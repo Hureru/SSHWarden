@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+#[cfg(windows)]
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use tokio::sync::RwLock;
@@ -475,15 +476,18 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
     }
 
     // Start the IPC control server
+    #[allow(unused_variables)]
     let (control_tx, mut control_rx) =
         tokio::sync::mpsc::channel::<sshwarden_agent::ControlRequest>(16);
     let cancel_token = tokio_util::sync::CancellationToken::new();
-    let cancel_clone = cancel_token.clone();
 
     #[cfg(windows)]
-    tokio::spawn(async move {
-        sshwarden_agent::control::start_control_server(control_tx, cancel_clone).await;
-    });
+    {
+        let cancel_clone = cancel_token.clone();
+        tokio::spawn(async move {
+            sshwarden_agent::control::start_control_server(control_tx, cancel_clone).await;
+        });
+    }
 
     info!("SSH Agent is running. Press Ctrl+C to stop.");
 
@@ -965,6 +969,7 @@ async fn handle_control_command(
                     let email = config.auth.email.clone();
                     let server_url = config.server.base_url.clone();
 
+                    #[allow(unused_mut)]
                     let mut vault = sshwarden_config::vault::VaultFile {
                         version: 1,
                         pin_encrypted: encrypted,
@@ -1083,6 +1088,7 @@ async fn finish_unlock_with_json(
 
 /// Handle a single UI request from the SSH agent (runs in a spawned task).
 #[allow(clippy::too_many_arguments)]
+#[allow(unused_variables)]
 async fn handle_ui_request(
     request: sshwarden_agent::SshAgentUIRequest,
     response_tx: tokio::sync::broadcast::Sender<(u32, bool)>,
@@ -1090,7 +1096,7 @@ async fn handle_ui_request(
     cached_key_tuples: CachedKeyTuples,
     agent: sshwarden_agent::SshWardenAgent,
     key_names: Arc<RwLock<std::collections::HashMap<String, String>>>,
-    _pin_encrypted_keys: Arc<RwLock<Option<String>>>,
+    pin_encrypted_keys: Arc<RwLock<Option<String>>>,
     vault_file_data: Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
     prompt_behavior: sshwarden_config::PromptBehavior,
     auto_unlock: bool,
@@ -1450,6 +1456,7 @@ async fn prompt_setup_pin(
 
     *pin_encrypted_keys.write().await = Some(encrypted.clone());
 
+    #[allow(unused_mut)]
     let mut vault = sshwarden_config::vault::VaultFile {
         version: 1,
         pin_encrypted: encrypted,
