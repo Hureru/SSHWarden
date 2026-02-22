@@ -1,5 +1,5 @@
 use bitwarden_russh::ssh_agent;
-pub mod named_pipe_listener_stream;
+use super::named_pipe_listener_stream;
 
 use std::sync::Arc;
 
@@ -27,8 +27,7 @@ impl SshWardenAgent {
                 cloned_agent_state.cancellation_token(),
             )
             .await;
-            cloned_agent_state
-                .set_running(false);
+            cloned_agent_state.set_running(false);
         });
         Ok(agent_state)
     }

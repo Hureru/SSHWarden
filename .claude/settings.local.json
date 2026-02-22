@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__context7__query-docs",
+      "Bash(cargo doc:*)",
+      "Bash(dir:*)",
+      "Bash(cargo metadata:*)",
+      "Bash(python -c:*)",
+      "Bash(findstr:*)",
+      "mcp__open-websearch__search",
+      "WebFetch(domain:microsoft.github.io)",
+      "WebFetch(domain:github.com)",
+      "Bash(cargo build:*)",
+      "Bash(cargo clippy:*)"
+    ]
+  }
+}

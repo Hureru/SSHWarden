@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -76,18 +76,13 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptBehavior {
+    #[default]
     Always,
     Never,
     RememberUntilLock,
-}
-
-impl Default for PromptBehavior {
-    fn default() -> Self {
-        Self::Always
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +121,8 @@ pub enum UnlockMethod {
     Password,
 }
 
+// Cannot use #[derive(Default)] due to conditional compilation
+#[allow(clippy::derivable_impls)]
 impl Default for UnlockMethod {
     fn default() -> Self {
         #[cfg(windows)]
@@ -139,17 +136,12 @@ impl Default for UnlockMethod {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackMethod {
+    #[default]
     Pin,
     Password,
-}
-
-impl Default for FallbackMethod {
-    fn default() -> Self {
-        Self::Pin
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,18 +173,6 @@ pub struct SocketConfig {
     pub path: Option<String>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            auth: AuthConfig::default(),
-            agent: AgentConfig::default(),
-            unlock: UnlockConfig::default(),
-            socket: SocketConfig::default(),
-        }
-    }
-}
-
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let path = config_path()?;
@@ -209,11 +189,11 @@ impl Config {
     pub fn save(&self) -> anyhow::Result<()> {
         let path = config_path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
         }
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize config")?;
+        let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write config file: {}", path.display()))?;
         Ok(())
@@ -225,9 +205,9 @@ impl Config {
 /// Uses the directory where the executable is located, making the
 /// application fully portable (all files travel with the exe).
 pub fn config_dir() -> anyhow::Result<PathBuf> {
-    let exe = std::env::current_exe()
-        .context("Could not determine executable path")?;
-    let dir = exe.parent()
+    let exe = std::env::current_exe().context("Could not determine executable path")?;
+    let dir = exe
+        .parent()
         .context("Executable has no parent directory")?
         .to_path_buf();
     Ok(dir)

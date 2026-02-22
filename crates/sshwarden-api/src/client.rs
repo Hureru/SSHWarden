@@ -53,25 +53,26 @@ impl BitwardenClient {
             return Err(anyhow!("Prelogin failed ({}): {}", status, body));
         }
 
-        let body = resp.text().await.context("Failed to read prelogin response body")?;
+        let body = resp
+            .text()
+            .await
+            .context("Failed to read prelogin response body")?;
         debug!("Prelogin response: {}", body);
 
-        serde_json::from_str::<PreloginResponse>(&body)
-            .context("Failed to parse prelogin response")
+        serde_json::from_str::<PreloginResponse>(&body).context("Failed to parse prelogin response")
     }
 
     /// Step 2: Login with email + master password.
     ///
     /// Derives master key, computes password hash, authenticates with the server,
     /// and decrypts the user's symmetric key.
-    pub async fn login_password(
-        &mut self,
-        email: &str,
-        password: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn login_password(&mut self, email: &str, password: &str) -> anyhow::Result<()> {
         // 2a: Get KDF params
         let prelogin = self.prelogin(email).await?;
-        info!("KDF: {:?}, iterations: {}", prelogin.kdf, prelogin.kdf_iterations);
+        info!(
+            "KDF: {:?}, iterations: {}",
+            prelogin.kdf, prelogin.kdf_iterations
+        );
 
         // 2b: Derive master key
         let master_key = crypto::derive_master_key(password, email, &prelogin)
@@ -111,16 +112,23 @@ impl BitwardenClient {
             return Err(anyhow!("Login failed ({}): {}", status, body));
         }
 
-        let body = resp.text().await.context("Failed to read token response body")?;
-        debug!("Token response Key prefix: {}",
+        let body = resp
+            .text()
+            .await
+            .context("Failed to read token response body")?;
+        debug!(
+            "Token response Key prefix: {}",
             serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
-                .and_then(|v| v.get("Key").or(v.get("key")).and_then(|k| k.as_str().map(|s| s.chars().take(20).collect::<String>())))
+                .and_then(|v| v
+                    .get("Key")
+                    .or(v.get("key"))
+                    .and_then(|k| k.as_str().map(|s| s.chars().take(20).collect::<String>())))
                 .unwrap_or_else(|| "N/A".to_string())
         );
 
-        let token_resp: TokenResponse = serde_json::from_str(&body)
-            .context("Failed to parse token response")?;
+        let token_resp: TokenResponse =
+            serde_json::from_str(&body).context("Failed to parse token response")?;
 
         self.access_token = Some(token_resp.access_token);
 
@@ -165,15 +173,9 @@ impl BitwardenClient {
             return Err(anyhow!("Sync failed ({}): {}", status, body));
         }
 
-        let sync: SyncResponse = resp
-            .json()
-            .await
-            .context("Failed to parse sync response")?;
+        let sync: SyncResponse = resp.json().await.context("Failed to parse sync response")?;
 
-        info!(
-            "Sync complete: {} ciphers total",
-            sync.ciphers.len()
-        );
+        info!("Sync complete: {} ciphers total", sync.ciphers.len());
 
         // Filter SSH key ciphers and decrypt
         let ssh_ciphers: Vec<&Cipher> = sync
@@ -225,20 +227,20 @@ impl BitwardenClient {
             user_key.clone()
         };
 
-        let ssh_data = cipher
-            .ssh_key
-            .as_ref()
-            .ok_or_else(|| anyhow!("Cipher {} is SshKey type but has no ssh_key data", cipher.id))?;
+        let ssh_data = cipher.ssh_key.as_ref().ok_or_else(|| {
+            anyhow!(
+                "Cipher {} is SshKey type but has no ssh_key data",
+                cipher.id
+            )
+        })?;
 
         let private_key_pem =
             crypto::decrypt_enc_string_to_string(&ssh_data.private_key, &effective_key)
                 .context("Failed to decrypt SSH private key")?;
 
         let name = match cipher.name {
-            Some(ref enc_name) => {
-                crypto::decrypt_enc_string_to_string(enc_name, &effective_key)
-                    .unwrap_or_else(|_| "unnamed".to_string())
-            }
+            Some(ref enc_name) => crypto::decrypt_enc_string_to_string(enc_name, &effective_key)
+                .unwrap_or_else(|_| "unnamed".to_string()),
             None => "unnamed".to_string(),
         };
 

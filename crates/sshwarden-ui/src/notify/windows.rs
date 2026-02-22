@@ -12,8 +12,7 @@ pub async fn prompt_authorization(info: &SignRequestInfo) -> AuthorizationResult
     let info_for_dialog = info.clone();
     let info_for_fallback = info.clone();
 
-    let result =
-        tokio::task::spawn_blocking(move || show_task_dialog(&info_for_dialog)).await;
+    let result = tokio::task::spawn_blocking(move || show_task_dialog(&info_for_dialog)).await;
 
     match result {
         Ok(Ok(auth)) => auth,
@@ -32,9 +31,7 @@ pub async fn prompt_authorization(info: &SignRequestInfo) -> AuthorizationResult
 
 /// Show a simple TaskDialog with Yes/No buttons and shield icon.
 fn show_task_dialog(info: &SignRequestInfo) -> anyhow::Result<AuthorizationResult> {
-    use windows::Win32::UI::Controls::{
-        TaskDialog, TDCBF_NO_BUTTON, TDCBF_YES_BUTTON,
-    };
+    use windows::Win32::UI::Controls::{TaskDialog, TDCBF_NO_BUTTON, TDCBF_YES_BUTTON};
     use windows::Win32::UI::WindowsAndMessaging::IDYES;
 
     let operation = match info.namespace.as_deref() {
@@ -44,17 +41,11 @@ fn show_task_dialog(info: &SignRequestInfo) -> anyhow::Result<AuthorizationResul
     };
 
     // Main instruction (large blue text)
-    let instruction = format!(
-        "{} 正在请求使用 SSH 密钥",
-        info.process_name
-    );
+    let instruction = format!("{} 正在请求使用 SSH 密钥", info.process_name);
     let instruction_h = HSTRING::from(&instruction);
 
     // Content body
-    let mut content = format!(
-        "密钥: {}\n操作: {}",
-        info.key_name, operation
-    );
+    let mut content = format!("密钥: {}\n操作: {}", info.key_name, operation);
     if info.is_forwarding {
         content.push_str("\n\n\u{26A0} 通过代理转发（来自远程主机）");
     }
@@ -107,8 +98,7 @@ pub fn prompt_authorization_blocking(info: &SignRequestInfo) -> AuthorizationRes
 
 fn show_message_box_fallback(info: &SignRequestInfo) -> AuthorizationResult {
     use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST,
-        MB_YESNO,
+        MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
     };
 
     let operation = match info.namespace.as_deref() {

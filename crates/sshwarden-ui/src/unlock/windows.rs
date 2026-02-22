@@ -132,8 +132,8 @@ fn focus_and_center_security_prompt() {
     use windows::core::s;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowA, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
-        MoveWindow, SetForegroundWindow, SM_CXSCREEN, SM_CYSCREEN,
+        FindWindowA, GetForegroundWindow, GetSystemMetrics, GetWindowRect, MoveWindow,
+        SetForegroundWindow, SM_CXSCREEN, SM_CYSCREEN,
     };
 
     let hwnd = match unsafe { FindWindowA(s!("Credential Dialog Xaml Host"), None) } {
@@ -174,11 +174,12 @@ fn focus_and_center_security_prompt() {
 /// and won't steal focus aggressively.
 fn credui_unlock_fallback() -> UnlockResult {
     use windows::Win32::Security::Credentials::{
-        CredUIPromptForWindowsCredentialsW, CREDUI_INFOW, CREDUIWIN_GENERIC,
+        CredUIPromptForWindowsCredentialsW, CREDUIWIN_GENERIC, CREDUI_INFOW,
     };
 
     let caption = HSTRING::from("SSHWarden - 解锁密码库");
-    let message_text = HSTRING::from("请验证您的身份以解锁 SSHWarden 密码库\n输入 Windows 凭据以继续");
+    let message_text =
+        HSTRING::from("请验证您的身份以解锁 SSHWarden 密码库\n输入 Windows 凭据以继续");
 
     let cred_info = CREDUI_INFOW {
         cbSize: std::mem::size_of::<CREDUI_INFOW>() as u32,

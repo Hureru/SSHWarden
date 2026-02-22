@@ -73,12 +73,7 @@ pub struct SshWardenAgent {
 }
 
 impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
-    async fn confirm(
-        &self,
-        ssh_key: SshWardenKey,
-        data: &[u8],
-        info: &PeerInfo,
-    ) -> bool {
+    async fn confirm(&self, ssh_key: SshWardenKey, data: &[u8], info: &PeerInfo) -> bool {
         if !self.is_running() {
             error!("Agent is not running, but tried to call confirm");
             return false;
@@ -331,9 +326,9 @@ fn parse_key_safe(pem: &str) -> Result<ssh_key::private::PrivateKey, anyhow::Err
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-    use ssh_key::Signature;
     use super::*;
+    use ssh_key::Signature;
+    use std::sync::atomic::Ordering;
 
     const TEST_ED25519_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW

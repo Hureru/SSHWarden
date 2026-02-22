@@ -67,19 +67,13 @@ pub fn hello_derive_key(challenge: &[u8; 16]) -> Result<[u8; 32]> {
                 info!("Created new Hello signing credential");
                 creation_result
             }
-            status => {
-                return Err(anyhow!(
-                    "Failed to create Hello credential: {:?}",
-                    status
-                ))
-            }
+            status => return Err(anyhow!("Failed to create Hello credential: {:?}", status)),
         }
     }
     .Credential()?;
 
     // Sign the challenge
-    let challenge_buffer =
-        CryptographicBuffer::CreateFromByteArray(challenge.as_slice())?;
+    let challenge_buffer = CryptographicBuffer::CreateFromByteArray(challenge.as_slice())?;
 
     let sign_result = credential.RequestSignAsync(&challenge_buffer)?.get()?;
     drop(credential);
@@ -125,10 +119,7 @@ fn hello_sym_key(raw_key: &[u8; 32]) -> sshwarden_api::crypto::SymmetricKey {
 /// Encrypt `key_tuples_json` with a Hello-derived key.
 ///
 /// Returns the encrypted EncString (type 2 format).
-pub fn hello_encrypt_keys(
-    key_tuples_json: &str,
-    challenge: &[u8; 16],
-) -> Result<String> {
+pub fn hello_encrypt_keys(key_tuples_json: &str, challenge: &[u8; 16]) -> Result<String> {
     let raw_key = hello_derive_key(challenge)?;
     sshwarden_api::crypto::encrypt_enc_string(key_tuples_json.as_bytes(), &hello_sym_key(&raw_key))
 }
@@ -136,10 +127,7 @@ pub fn hello_encrypt_keys(
 /// Decrypt an EncString with a Hello-derived key.
 ///
 /// Returns the decrypted JSON string.
-pub fn hello_decrypt_keys(
-    enc_string: &str,
-    challenge: &[u8; 16],
-) -> Result<String> {
+pub fn hello_decrypt_keys(enc_string: &str, challenge: &[u8; 16]) -> Result<String> {
     let raw_key = hello_derive_key(challenge)?;
     let bytes = sshwarden_api::crypto::decrypt_enc_string(enc_string, &hello_sym_key(&raw_key))?;
     String::from_utf8(bytes).map_err(|e| anyhow!("Hello decrypted data is not valid UTF-8: {}", e))

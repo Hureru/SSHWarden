@@ -238,7 +238,9 @@ pub async fn send_control_command(cmd: &str) -> anyhow::Result<ControlResponse> 
         cmd: cmd.to_string(),
     };
     let cmd_json = serde_json::to_string(&command)?;
-    writer.write_all(format!("{}\n", cmd_json).as_bytes()).await?;
+    writer
+        .write_all(format!("{}\n", cmd_json).as_bytes())
+        .await?;
     writer.shutdown().await?;
 
     // Read response

@@ -49,11 +49,12 @@ impl VaultFile {
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create vault directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create vault directory: {}", parent.display())
+            })?;
         }
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize vault file")?;
+        let content =
+            serde_json::to_string_pretty(self).context("Failed to serialize vault file")?;
         std::fs::write(&path, content)
             .with_context(|| format!("Failed to write vault file: {}", path.display()))?;
         Ok(())

@@ -6,8 +6,15 @@ use clap::{Parser, Subcommand};
 use tokio::sync::RwLock;
 use tracing::info;
 
+// Type alias for cached key tuples (name, public_key, private_key)
+type CachedKeyTuples = Arc<RwLock<Vec<(String, String, String)>>>;
+
 #[derive(Parser)]
-#[command(name = "sshwarden", version, about = "SSH Agent backed by Bitwarden vault")]
+#[command(
+    name = "sshwarden",
+    version,
+    about = "SSH Agent backed by Bitwarden vault"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -77,7 +84,10 @@ async fn main() -> anyhow::Result<()> {
     // Daemon mode: log to file; otherwise log to stderr
     let is_daemon = matches!(
         cli.command,
-        Some(Commands::Daemon { install: false, uninstall: false })
+        Some(Commands::Daemon {
+            install: false,
+            uninstall: false
+        })
     );
 
     if is_daemon {
@@ -105,8 +115,7 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    let config = sshwarden_config::Config::load()
-        .context("Failed to load configuration")?;
+    let config = sshwarden_config::Config::load().context("Failed to load configuration")?;
 
     match cli.command {
         None => run_foreground(config).await,
@@ -139,7 +148,11 @@ async fn main() -> anyhow::Result<()> {
             cmd_keys(&config, base_url.as_deref(), email.as_deref()).await
         }
         Some(Commands::Lock) => cmd_control("lock").await,
-        Some(Commands::Unlock { pin, password, hello }) => {
+        Some(Commands::Unlock {
+            pin,
+            password,
+            hello,
+        }) => {
             if pin {
                 let pin_value = prompt_password("Enter PIN: ")?;
                 let cmd = format!("unlock-pin:{}", pin_value);
@@ -224,8 +237,7 @@ async fn cmd_set_pin() -> anyhow::Result<()> {
 
 /// Prompt for a password from the terminal (hides input).
 fn prompt_password(prompt: &str) -> anyhow::Result<String> {
-    rpassword::prompt_password(prompt)
-        .context("Failed to read password")
+    rpassword::prompt_password(prompt).context("Failed to read password")
 }
 
 /// Prompt for an email from the terminal.
@@ -247,10 +259,16 @@ fn create_client(
     base_url_override: Option<&str>,
 ) -> sshwarden_api::BitwardenClient {
     let base = base_url_override.unwrap_or(&config.server.base_url);
-    let api_url = config.server.api_url.as_deref()
+    let api_url = config
+        .server
+        .api_url
+        .as_deref()
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}/api", base));
-    let identity_url = config.server.identity_url.as_deref()
+    let identity_url = config
+        .server
+        .identity_url
+        .as_deref()
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}/identity", base));
     sshwarden_api::BitwardenClient::new(base, &api_url, &identity_url)
@@ -331,11 +349,10 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
     info!("Server: {}", config.server.base_url);
 
     // Check for persisted vault file BEFORE prompting for master password
-    let vault_file = sshwarden_config::vault::VaultFile::load()
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to load vault file: {}", e);
-            None
-        });
+    let vault_file = sshwarden_config::vault::VaultFile::load().unwrap_or_else(|e| {
+        tracing::warn!("Failed to load vault file: {}", e);
+        None
+    });
 
     let has_vault_file = vault_file.is_some();
 
@@ -393,8 +410,7 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
     // Create channels for UI communication
     let (request_tx, mut request_rx) =
         tokio::sync::mpsc::channel::<sshwarden_agent::SshAgentUIRequest>(32);
-    let (response_tx, _response_rx) =
-        tokio::sync::broadcast::channel::<(u32, bool)>(32);
+    let (response_tx, _response_rx) = tokio::sync::broadcast::channel::<(u32, bool)>(32);
     let response_tx = Arc::new(response_tx);
 
     // Start the SSH agent server
@@ -414,8 +430,7 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
     );
 
     // Cache key tuples for re-loading after unlock, and track vault lock state
-    let cached_key_tuples: Arc<RwLock<Vec<(String, String, String)>>> =
-        Arc::new(RwLock::new(Vec::new()));
+    let cached_key_tuples: CachedKeyTuples = Arc::new(RwLock::new(Vec::new()));
     let vault_locked = Arc::new(std::sync::atomic::AtomicBool::new(has_vault_file));
     let api_client: Arc<RwLock<Option<sshwarden_api::BitwardenClient>>> =
         Arc::new(RwLock::new(api_client));
@@ -430,7 +445,13 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
     if let Some(keys) = vault_keys {
         let key_tuples: Vec<(String, String, String)> = keys
             .iter()
-            .map(|k| (k.private_key_pem.clone(), k.name.clone(), k.cipher_id.clone()))
+            .map(|k| {
+                (
+                    k.private_key_pem.clone(),
+                    k.name.clone(),
+                    k.cipher_id.clone(),
+                )
+            })
             .collect();
         let count = key_tuples.len();
         if count > 0 {
@@ -445,7 +466,8 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
                     &pin_encrypted_keys,
                     &vault_file_data,
                     &config,
-                ).await;
+                )
+                .await;
             }
         }
     } else if !has_vault_file {
@@ -524,12 +546,11 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
             _ = lock_check_interval.tick() => {
                 if lock_timeout > 0
                     && !vault_locked.load(std::sync::atomic::Ordering::Relaxed)
+                    && last_activity.elapsed().as_secs() >= lock_timeout
                 {
-                    if last_activity.elapsed().as_secs() >= lock_timeout {
-                        info!("Auto-locking vault due to inactivity ({} seconds)", lock_timeout);
-                        if agent.lock().is_ok() {
-                            vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
+                    info!("Auto-locking vault due to inactivity ({} seconds)", lock_timeout);
+                    if agent.lock().is_ok() {
+                        vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -553,7 +574,7 @@ async fn handle_control_command(
     action: sshwarden_agent::ControlAction,
     agent: &mut sshwarden_agent::SshWardenAgent,
     vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    cached_key_tuples: &Arc<RwLock<Vec<(String, String, String)>>>,
+    cached_key_tuples: &CachedKeyTuples,
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
     pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
     vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
@@ -575,10 +596,7 @@ async fn handle_control_command(
                         sshwarden_agent::ControlResponse::ok("Vault locked")
                     }
                     Err(e) => {
-                        sshwarden_agent::ControlResponse::err(&format!(
-                            "Failed to lock: {}",
-                            e
-                        ))
+                        sshwarden_agent::ControlResponse::err(&format!("Failed to lock: {}", e))
                     }
                 }
             }
@@ -601,7 +619,9 @@ async fn handle_control_command(
                 };
 
                 if let Some((challenge_b64, hello_encrypted)) = hello_info {
-                    if let Ok(challenge_bytes) = base64::engine::general_purpose::STANDARD.decode(&challenge_b64) {
+                    if let Ok(challenge_bytes) =
+                        base64::engine::general_purpose::STANDARD.decode(&challenge_b64)
+                    {
                         if challenge_bytes.len() == 16 {
                             let mut challenge = [0u8; 16];
                             challenge.copy_from_slice(&challenge_bytes);
@@ -609,13 +629,19 @@ async fn handle_control_command(
                             // Try Hello sign-path unlock
                             let hello_result = tokio::task::spawn_blocking(move || {
                                 try_hello_unlock(&challenge, &hello_encrypted)
-                            }).await;
+                            })
+                            .await;
 
                             if let Ok(Ok(keys_json)) = hello_result {
                                 return finish_unlock_with_json(
-                                    &keys_json, agent, vault_locked, cached_key_tuples, key_names,
-                                    "Vault unlocked via Windows Hello"
-                                ).await;
+                                    &keys_json,
+                                    agent,
+                                    vault_locked,
+                                    cached_key_tuples,
+                                    key_names,
+                                    "Vault unlocked via Windows Hello",
+                                )
+                                .await;
                             }
                             info!("Hello unlock failed or cancelled, trying fallback");
                         }
@@ -669,53 +695,60 @@ async fn handle_control_command(
                 };
                 drop(vf);
 
-                let challenge_b64 = match challenge_b64 {
-                    Some(c) => c,
-                    None => {
-                        return sshwarden_agent::ControlResponse::err(
+                let challenge_b64 =
+                    match challenge_b64 {
+                        Some(c) => c,
+                        None => return sshwarden_agent::ControlResponse::err(
                             "Windows Hello not enrolled. Set PIN with Hello available to enroll.",
-                        )
-                    }
-                };
+                        ),
+                    };
 
-                let hello_encrypted = match hello_encrypted {
-                    Some(e) => e,
-                    None => {
-                        return sshwarden_agent::ControlResponse::err(
+                let hello_encrypted =
+                    match hello_encrypted {
+                        Some(e) => e,
+                        None => return sshwarden_agent::ControlResponse::err(
                             "Windows Hello not enrolled. Set PIN with Hello available to enroll.",
-                        )
-                    }
-                };
+                        ),
+                    };
 
-                let challenge_bytes = match base64::engine::general_purpose::STANDARD.decode(&challenge_b64) {
-                    Ok(b) if b.len() == 16 => {
-                        let mut arr = [0u8; 16];
-                        arr.copy_from_slice(&b);
-                        arr
-                    }
-                    _ => {
-                        return sshwarden_agent::ControlResponse::err(
-                            "Invalid hello_challenge in vault file",
-                        )
-                    }
-                };
+                let challenge_bytes =
+                    match base64::engine::general_purpose::STANDARD.decode(&challenge_b64) {
+                        Ok(b) if b.len() == 16 => {
+                            let mut arr = [0u8; 16];
+                            arr.copy_from_slice(&b);
+                            arr
+                        }
+                        _ => {
+                            return sshwarden_agent::ControlResponse::err(
+                                "Invalid hello_challenge in vault file",
+                            )
+                        }
+                    };
 
                 let hello_result = tokio::task::spawn_blocking(move || {
                     try_hello_unlock(&challenge_bytes, &hello_encrypted)
-                }).await;
+                })
+                .await;
 
                 match hello_result {
                     Ok(Ok(keys_json)) => {
                         finish_unlock_with_json(
-                            &keys_json, agent, vault_locked, cached_key_tuples, key_names,
-                            "Vault unlocked via Windows Hello"
-                        ).await
+                            &keys_json,
+                            agent,
+                            vault_locked,
+                            cached_key_tuples,
+                            key_names,
+                            "Vault unlocked via Windows Hello",
+                        )
+                        .await
                     }
                     Ok(Err(e)) => sshwarden_agent::ControlResponse::err(&format!(
-                        "Hello unlock failed: {}", e
+                        "Hello unlock failed: {}",
+                        e
                     )),
                     Err(e) => sshwarden_agent::ControlResponse::err(&format!(
-                        "Hello unlock task failed: {}", e
+                        "Hello unlock task failed: {}",
+                        e
                     )),
                 }
             }
@@ -730,8 +763,12 @@ async fn handle_control_command(
             let has_vault = vault_file_data.read().await.is_some();
             let mut resp = sshwarden_agent::ControlResponse::status(locked, count);
             let mut extras = Vec::new();
-            if has_pin { extras.push("PIN configured"); }
-            if has_vault { extras.push("vault.enc present"); }
+            if has_pin {
+                extras.push("PIN configured");
+            }
+            if has_vault {
+                extras.push("vault.enc present");
+            }
             if !extras.is_empty() {
                 resp.message = Some(format!(
                     "{} ({})",
@@ -752,22 +789,29 @@ async fn handle_control_command(
                 if mem.is_some() {
                     mem
                 } else {
-                    vault_file_data.read().await.as_ref().map(|v| v.pin_encrypted.clone())
+                    vault_file_data
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|v| v.pin_encrypted.clone())
                 }
             };
 
             match encrypted {
-                Some(enc_data) => {
-                    match sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
-                        Ok(keys_json) => {
-                            finish_unlock_with_json(
-                                &keys_json, agent, vault_locked, cached_key_tuples, key_names,
-                                "Vault unlocked via PIN"
-                            ).await
-                        }
-                        Err(_) => sshwarden_agent::ControlResponse::err("Invalid PIN"),
+                Some(enc_data) => match sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
+                    Ok(keys_json) => {
+                        finish_unlock_with_json(
+                            &keys_json,
+                            agent,
+                            vault_locked,
+                            cached_key_tuples,
+                            key_names,
+                            "Vault unlocked via PIN",
+                        )
+                        .await
                     }
-                }
+                    Err(_) => sshwarden_agent::ControlResponse::err("Invalid PIN"),
+                },
                 None => sshwarden_agent::ControlResponse::err(
                     "No PIN configured. Use 'sshwarden set-pin' first.",
                 ),
@@ -781,7 +825,8 @@ async fn handle_control_command(
             // Get email from vault file or config
             let email = {
                 let vf = vault_file_data.read().await;
-                vf.as_ref().map(|v| v.email.clone())
+                vf.as_ref()
+                    .map(|v| v.email.clone())
                     .unwrap_or_else(|| config.auth.email.clone())
             };
 
@@ -795,9 +840,7 @@ async fn handle_control_command(
             match client.login_password(&email, &password).await {
                 Ok(()) => {}
                 Err(e) => {
-                    return sshwarden_agent::ControlResponse::err(&format!(
-                        "Login failed: {}", e
-                    ))
+                    return sshwarden_agent::ControlResponse::err(&format!("Login failed: {}", e))
                 }
             }
 
@@ -805,7 +848,13 @@ async fn handle_control_command(
                 Ok(keys) => {
                     let key_tuples: Vec<(String, String, String)> = keys
                         .iter()
-                        .map(|k| (k.private_key_pem.clone(), k.name.clone(), k.cipher_id.clone()))
+                        .map(|k| {
+                            (
+                                k.private_key_pem.clone(),
+                                k.name.clone(),
+                                k.cipher_id.clone(),
+                            )
+                        })
                         .collect();
                     let count = key_tuples.len();
                     *cached_key_tuples.write().await = key_tuples.clone();
@@ -821,7 +870,8 @@ async fn handle_control_command(
 
                     if let Err(e) = agent.set_keys(key_tuples) {
                         return sshwarden_agent::ControlResponse::err(&format!(
-                            "Login succeeded but failed to load keys: {}", e
+                            "Login succeeded but failed to load keys: {}",
+                            e
                         ));
                     }
                     vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -837,11 +887,13 @@ async fn handle_control_command(
 
                     info!("Vault unlocked via master password, {} keys loaded", count);
                     sshwarden_agent::ControlResponse::ok(&format!(
-                        "Vault unlocked, {} SSH keys loaded", count
+                        "Vault unlocked, {} SSH keys loaded",
+                        count
                     ))
                 }
                 Err(e) => sshwarden_agent::ControlResponse::err(&format!(
-                    "Sync failed after login: {}", e
+                    "Sync failed after login: {}",
+                    e
                 )),
             }
         }
@@ -873,15 +925,9 @@ async fn handle_control_command(
                             }
                         }
                         info!("Vault synced: {} SSH keys", count);
-                        sshwarden_agent::ControlResponse::ok(&format!(
-                            "Synced {} SSH keys",
-                            count
-                        ))
+                        sshwarden_agent::ControlResponse::ok(&format!("Synced {} SSH keys", count))
                     }
-                    Err(e) => sshwarden_agent::ControlResponse::err(&format!(
-                        "Sync failed: {}",
-                        e
-                    )),
+                    Err(e) => sshwarden_agent::ControlResponse::err(&format!("Sync failed: {}", e)),
                 }
             } else {
                 sshwarden_agent::ControlResponse::err(
@@ -891,16 +937,12 @@ async fn handle_control_command(
         }
         ControlAction::SetPin { pin } => {
             if pin.len() < 4 {
-                return sshwarden_agent::ControlResponse::err(
-                    "PIN must be at least 4 characters",
-                );
+                return sshwarden_agent::ControlResponse::err("PIN must be at least 4 characters");
             }
 
             let keys = cached_key_tuples.read().await.clone();
             if keys.is_empty() {
-                return sshwarden_agent::ControlResponse::err(
-                    "No keys loaded. Login first.",
-                );
+                return sshwarden_agent::ControlResponse::err("No keys loaded. Login first.");
             }
 
             // Serialize key tuples and encrypt with PIN
@@ -946,13 +988,14 @@ async fn handle_control_command(
                                     &keys_json_clone,
                                     &challenge_clone,
                                 )
-                            }).await;
+                            })
+                            .await;
 
                             match hello_result {
                                 Ok(Ok(hello_enc)) => {
                                     vault.hello_encrypted = Some(hello_enc);
                                     vault.hello_challenge = Some(
-                                        base64::engine::general_purpose::STANDARD.encode(challenge)
+                                        base64::engine::general_purpose::STANDARD.encode(challenge),
                                     );
                                     info!("Windows Hello sign-path registered");
                                 }
@@ -970,15 +1013,20 @@ async fn handle_control_command(
                         tracing::warn!("Failed to save vault file: {}", e);
                         // Still return success since in-memory encryption worked
                     } else {
-                        info!("Vault file saved to {}", sshwarden_config::vault::VaultFile::path()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| "unknown".to_string()));
+                        info!(
+                            "Vault file saved to {}",
+                            sshwarden_config::vault::VaultFile::path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|_| "unknown".to_string())
+                        );
                     }
 
                     *vault_file_data.write().await = Some(vault);
 
                     info!("PIN set successfully, keys encrypted with PIN");
-                    sshwarden_agent::ControlResponse::ok("PIN set successfully (persisted to vault.enc)")
+                    sshwarden_agent::ControlResponse::ok(
+                        "PIN set successfully (persisted to vault.enc)",
+                    )
                 }
                 Err(e) => sshwarden_agent::ControlResponse::err(&format!(
                     "Failed to encrypt with PIN: {}",
@@ -1001,7 +1049,7 @@ async fn finish_unlock_with_json(
     keys_json: &str,
     agent: &mut sshwarden_agent::SshWardenAgent,
     vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    cached_key_tuples: &Arc<RwLock<Vec<(String, String, String)>>>,
+    cached_key_tuples: &CachedKeyTuples,
     key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
     success_msg: &str,
 ) -> sshwarden_agent::ControlResponse {
@@ -1009,7 +1057,8 @@ async fn finish_unlock_with_json(
         Ok(k) => k,
         Err(e) => {
             return sshwarden_agent::ControlResponse::err(&format!(
-                "Failed to parse decrypted keys: {}", e
+                "Failed to parse decrypted keys: {}",
+                e
             ))
         }
     };
@@ -1025,9 +1074,7 @@ async fn finish_unlock_with_json(
 
     *cached_key_tuples.write().await = keys.clone();
     if let Err(e) = agent.set_keys(keys) {
-        return sshwarden_agent::ControlResponse::err(&format!(
-            "Failed to reload keys: {}", e
-        ));
+        return sshwarden_agent::ControlResponse::err(&format!("Failed to reload keys: {}", e));
     }
     vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
     info!("{}", success_msg);
@@ -1040,7 +1087,7 @@ async fn handle_ui_request(
     request: sshwarden_agent::SshAgentUIRequest,
     response_tx: tokio::sync::broadcast::Sender<(u32, bool)>,
     vault_locked: Arc<std::sync::atomic::AtomicBool>,
-    cached_key_tuples: Arc<RwLock<Vec<(String, String, String)>>>,
+    cached_key_tuples: CachedKeyTuples,
     agent: sshwarden_agent::SshWardenAgent,
     key_names: Arc<RwLock<std::collections::HashMap<String, String>>>,
     _pin_encrypted_keys: Arc<RwLock<Option<String>>>,
@@ -1072,20 +1119,28 @@ async fn handle_ui_request(
                 };
 
                 if let Some((challenge_b64, hello_encrypted)) = hello_info {
-                    if let Ok(challenge_bytes) = base64::engine::general_purpose::STANDARD.decode(&challenge_b64) {
+                    if let Ok(challenge_bytes) =
+                        base64::engine::general_purpose::STANDARD.decode(&challenge_b64)
+                    {
                         if challenge_bytes.len() == 16 {
                             let mut challenge = [0u8; 16];
                             challenge.copy_from_slice(&challenge_bytes);
 
                             let hello_result = tokio::task::spawn_blocking(move || {
                                 try_hello_unlock(&challenge, &hello_encrypted)
-                            }).await;
+                            })
+                            .await;
 
                             if let Ok(Ok(keys_json)) = hello_result {
                                 let finish = finish_unlock_with_json(
-                                    &keys_json, &mut agent.clone(), &vault_locked, &cached_key_tuples, &key_names,
-                                    "Auto-unlocked via Windows Hello sign-path (list request)"
-                                ).await;
+                                    &keys_json,
+                                    &mut agent.clone(),
+                                    &vault_locked,
+                                    &cached_key_tuples,
+                                    &key_names,
+                                    "Auto-unlocked via Windows Hello sign-path (list request)",
+                                )
+                                .await;
                                 if finish.ok {
                                     unlocked = true;
                                 }
@@ -1116,7 +1171,10 @@ async fn handle_ui_request(
             }
 
             if !unlocked {
-                info!(request_id = request.request_id, "Vault still locked, denying list request");
+                info!(
+                    request_id = request.request_id,
+                    "Vault still locked, denying list request"
+                );
                 let _ = response_tx.send((request.request_id, false));
                 return;
             }
@@ -1156,7 +1214,9 @@ async fn handle_ui_request(
             };
 
             if let Some((challenge_b64, hello_encrypted)) = hello_info {
-                if let Ok(challenge_bytes) = base64::engine::general_purpose::STANDARD.decode(&challenge_b64) {
+                if let Ok(challenge_bytes) =
+                    base64::engine::general_purpose::STANDARD.decode(&challenge_b64)
+                {
                     if challenge_bytes.len() == 16 {
                         let mut challenge = [0u8; 16];
                         challenge.copy_from_slice(&challenge_bytes);
@@ -1175,8 +1235,9 @@ async fn handle_ui_request(
                         // Single spawn_blocking: Hello unlock + optional authorization dialog
                         let combined_result = tokio::task::spawn_blocking(move || {
                             let keys_json = try_hello_unlock(&challenge, &hello_encrypted)?;
-                            let keys: Vec<(String, String, String)> = serde_json::from_str(&keys_json)
-                                .map_err(|e| anyhow::anyhow!("Failed to parse keys: {}", e))?;
+                            let keys: Vec<(String, String, String)> =
+                                serde_json::from_str(&keys_json)
+                                    .map_err(|e| anyhow::anyhow!("Failed to parse keys: {}", e))?;
 
                             // Extract key name for the authorization prompt
                             let key_name = cipher_id
@@ -1193,14 +1254,16 @@ async fn handle_ui_request(
                                     namespace,
                                     is_forwarding,
                                 };
-                                let result = sshwarden_ui::notify::prompt_authorization_blocking(&sign_info);
+                                let result =
+                                    sshwarden_ui::notify::prompt_authorization_blocking(&sign_info);
                                 result == sshwarden_ui::AuthorizationResult::Approved
                             } else {
                                 true
                             };
 
                             Ok::<_, anyhow::Error>((keys, approved))
-                        }).await;
+                        })
+                        .await;
 
                         if let Ok(Ok((keys, approved))) = combined_result {
                             // Update state after successful unlock
@@ -1248,7 +1311,10 @@ async fn handle_ui_request(
                     unlocked = true;
                 }
                 _ => {
-                    info!(?unlock_result, "Unlock failed or cancelled, denying request");
+                    info!(
+                        ?unlock_result,
+                        "Unlock failed or cancelled, denying request"
+                    );
                 }
             }
         }
@@ -1281,14 +1347,12 @@ async fn handle_ui_request(
 
     // Build request info for UI — use try_read to avoid blocking on write lock
     let key_name = match key_names.try_read() {
-        Ok(names) => {
-            request
-                .cipher_id
-                .as_ref()
-                .and_then(|id| names.get(id))
-                .cloned()
-                .unwrap_or_else(|| "Unknown key".to_string())
-        }
+        Ok(names) => request
+            .cipher_id
+            .as_ref()
+            .and_then(|id| names.get(id))
+            .cloned()
+            .unwrap_or_else(|| "Unknown key".to_string()),
         Err(_) => "Unknown key".to_string(),
     };
 
@@ -1314,7 +1378,10 @@ async fn handle_ui_request(
 /// Login to the vault and fetch SSH keys, returning both keys and the authenticated client.
 async fn fetch_vault_keys_with_client(
     config: &sshwarden_config::Config,
-) -> anyhow::Result<(Vec<sshwarden_api::DecryptedSshKey>, sshwarden_api::BitwardenClient)> {
+) -> anyhow::Result<(
+    Vec<sshwarden_api::DecryptedSshKey>,
+    sshwarden_api::BitwardenClient,
+)> {
     let password = prompt_password("Master password: ")?;
 
     let mut client = create_client(config, None);
@@ -1328,7 +1395,7 @@ async fn fetch_vault_keys_with_client(
 ///
 /// This avoids requiring the master password on every restart.
 async fn prompt_setup_pin(
-    cached_key_tuples: &Arc<RwLock<Vec<(String, String, String)>>>,
+    cached_key_tuples: &CachedKeyTuples,
     pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
     vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
     config: &sshwarden_config::Config,
@@ -1406,14 +1473,14 @@ async fn prompt_setup_pin(
                     &keys_json_clone,
                     &challenge_clone,
                 )
-            }).await;
+            })
+            .await;
 
             match hello_result {
                 Ok(Ok(hello_enc)) => {
                     vault.hello_encrypted = Some(hello_enc);
-                    vault.hello_challenge = Some(
-                        base64::engine::general_purpose::STANDARD.encode(challenge)
-                    );
+                    vault.hello_challenge =
+                        Some(base64::engine::general_purpose::STANDARD.encode(challenge));
                     info!("Windows Hello registered for unlock");
                 }
                 Ok(Err(e)) => tracing::warn!("Hello registration failed: {}", e),
@@ -1506,8 +1573,7 @@ fn detach_console() {
 /// Get the path to the startup shortcut in the user's Startup folder.
 #[cfg(windows)]
 fn startup_shortcut_path() -> anyhow::Result<std::path::PathBuf> {
-    let startup_dir = std::env::var("APPDATA")
-        .context("APPDATA environment variable not set")?;
+    let startup_dir = std::env::var("APPDATA").context("APPDATA environment variable not set")?;
     let startup_dir = std::path::Path::new(&startup_dir)
         .join("Microsoft\\Windows\\Start Menu\\Programs\\Startup");
     Ok(startup_dir.join("SSHWarden.lnk"))
@@ -1519,10 +1585,14 @@ async fn cmd_daemon_install() -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
     let exe_str = exe.to_str().context("Executable path is not valid UTF-8")?;
     let working_dir = exe.parent().context("Failed to get executable directory")?;
-    let working_dir_str = working_dir.to_str().context("Directory path is not valid UTF-8")?;
+    let working_dir_str = working_dir
+        .to_str()
+        .context("Directory path is not valid UTF-8")?;
 
     let shortcut_path = startup_shortcut_path()?;
-    let shortcut_str = shortcut_path.to_str().context("Shortcut path is not valid UTF-8")?;
+    let shortcut_str = shortcut_path
+        .to_str()
+        .context("Shortcut path is not valid UTF-8")?;
 
     // Use PowerShell to create a .lnk shortcut file
     // WindowStyle 7 = Minimized, so the console window doesn't flash on startup
@@ -1586,4 +1656,3 @@ async fn cmd_daemon_uninstall() -> anyhow::Result<()> {
     info!("Startup uninstallation is only supported on Windows currently");
     Ok(())
 }
-

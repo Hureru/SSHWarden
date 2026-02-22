@@ -51,7 +51,8 @@ pub fn derive_master_key(
         KdfType::Argon2id => {
             let memory = prelogin
                 .kdf_memory
-                .ok_or_else(|| anyhow!("Argon2id requires kdf_memory"))? * 1024; // KiB
+                .ok_or_else(|| anyhow!("Argon2id requires kdf_memory"))?
+                * 1024; // KiB
             let parallelism = prelogin
                 .kdf_parallelism
                 .ok_or_else(|| anyhow!("Argon2id requires kdf_parallelism"))?;
@@ -63,7 +64,8 @@ pub fn derive_master_key(
 
             let params = argon2::Params::new(memory, iterations, parallelism, Some(32))
                 .map_err(|e| anyhow!("Invalid Argon2 params: {e}"))?;
-            let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+            let argon2 =
+                argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
             let mut master_key = vec![0u8; 32];
             argon2
@@ -155,7 +157,9 @@ fn decrypt_type0(payload: &str, key: &SymmetricKey) -> anyhow::Result<Vec<u8>> {
     }
 
     let iv = STANDARD.decode(parts[0]).context("Failed to decode IV")?;
-    let data = STANDARD.decode(parts[1]).context("Failed to decode ciphertext")?;
+    let data = STANDARD
+        .decode(parts[1])
+        .context("Failed to decode ciphertext")?;
 
     let decryptor = Aes256CbcDec::new_from_slices(&key.enc_key, &iv)
         .map_err(|e| anyhow!("AES-CBC init failed: {e}"))?;
@@ -178,12 +182,14 @@ fn decrypt_type2(payload: &str, key: &SymmetricKey) -> anyhow::Result<Vec<u8>> {
     }
 
     let iv = STANDARD.decode(parts[0]).context("Failed to decode IV")?;
-    let data = STANDARD.decode(parts[1]).context("Failed to decode ciphertext")?;
+    let data = STANDARD
+        .decode(parts[1])
+        .context("Failed to decode ciphertext")?;
     let mac = STANDARD.decode(parts[2]).context("Failed to decode MAC")?;
 
     // Verify HMAC-SHA256
-    let mut hmac = HmacSha256::new_from_slice(&key.mac_key)
-        .map_err(|e| anyhow!("HMAC init failed: {e}"))?;
+    let mut hmac =
+        HmacSha256::new_from_slice(&key.mac_key).map_err(|e| anyhow!("HMAC init failed: {e}"))?;
     hmac.update(&iv);
     hmac.update(&data);
     hmac.verify_slice(&mac)
@@ -222,8 +228,8 @@ pub fn encrypt_enc_string(data: &[u8], key: &SymmetricKey) -> anyhow::Result<Str
     let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(data);
 
     // HMAC over IV + ciphertext
-    let mut hmac = HmacSha256::new_from_slice(&key.mac_key)
-        .map_err(|e| anyhow!("HMAC init failed: {e}"))?;
+    let mut hmac =
+        HmacSha256::new_from_slice(&key.mac_key).map_err(|e| anyhow!("HMAC init failed: {e}"))?;
     hmac.update(&iv);
     hmac.update(&ciphertext);
     let mac = hmac.finalize().into_bytes();
@@ -246,11 +252,7 @@ pub fn derive_pin_key(pin: &str) -> anyhow::Result<SymmetricKey> {
 
     let params = argon2::Params::new(64 * 1024, 3, 1, Some(64))
         .map_err(|e| anyhow!("Invalid Argon2 params: {e}"))?;
-    let argon2 = argon2::Argon2::new(
-        argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13,
-        params,
-    );
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
     let mut key_material = vec![0u8; 64];
     argon2

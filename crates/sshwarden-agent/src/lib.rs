@@ -12,7 +12,7 @@ mod platform_ssh_agent;
 mod peercred_unix_listener_stream;
 
 #[cfg(windows)]
-pub mod named_pipe_listener_stream;
+mod named_pipe_listener_stream;
 
 pub use agent::{SshAgentUIRequest, SshWardenAgent, SshWardenKey};
 pub use control::{ControlAction, ControlRequest, ControlResponse, CONTROL_PIPE_NAME};
