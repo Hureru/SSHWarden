@@ -6,6 +6,8 @@
 
 一个独立的命令行 SSH Agent 守护进程，从 Bitwarden 密码库获取 SSH 密钥，替代系统 OpenSSH Agent。
 
+> **注意**: 本项目基于 [Bitwarden clients](https://github.com/bitwarden/clients) 的部分代码开发，遵循 GPL-3.0 许可证。Bitwarden 是 Bitwarden Inc. 的注册商标。
+
 ## 特性
 
 - 🔐 **集中管理**: 通过 Bitwarden 集中存储和管理 SSH 私钥
@@ -99,7 +101,11 @@ SSHWarden 采用模块化设计，包含以下 crate：
 
 ## 许可证
 
-GPL-3.0
+本项目基于 [Bitwarden clients](https://github.com/bitwarden/clients) 开发，遵循 GPL-3.0 许可证。
+
+- **许可证**: GPL-3.0
+- **上游项目**: [Bitwarden clients](https://github.com/bitwarden/clients)
+- **商标**: Bitwarden 是 Bitwarden Inc. 的注册商标，本项目与 Bitwarden Inc. 无关联
 
 ## 安全说明
 

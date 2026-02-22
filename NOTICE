@@ -1,0 +1,75 @@
+# 版权声明和归属
+
+## SSHWarden
+
+Copyright (C) 2026 SSHWarden Contributors
+
+本项目遵循 GNU General Public License v3.0 许可证。
+
+## 基于 Bitwarden Clients
+
+本项目的部分代码基于 Bitwarden clients 项目开发：
+- 上游项目: https://github.com/bitwarden/clients
+- 许可证: GPL-3.0
+- Copyright: Bitwarden Inc.
+
+具体来说，以下组件参考或派生自 Bitwarden clients：
+
+### desktop/desktop_native/
+- SSH Agent 核心实现
+- Windows Hello 生物识别集成
+- 跨平台密码存储
+- IPC 通信机制
+
+这些组件的原始代码版权归 Bitwarden Inc. 所有，根据 GPL-3.0 许可证使用。
+
+## 修改说明
+
+本项目对 Bitwarden clients 的代码进行了以下修改：
+1. 提取 SSH Agent 功能为独立 CLI 工具
+2. 重构为纯 Rust 实现（移除 Electron/Node.js 依赖）
+3. 添加 Windows Hello 签名路径支持
+4. 实现 vault.enc 密钥持久化
+5. 添加 PIN 加密和解锁功能
+6. 实现完全便携模式
+
+## 商标声明
+
+- "Bitwarden" 是 Bitwarden Inc. 的注册商标
+- 本项目与 Bitwarden Inc. 无任何官方关联或背书
+- 使用 "Bitwarden" 名称仅用于说明兼容性和技术来源
+
+## 第三方依赖
+
+本项目还使用了以下开源项目：
+
+- **bitwarden-russh**: SSH Agent 协议实现
+  - 仓库: https://github.com/bitwarden/bitwarden-russh
+  - 许可证: Apache-2.0 / MIT
+
+- **Tokio**: 异步运行时
+  - 仓库: https://github.com/tokio-rs/tokio
+  - 许可证: MIT
+
+- **Clap**: CLI 参数解析
+  - 仓库: https://github.com/clap-rs/clap
+  - 许可证: Apache-2.0 / MIT
+
+完整的依赖列表请参阅 `Cargo.toml` 和 `Cargo.lock`。
+
+## GPL-3.0 合规性
+
+根据 GPL-3.0 许可证要求：
+
+1. **源代码可用性**: 本项目的完整源代码在 GitHub 上公开
+2. **许可证传递**: 本项目及其衍生作品必须使用 GPL-3.0 许可证
+3. **修改声明**: 所有修改都在 git 历史中记录
+4. **版权声明**: 保留原始版权声明并添加新的版权声明
+
+## 贡献
+
+如果你对本项目做出贡献，你的贡献将根据 GPL-3.0 许可证授权。
+
+## 联系方式
+
+如有任何许可证或版权相关问题，请通过 GitHub Issues 联系。
