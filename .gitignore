@@ -1,6 +1,5 @@
 # Rust 构建产物
 /target/
-Cargo.lock
 
 # 敏感配置和数据文件
 config.toml
