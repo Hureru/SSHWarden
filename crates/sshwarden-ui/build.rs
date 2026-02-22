@@ -1,0 +1,10 @@
+fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "windows" {
+        let mut res = winresource::WindowsResource::new();
+        res.set_manifest_file("app.manifest");
+        if let Err(e) = res.compile() {
+            // Don't fail the build for the library itself, only for examples/bins
+            println!("cargo:warning=Failed to compile Windows resources: {}", e);
+        }
+    }
+}

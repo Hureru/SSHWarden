@@ -1,0 +1,31 @@
+[package]
+name = "sshwarden-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+reqwest = { version = "0.12", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
+
+# KDF
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+argon2 = "0.5"
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+
+# Encryption
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+rand = "0.8"
+
+[lints]
+workspace = true

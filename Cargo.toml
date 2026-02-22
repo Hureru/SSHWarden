@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sshwarden-agent",
+    "crates/sshwarden-api",
+    "crates/sshwarden-ui",
+    "crates/sshwarden-config",
+]
+
+[package]
+name = "sshwarden"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[dependencies]
+sshwarden-agent = { path = "crates/sshwarden-agent" }
+sshwarden-api = { path = "crates/sshwarden-api" }
+sshwarden-ui = { path = "crates/sshwarden-ui" }
+sshwarden-config = { path = "crates/sshwarden-config" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio-util = { version = "0.7" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+anyhow = "1"
+rpassword = "7"
+serde_json = { workspace = true }
+sysinfo = { workspace = true }
+base64 = { workspace = true }
+rand = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_System_Console",
+] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[workspace.package]
+version = "0.1.0"
+license = "GPL-3.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+bitwarden-russh = { git = "https://github.com/bitwarden/bitwarden-russh.git", rev = "a641316227227f8777fdf56ac9fa2d6b5f7fe662" }
+bytes = "1.11"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ssh-key = { version = "0.6.7", default-features = false }
+sysinfo = "0.37"
+thiserror = "2"
+tokio = { version = "1.48", features = ["io-util", "sync", "macros", "net"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[workspace.lints.clippy]
+print_stderr = "deny"
+print_stdout = "deny"
+unwrap_used = "warn"

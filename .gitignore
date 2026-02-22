@@ -1,0 +1,48 @@
+# Rust 构建产物
+/target/
+Cargo.lock
+
+# 敏感配置和数据文件
+config.toml
+vault.enc
+*.log
+*.pid
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.bak
+nul
+
+# 密钥文件
+*.key
+*.pem
+*.ppk
+*.env
+.env.*
+
+# Windows 特定
+*.exe
+*.dll
+*.pdb
+!target/release/sshwarden.exe
+
+# 调试符号
+*.dSYM/
+
+# 文档构建产物
+/target/doc/
+
+# Desktop 子项目（如果不需要）
+/desktop/
