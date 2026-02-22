@@ -56,42 +56,11 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
             artifact_name: sshwarden.exe
-            asset_name: sshwarden-$VERSION-windows-x64.zip
-            package_cmd: |
-              mkdir release-package
-              cp target/release/sshwarden.exe release-package/
-              cp config.toml.example release-package/
-              cp README.md release-package/
-              cp BUILD.md release-package/
-              Compress-Archive -Path release-package/* -DestinationPath sshwarden-$VERSION-windows-x64.zip
-
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
             artifact_name: sshwarden
-            asset_name: sshwarden-$VERSION-linux-x64.tar.gz
-            package_cmd: |
-              mkdir release-package
-              cp target/release/sshwarden release-package/
-              cp config.toml.example release-package/
-              cp README.md release-package/
-              cp BUILD.md release-package/
-              chmod +x release-package/sshwarden
-              tar -czf sshwarden-$VERSION-linux-x64.tar.gz -C release-package .
-
           - os: macos-latest
-            target: x86_64-apple-darwin
             artifact_name: sshwarden
-            asset_name: sshwarden-$VERSION-macos-x64.tar.gz
-            package_cmd: |
-              mkdir release-package
-              cp target/release/sshwarden release-package/
-              cp config.toml.example release-package/
-              cp README.md release-package/
-              cp BUILD.md release-package/
-              chmod +x release-package/sshwarden
-              tar -czf sshwarden-$VERSION-macos-x64.tar.gz -C release-package .
 
     steps:
       - name: Checkout code
@@ -99,8 +68,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -112,20 +79,70 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }} --verbose
+        run: cargo build --release --verbose
 
-      - name: Package release
+      - name: Package release (Windows)
+        if: matrix.os == 'windows-latest'
         shell: bash
         run: |
           VERSION=${{ needs.create-release.outputs.version }}
-          ${{ matrix.package_cmd }}
+          mkdir release-package
+          cp target/release/sshwarden.exe release-package/
+          cp config.toml.example release-package/
+          cp README.md release-package/
+          7z a sshwarden-${VERSION}-windows-x64.zip ./release-package/*
 
-      - name: Upload Release Asset
+      - name: Package release (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          VERSION=${{ needs.create-release.outputs.version }}
+          mkdir release-package
+          cp target/release/sshwarden release-package/
+          cp config.toml.example release-package/
+          cp README.md release-package/
+          chmod +x release-package/sshwarden
+          tar -czf sshwarden-${VERSION}-linux-x64.tar.gz -C release-package .
+
+      - name: Package release (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          VERSION=${{ needs.create-release.outputs.version }}
+          mkdir release-package
+          cp target/release/sshwarden release-package/
+          cp config.toml.example release-package/
+          cp README.md release-package/
+          chmod +x release-package/sshwarden
+          tar -czf sshwarden-${VERSION}-macos-x64.tar.gz -C release-package .
+
+      - name: Upload Release Asset (Windows)
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./${{ matrix.asset_name }}
-          asset_name: ${{ matrix.asset_name }}
-          asset_content_type: application/octet-stream
+          asset_path: ./sshwarden-${{ needs.create-release.outputs.version }}-windows-x64.zip
+          asset_name: sshwarden-${{ needs.create-release.outputs.version }}-windows-x64.zip
+          asset_content_type: application/zip
+
+      - name: Upload Release Asset (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./sshwarden-${{ needs.create-release.outputs.version }}-linux-x64.tar.gz
+          asset_name: sshwarden-${{ needs.create-release.outputs.version }}-linux-x64.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload Release Asset (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./sshwarden-${{ needs.create-release.outputs.version }}-macos-x64.tar.gz
+          asset_name: sshwarden-${{ needs.create-release.outputs.version }}-macos-x64.tar.gz
+          asset_content_type: application/gzip
