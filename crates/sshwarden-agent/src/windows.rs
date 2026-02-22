@@ -1,5 +1,5 @@
-use bitwarden_russh::ssh_agent;
 use super::named_pipe_listener_stream;
+use bitwarden_russh::ssh_agent;
 
 use std::sync::Arc;
 

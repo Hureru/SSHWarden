@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use tracing::{error, info};
 
 #[derive(Debug, Serialize, Deserialize)]
