@@ -1,5 +1,9 @@
 # SSHWarden
 
+[![Build and Test](https://github.com/Hureru/SSHWarden/actions/workflows/build.yml/badge.svg)](https://github.com/Hureru/SSHWarden/actions/workflows/build.yml)
+[![Release](https://github.com/Hureru/SSHWarden/actions/workflows/release.yml/badge.svg)](https://github.com/Hureru/SSHWarden/actions/workflows/release.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
 一个独立的命令行 SSH Agent 守护进程，从 Bitwarden 密码库获取 SSH 密钥，替代系统 OpenSSH Agent。
 
 ## 特性
@@ -21,13 +25,36 @@
 - **Windows API**: WinRT (Toast 通知、Windows Hello)
 - **加密**: AES-256-CBC + HMAC-SHA256, Argon2id
 
-## 快速开始
+## 安装
 
-### 构建
+### 从 Release 下载（推荐）
+
+前往 [Releases](https://github.com/Hureru/SSHWarden/releases) 页面下载最新版本：
+
+- **Windows**: `sshwarden-x.x.x-windows-x64.zip`
+- **Linux**: `sshwarden-x.x.x-linux-x64.tar.gz`
+- **macOS**: `sshwarden-x.x.x-macos-x64.tar.gz`
+
+### 从源码构建
 
 ```bash
+git clone https://github.com/Hureru/SSHWarden.git
+cd SSHWarden
 cargo build --release
 ```
+
+详细构建说明请参阅 [BUILD.md](BUILD.md)
+
+## 快速开始
+
+### 配置
+
+1. 复制配置文件示例：
+```bash
+cp config.toml.example config.toml
+```
+
+2. 编辑 `config.toml`，填写你的 Bitwarden 邮箱和其他配置。
 
 ### 使用
 

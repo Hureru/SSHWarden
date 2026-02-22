@@ -1,0 +1,88 @@
+# SSHWarden 配置文件示例
+# 将此文件复制为 config.toml 并根据需要修改
+
+# ============================================
+# 服务器配置
+# ============================================
+[server]
+# Bitwarden 服务器基础 URL
+# 默认: "https://vault.bitwarden.com"
+# 自托管服务器示例: "https://your-bitwarden-server.com"
+base_url = "https://vault.bitwarden.com"
+
+# API URL（可选，默认为 base_url/api）
+# api_url = "https://vault.bitwarden.com/api"
+
+# Identity URL（可选，默认为 base_url/identity）
+# identity_url = "https://vault.bitwarden.com/identity"
+
+# ============================================
+# 认证配置
+# ============================================
+[auth]
+# 认证方法
+# 可选值: "password", "api_key"
+# 默认: "password"
+method = "password"
+
+# Bitwarden 账户邮箱
+# 留空则每次启动时提示输入
+email = ""
+
+# ============================================
+# Agent 配置
+# ============================================
+[agent]
+# SSH 签名请求提示行为
+# 可选值:
+#   - "always": 每次请求都提示（最安全）
+#   - "never": 从不提示（自动批准所有请求）
+#   - "remember_until_lock": 记住决定直到锁定（平衡安全与便利）
+# 默认: "always"
+prompt_behavior = "always"
+
+# 自动同步间隔（秒）
+# 定期从 Bitwarden 同步 SSH 密钥
+# 默认: 300（5 分钟）
+sync_interval = 300
+
+# 自动锁定超时（秒）
+# 无活动后自动锁定 Agent
+# 默认: 3600（1 小时）
+# 设置为 0 禁用自动锁定
+lock_timeout = 3600
+
+# ============================================
+# 解锁配置
+# ============================================
+[unlock]
+# 默认解锁方法
+# 可选值:
+#   - "windows_hello": Windows Hello 生物识别（仅 Windows）
+#   - "pin": PIN 码快速解锁
+#   - "password": Bitwarden 主密码
+# 默认: Windows 上为 "windows_hello"，其他平台为 "password"
+method = "windows_hello"
+
+# 备用解锁方法
+# 当主解锁方法失败时使用
+# 可选值:
+#   - "pin": PIN 码
+#   - "password": 主密码
+# 默认: "pin"
+fallback = "pin"
+
+# SSH 请求时自动尝试解锁
+# true: 收到 SSH 请求时自动尝试 Windows Hello 解锁
+# false: 需要手动解锁
+# 默认: true
+auto_unlock_on_request = true
+
+# ============================================
+# Socket 配置（高级）
+# ============================================
+[socket]
+# 自定义 socket 路径（可选）
+# Windows 默认: \\.\pipe\openssh-ssh-agent
+# Unix 默认: $SSH_AUTH_SOCK 或 /tmp/ssh-agent.sock
+# path = "\\\\.\\pipe\\openssh-ssh-agent"

@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: SSHWarden ${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+          body: |
+            ## SSHWarden ${{ steps.get_version.outputs.version }}
+
+            ### 下载
+
+            - **Windows**: sshwarden-${{ steps.get_version.outputs.version }}-windows-x64.zip
+            - **Linux**: sshwarden-${{ steps.get_version.outputs.version }}-linux-x64.tar.gz
+            - **macOS**: sshwarden-${{ steps.get_version.outputs.version }}-macos-x64.tar.gz
+
+            ### 安装说明
+
+            1. 下载对应平台的压缩包
+            2. 解压到任意目录
+            3. 将 `config.toml.example` 复制为 `config.toml` 并配置
+            4. 运行 `sshwarden daemon` 启动守护进程
+
+            详细文档请参阅 [README.md](https://github.com/Hureru/SSHWarden/blob/main/README.md)
+
+  build-release:
+    name: Build Release - ${{ matrix.os }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: sshwarden.exe
+            asset_name: sshwarden-$VERSION-windows-x64.zip
+            package_cmd: |
+              mkdir release-package
+              cp target/release/sshwarden.exe release-package/
+              cp config.toml.example release-package/
+              cp README.md release-package/
+              cp BUILD.md release-package/
+              Compress-Archive -Path release-package/* -DestinationPath sshwarden-$VERSION-windows-x64.zip
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: sshwarden
+            asset_name: sshwarden-$VERSION-linux-x64.tar.gz
+            package_cmd: |
+              mkdir release-package
+              cp target/release/sshwarden release-package/
+              cp config.toml.example release-package/
+              cp README.md release-package/
+              cp BUILD.md release-package/
+              chmod +x release-package/sshwarden
+              tar -czf sshwarden-$VERSION-linux-x64.tar.gz -C release-package .
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: sshwarden
+            asset_name: sshwarden-$VERSION-macos-x64.tar.gz
+            package_cmd: |
+              mkdir release-package
+              cp target/release/sshwarden release-package/
+              cp config.toml.example release-package/
+              cp README.md release-package/
+              cp BUILD.md release-package/
+              chmod +x release-package/sshwarden
+              tar -czf sshwarden-$VERSION-macos-x64.tar.gz -C release-package .
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }} --verbose
+
+      - name: Package release
+        shell: bash
+        run: |
+          VERSION=${{ needs.create-release.outputs.version }}
+          ${{ matrix.package_cmd }}
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./${{ matrix.asset_name }}
+          asset_name: ${{ matrix.asset_name }}
+          asset_content_type: application/octet-stream
