@@ -3,7 +3,7 @@
 **项目**: SSHWarden -- Bitwarden SSH Agent (独立 CLI)
 **版本**: Phase 5 complete
 **License**: GPL-3.0
-**技术栈**: Pure Rust (Tokio + Clap + Slint + WinRT + bitwarden-russh)
+**技术栈**: Pure Rust (Tokio + Clap + Slint + winit + WinRT + bitwarden-russh)
 
 ---
 
@@ -158,7 +158,13 @@
 
 ## 文档更新日志
 
-**最后更新**: 2026-03-02
+**最后更新**: 2026-03-03
+
+### Slint 窗口居中+聚焦跨平台改造 & AuthDialog UI 美化
+- UPDATE `architecture/slint-authorization-dialog.md` - `center_and_focus_dialog()` 改为跨平台（移除 `#[cfg]`，使用 winit `focus_window()`），延迟调度改为 `Timer::single_shot(30ms)`，UI 属性更新（380x195px、Segoe UI 字体、22px 进程名、13px 正文、16px 内边距、30px 按钮高度）
+- UPDATE `architecture/sshwarden-windows-hello-unlock.md` - PinDialog 新增 `center_and_focus_dialog` 跨平台居中+聚焦描述，Design Rationale 新增 winit 访问器条目
+- UPDATE `overview/project-overview.md` - 技术栈 UI 层新增 winit (via WinitWindowAccessor) 和窗口居中+聚焦描述
+- UPDATE `llmdoc/index.md` - 技术栈新增 winit，新增更新日志
 
 ### Slint 授权对话框替代 Windows Toast 通知（跨平台 UI 统一）
 - RENAME `architecture/windows-toast-notification-flow.md` -> `architecture/slint-authorization-dialog.md` - 重写为 Slint 跨平台授权对话框架构，替代 Windows Toast 通知 + TaskDialog + MessageBox fallback + non-Windows 自动批准

@@ -8,7 +8,7 @@
 ## 2. Core Components
 
 - `crates/sshwarden-ui/src/unlock/mod.rs` (`UnlockResult`, `show_pin_dialog`, `request_pin_dialog`): 解锁结果枚举，导出 Slint PIN 对话框的跨线程通信函数.
-- `crates/sshwarden-ui/src/unlock/slint_dialog.rs` (`show_pin_dialog`, `request_pin_dialog`): Slint PIN 对话框实现——`slint::slint!{}` 内联宏定义暗色主题窗口，`show_pin_dialog()` 在 Slint 主线程创建对话框，`request_pin_dialog()` 从 tokio 线程通过 `UIRequest::PinDialog` 异步请求.
+- `crates/sshwarden-ui/src/unlock/slint_dialog.rs` (`show_pin_dialog`, `request_pin_dialog`, `center_and_focus_dialog`): Slint PIN 对话框实现——`slint::slint!{}` 内联宏定义暗色主题窗口，`show_pin_dialog()` 在 Slint 主线程创建对话框，`request_pin_dialog()` 从 tokio 线程通过 `UIRequest::PinDialog` 异步请求，`center_and_focus_dialog()` 跨平台居中+聚焦（slint_center_win + winit focus_window）.
 - `crates/sshwarden-ui/src/unlock/windows.rs` (`prompt_windows_hello`, `focus_and_center_security_prompt_pub`): Windows Hello UV 路径（仅 CLI `unlock` 使用）+ 窗口居中辅助.
 - `crates/sshwarden-ui/src/unlock/hello_crypto.rs` (`hello_derive_key`, `hello_encrypt_keys`, `hello_decrypt_keys`, `hello_available`, `credential_set`, `credential_get`, `credential_delete`, `credential_exists`): Windows Hello 签名路径 + Windows Credential Manager 加密缓存.
 - `src/main.rs` (`handle_ui_request`, `handle_control_command`, `try_hello_unlock`, `finish_unlock_with_json`, `run_slint_event_loop`): 调用入口、解锁逻辑和 Slint 事件循环。Hello 签名路径成功后的授权改为 `request_authorization()` 通过 Slint 授权对话框。
@@ -29,7 +29,7 @@
 - **1. 触发:** Hello 签名路径失败后，在三个位置降级：ControlAction::Unlock (`src/main.rs:752-795`)、list 请求 (`src/main.rs:1280-1318`)、sign 请求 (`src/main.rs:1442-1527`).
 - **2. 异步请求:** 调用 `request_pin_dialog(&ui_request_tx)` 向 Slint 主线程发送 `UIRequest::PinDialog`，通过 oneshot channel 等待结果. 参见 `crates/sshwarden-ui/src/unlock/slint_dialog.rs:114-135`.
 - **3. Slint 调度:** bridge 线程接收 `UIRequest::PinDialog`，`slint::invoke_from_event_loop` 调用 `show_pin_dialog()` 在主线程创建 Slint 窗口. 参见 `src/main.rs:257-268`.
-- **4. 用户交互:** Slint PIN 对话框（暗色主题、password input、always-on-top），用户输入 PIN 或取消. 参见 `crates/sshwarden-ui/src/unlock/slint_dialog.rs:3-49`.
+- **4. 用户交互:** Slint PIN 对话框（暗色主题、password input、always-on-top），`show()` 后 `Timer::single_shot(30ms)` 延迟调用 `center_and_focus_dialog()` 居中窗口并通过 winit `focus_window()` 前置激活. 用户输入 PIN 或取消. 参见 `crates/sshwarden-ui/src/unlock/slint_dialog.rs:54-62` (center_and_focus), `crates/sshwarden-ui/src/unlock/slint_dialog.rs:3-51` (UI).
 - **5. PIN 解密:** 用户输入 PIN 后，从 `pin_encrypted_keys` 或 `vault_file_data` 读取密文，调用 `pin_decrypt()` 解密.
 - **6. 授权对话框:** PIN 解锁成功后，若 `prompt_behavior` 要求授权，调用 `request_authorization()` 弹出 Slint 授权对话框. 参见 `src/main.rs:1509-1532`.
 - **7. 完成解锁:** 解密成功后调用 `finish_unlock_with_json()` 加载密钥.
@@ -48,3 +48,4 @@
 - **签名路径优先:** 自动解锁优先签名路径（无需交互），失败后降级到 PIN 对话框（需用户输入）。
 - **Focus helper:** 签名路径使用后台线程持续调用 focus helper，确保安全提示窗口前置。
 - **spawn_blocking:** WinRT 同步 API 不能在 tokio 异步运行时中直接调用。
+- **跨平台窗口居中+聚焦:** `center_and_focus_dialog()` 移除了 `#[cfg(windows)]` 条件编译，通过 Slint `unstable-winit-030` feature 暴露的 `WinitWindowAccessor` 获取底层 winit 窗口并调用 `focus_window()`，在所有 winit 支持的平台工作。
