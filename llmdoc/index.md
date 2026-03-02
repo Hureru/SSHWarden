@@ -3,7 +3,7 @@
 **项目**: SSHWarden -- Bitwarden SSH Agent (独立 CLI)
 **版本**: Phase 5 complete
 **License**: GPL-3.0
-**技术栈**: Pure Rust (Tokio + Clap + WinRT + bitwarden-russh)
+**技术栈**: Pure Rust (Tokio + Clap + Slint + WinRT + bitwarden-russh)
 
 ---
 
@@ -16,10 +16,10 @@
    - `overview/project-overview.md` - SSHWarden 是什么、技术栈、crate 结构、实现阶段
 
 2. **核心架构理解**
-   - `architecture/sshwarden-main-loop.md` - 守护进程主循环 tokio::select! 四路事件处理
+   - `architecture/sshwarden-main-loop.md` - 双线程架构（Slint 主线程 + tokio 线程）tokio::select! 四路事件处理
    - `architecture/ipc-control-channel.md` - IPC 控制通道架构（Named Pipe JSON 协议，8 种命令）
-   - `architecture/windows-toast-notification-flow.md` - Toast 通知授权流程
-   - `architecture/sshwarden-windows-hello-unlock.md` - Windows Hello 解锁（UV + 签名路径双路径）
+   - `architecture/slint-authorization-dialog.md` - Slint 跨平台授权对话框（SSH 签名请求 Approve/Deny）
+   - `architecture/sshwarden-windows-hello-unlock.md` - Windows Hello 解锁（签名路径 + Slint PIN 对话框降级）
    - `architecture/sshwarden-pin-encryption.md` - PIN 加解密架构 + vault.enc 持久化
 
 3. **操作指南**
@@ -36,9 +36,14 @@
 |------|------|
 | "项目是什么，crate 结构如何？" | `overview/project-overview.md` |
 | "守护进程主循环如何工作？" | `architecture/sshwarden-main-loop.md` |
-| "SSH 签名请求如何授权？" | `architecture/windows-toast-notification-flow.md` |
+| "双线程架构怎么工作？" | `architecture/sshwarden-main-loop.md` (3.1 节) |
+| "SSH 签名请求如何授权？" | `architecture/slint-authorization-dialog.md` |
 | "Windows Hello 解锁如何工作？" | `architecture/sshwarden-windows-hello-unlock.md` |
 | "Hello 签名路径是什么？" | `architecture/sshwarden-windows-hello-unlock.md` (3.1 节) |
+| "PIN 对话框降级如何工作？" | `architecture/sshwarden-windows-hello-unlock.md` (3.2 节) |
+| "Slint PIN 对话框如何跨线程调度？" | `architecture/sshwarden-windows-hello-unlock.md` (3.2 节) + `architecture/sshwarden-main-loop.md` (3.1 节) |
+| "Slint 授权对话框如何工作？" | `architecture/slint-authorization-dialog.md` |
+| "UIRequest 枚举如何统一 UI 请求？" | `architecture/sshwarden-main-loop.md` (2 节 UIRequest) + `architecture/slint-authorization-dialog.md` (3.2 节) |
 | "PIN 加解密如何实现？" | `architecture/sshwarden-pin-encryption.md` |
 | "vault.enc 持久化如何工作？" | `architecture/sshwarden-pin-encryption.md` (3.1 步骤 6-7) |
 | "IPC 控制通道如何通信？" | `architecture/ipc-control-channel.md` |
@@ -53,7 +58,7 @@
 
 #### 1. `overview/project-overview.md`
 **身份**: SSHWarden -- Bitwarden SSH Agent
-**内容**: 项目定义、技术栈（Rust + Tokio + Clap + WinRT）、5 个 crate 的职责、5 个实现阶段状态、关键设计决策
+**内容**: 项目定义、技术栈（Rust + Tokio + Clap + Slint + WinRT）、5 个 crate 的职责、5 个实现阶段状态、关键设计决策
 **适用角色**: 任何人 - 快速了解项目
 
 ---
@@ -61,18 +66,18 @@
 ### Architecture - 系统构建方式
 
 #### 2. `architecture/sshwarden-main-loop.md`
-**身份**: SSHWarden 守护进程主循环架构
-**内容**: 启动初始化流程（vault.enc 检测/条件登录/通道/Agent/状态）、tokio::select! 四路事件（control/request/lock-check/ctrl-c）、8 种控制命令处理、三级自动解锁、关闭流程
+**身份**: SSHWarden 守护进程双线程架构（Slint 主线程 + tokio 线程）
+**内容**: 双线程启动流程（main -> Slint 事件循环 + tokio 线程）、UIRequest 统一通道桥接（mpsc + slint::invoke_from_event_loop，分发 PinDialog/AuthDialog）、tokio::select! 四路事件（control/request/lock-check/ctrl-c）、8 种控制命令处理、二级自动解锁、关闭流程（channel drop -> quit_event_loop）
 **适用角色**: 核心架构开发
 
-#### 3. `architecture/windows-toast-notification-flow.md`
-**身份**: Windows Toast 通知授权流程
-**内容**: Toast XML 构建（scenario=urgent）、TypedEventHandler 回调（Ref deref + Interface cast）、PowerShell AUMID fallback、MessageBox fallback、60 秒超时
-**适用角色**: Windows UI 开发
+#### 3. `architecture/slint-authorization-dialog.md`
+**身份**: Slint 跨平台授权对话框
+**内容**: SSH 签名请求授权 UI（替代原 Windows Toast 通知 + TaskDialog/MessageBox）、AuthDialog 窗口组件（进程名/密钥名/操作类型/代理转发警告/Approve+Deny）、UIRequest::AuthDialog 跨线程调度（request_authorization -> bridge -> show_auth_dialog）、3 处调用点（Hello 签名路径后/PIN 解锁后/正常签名）
+**适用角色**: UI 开发、授权流程开发
 
 #### 4. `architecture/sshwarden-windows-hello-unlock.md`
-**身份**: SSHWarden 的 Windows Hello 解锁流程（双路径）
-**内容**: UV 路径（UserConsentVerifier）、签名路径（KeyCredentialManager + Credential Manager）、SSH 请求自动解锁优先级（签名 -> UV -> 拒绝）、hello_crypto 模块
+**身份**: SSHWarden 的 Windows Hello 解锁流程（签名路径 + Slint PIN 对话框降级）
+**内容**: 签名路径（KeyCredentialManager）、Slint PIN 对话框降级路径（跨平台暗色窗口、跨线程 mpsc+oneshot 通信）、SSH 请求自动解锁优先级（签名 -> PIN 对话框 -> 拒绝）、hello_crypto 模块
 **适用角色**: 解锁流程开发
 
 #### 5. `architecture/ipc-control-channel.md`
@@ -153,7 +158,26 @@
 
 ## 文档更新日志
 
-**最后更新**: 2026-02-14
+**最后更新**: 2026-03-02
+
+### Slint 授权对话框替代 Windows Toast 通知（跨平台 UI 统一）
+- RENAME `architecture/windows-toast-notification-flow.md` -> `architecture/slint-authorization-dialog.md` - 重写为 Slint 跨平台授权对话框架构，替代 Windows Toast 通知 + TaskDialog + MessageBox fallback + non-Windows 自动批准
+- UPDATE `overview/project-overview.md` - UI 层描述从 Toast 通知/MessageBox 改为 Slint 授权对话框，双线程架构从 PinDialogRequest 改为 UIRequest 统一枚举
+- UPDATE `architecture/sshwarden-main-loop.md` - bridge 线程从 PinDialogRequest 改为 UIRequest match 分发（PinDialog + AuthDialog），新增 UIRequest/show_auth_dialog/request_authorization 组件
+- UPDATE `architecture/sshwarden-windows-hello-unlock.md` - 签名路径后授权从 spawn_blocking+TaskDialog 改为 async request_authorization，PIN 降级后新增授权对话框步骤，跨线程通信改为 UIRequest 枚举
+- UPDATE `llmdoc/index.md` - 文件重命名、查询表新增授权对话框/UIRequest 条目、文档描述更新
+
+### Slint GUI 框架替代 Win32 PIN 对话框（跨平台 + 双线程架构）
+- UPDATE `overview/project-overview.md` - 技术栈新增 Slint，High-Level Description 改为双线程模型，UI 层 PIN 对话框从 Win32 Acrylic 改为 Slint 跨平台，crate 描述更新，新增"双线程架构"设计决策，PIN 对话框降级描述改为 Slint
+- UPDATE `architecture/sshwarden-main-loop.md` - 重写为双线程架构：主线程 Slint 事件循环 + tokio 独立线程，新增 `run_slint_event_loop`/bridge 线程/`PinDialogRequest` 通道组件，关闭流程新增 channel drop -> quit_event_loop，更新所有代码行号引用
+- UPDATE `architecture/sshwarden-windows-hello-unlock.md` - PIN 对话框从 Win32 原生改为 Slint 跨平台实现，移除 3.3 PIN 对话框 UI 实现节（Win32 细节），降级路径改为 `request_pin_dialog()` 异步请求 Slint 主线程，新增跨线程通信描述（mpsc + oneshot + invoke_from_event_loop），Design Rationale 新增"Slint 替代 Win32"条目
+- UPDATE `llmdoc/index.md` - 技术栈新增 Slint，更新文档描述、查询表新增双线程/Slint 条目、新增更新日志
+
+### CredUI 降级移除 + PIN 对话框添加（Windows Hello 解锁流程重构）
+- UPDATE `architecture/sshwarden-windows-hello-unlock.md` - 重写为签名路径 + PIN 对话框降级架构：移除 UV 路径用于自动解锁（vault.enc 启动后 cached_key_tuples 为空，UV 无用），移除 CredUI 降级（无锁屏密码 PC 上失败），新增 Win32 原生 PIN 对话框（Acrylic 暗色主题、DPI-aware、键盘快捷键），更新自动解锁优先级（签名 -> PIN 对话框 -> 拒绝）
+- UPDATE `overview/project-overview.md` - Tech Stack UI 层新增 PIN 输入对话框描述，Key Design Decisions 更新为"签名路径 + PIN 对话框降级"
+- UPDATE `architecture/sshwarden-main-loop.md` - 更新自动解锁描述（二级：Hello 签名 -> PIN 对话框），更新代码行号引用
+- UPDATE `llmdoc/index.md` - 新增 PIN 对话框查询表条目、更新 Windows Hello 文档描述、新增更新日志
 
 ### 自启动机制变更（Task Scheduler -> 启动文件夹快捷方式）
 - UPDATE `guides/how-to-use-cli-commands.md` - 新增步骤 10/11：daemon --install/--uninstall 创建/删除启动文件夹快捷方式
