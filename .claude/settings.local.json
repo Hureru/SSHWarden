@@ -11,7 +11,19 @@
       "WebFetch(domain:microsoft.github.io)",
       "WebFetch(domain:github.com)",
       "Bash(cargo build:*)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(test:*)",
+      "WebSearch",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:docs.microsoft.com)",
+      "WebFetch(domain:stackoverflow.com)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "mcp__context7__resolve-library-id",
+      "WebFetch(domain:docs.rs)",
+      "Bash(cargo check:*)",
+      "WebFetch(domain:slint.dev)",
+      "Bash(cargo tree:*)"
     ]
   }
 }
