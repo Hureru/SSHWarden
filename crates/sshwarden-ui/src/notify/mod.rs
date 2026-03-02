@@ -1,11 +1,3 @@
-#[cfg(windows)]
-mod windows;
+mod slint_dialog;
 
-#[cfg(windows)]
-pub use self::windows::{prompt_authorization, prompt_authorization_blocking};
-
-#[cfg(not(windows))]
-mod fallback;
-
-#[cfg(not(windows))]
-pub use fallback::prompt_authorization;
+pub use slint_dialog::{show_auth_dialog, request_authorization, AuthDialogRequest};

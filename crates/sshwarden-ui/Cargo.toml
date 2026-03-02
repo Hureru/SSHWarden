@@ -10,6 +10,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 sshwarden-api = { path = "../sshwarden-api" }
+slint = "1.15"
+slint-center-win = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 sha2 = "0.10"
@@ -18,10 +20,8 @@ windows = { version = "0.61", features = [
     "Foundation",
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Controls",
     "Win32_UI_HiDpi",
     "Win32_System_Com",
-    "Win32_Graphics_Gdi",
     "Security_Credentials_UI",
     "Security_Credentials",
     "Security_Cryptography",
