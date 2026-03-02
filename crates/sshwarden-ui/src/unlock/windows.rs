@@ -6,9 +6,8 @@ use super::UnlockResult;
 /// Windows Hello unlock prompt using WinRT UserConsentVerifier.
 ///
 /// Shows the system biometric/PIN authentication dialog.
-/// If Windows Hello is not available (e.g., Win10 without biometric hardware),
-/// falls back to CredUIPromptForWindowsCredentialsW which is lighter and
-/// doesn't steal full-screen focus.
+/// Returns NotAvailable/Failed directly when Hello is not available,
+/// so the caller can try alternative unlock methods (e.g., PIN dialog).
 pub async fn prompt_windows_hello() -> UnlockResult {
     match tokio::task::spawn_blocking(do_unlock).await {
         Ok(result) => result,
@@ -20,23 +19,7 @@ pub async fn prompt_windows_hello() -> UnlockResult {
 }
 
 fn do_unlock() -> UnlockResult {
-    // Try Windows Hello first
-    let hello_result = try_windows_hello();
-
-    match hello_result {
-        // Hello succeeded or user explicitly cancelled -> return as-is
-        UnlockResult::Verified | UnlockResult::Cancelled => hello_result,
-        // Hello not available -> fall back to CredUI
-        UnlockResult::NotAvailable => {
-            info!("Windows Hello not available, falling back to CredUI for unlock");
-            credui_unlock_fallback()
-        }
-        // Hello failed (e.g., Win10 20H2 quirks) -> fall back to CredUI
-        UnlockResult::Failed => {
-            info!("Windows Hello failed, falling back to CredUI for unlock");
-            credui_unlock_fallback()
-        }
-    }
+    try_windows_hello()
 }
 
 /// Attempt Windows Hello via UserConsentVerifier.
@@ -163,70 +146,6 @@ fn focus_and_center_security_prompt() {
         let fg = GetForegroundWindow();
         if fg != hwnd {
             let _ = SetForegroundWindow(hwnd);
-        }
-    }
-}
-
-/// CredUI fallback for unlock when Windows Hello is not available.
-///
-/// Uses CredUIPromptForWindowsCredentialsW with CREDUIWIN_GENERIC.
-/// On Win10 this is lighter than the full-screen Hello verification
-/// and won't steal focus aggressively.
-fn credui_unlock_fallback() -> UnlockResult {
-    use windows::Win32::Security::Credentials::{
-        CredUIPromptForWindowsCredentialsW, CREDUIWIN_GENERIC, CREDUI_INFOW,
-    };
-
-    let caption = HSTRING::from("SSHWarden - 解锁密码库");
-    let message_text =
-        HSTRING::from("请验证您的身份以解锁 SSHWarden 密码库\n输入 Windows 凭据以继续");
-
-    let cred_info = CREDUI_INFOW {
-        cbSize: std::mem::size_of::<CREDUI_INFOW>() as u32,
-        hwndParent: Default::default(),
-        pszMessageText: windows::core::PCWSTR(message_text.as_ptr()),
-        pszCaptionText: windows::core::PCWSTR(caption.as_ptr()),
-        hbmBanner: Default::default(),
-    };
-
-    let mut auth_package: u32 = 0;
-    let mut out_cred_buffer: *mut std::ffi::c_void = std::ptr::null_mut();
-    let mut out_cred_size: u32 = 0;
-    let mut save = windows::core::BOOL::default();
-
-    let result = unsafe {
-        CredUIPromptForWindowsCredentialsW(
-            Some(&cred_info as *const _),
-            0,
-            &mut auth_package,
-            None,
-            0,
-            &mut out_cred_buffer,
-            &mut out_cred_size,
-            Some(&mut save),
-            CREDUIWIN_GENERIC,
-        )
-    };
-
-    // Free credential buffer
-    if !out_cred_buffer.is_null() {
-        unsafe {
-            windows::Win32::System::Com::CoTaskMemFree(Some(out_cred_buffer));
-        }
-    }
-
-    match result {
-        0 => {
-            info!("User verified via CredUI fallback");
-            UnlockResult::Verified
-        }
-        1223 => {
-            info!("User cancelled CredUI unlock");
-            UnlockResult::Cancelled
-        }
-        code => {
-            tracing::error!(code, "CredUI unlock returned error");
-            UnlockResult::Failed
         }
     }
 }
