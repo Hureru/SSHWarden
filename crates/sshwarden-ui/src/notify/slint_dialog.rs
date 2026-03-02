@@ -6,8 +6,9 @@ slint::slint! {
     export component AuthDialog inherits Window {
         title: "SSHWarden - Authorization";
         icon: @image-url("../../assets/shhwarden-32x32.png");
-        width: 420px;
-        height: 250px;
+        default-font-family: "Segoe UI";
+        width: 380px;
+        height: 195px;
         background: Palette.background;
         always-on-top: true;
 
@@ -35,14 +36,15 @@ slint::slint! {
             }
         }
 
-        VerticalBox {
-            padding: 24px;
-            spacing: 10px;
+        VerticalLayout {
+            padding: 16px;
+            padding-right: 16px;
+            spacing: 8px;
 
             Text {
                 text: process-name;
                 color: Palette.foreground;
-                font-size: 18px;
+                font-size: 22px;
                 font-weight: 700;
             }
 
@@ -53,11 +55,11 @@ slint::slint! {
             }
 
             VerticalLayout {
-                spacing: 6px;
-                padding-top: 6px;
+                spacing: 4px;
+                padding-top: 4px;
 
                 HorizontalLayout {
-                    spacing: 8px;
+                    spacing: 6px;
                     Text {
                         text: "Key:";
                         color: Palette.foreground;
@@ -73,7 +75,7 @@ slint::slint! {
                 }
 
                 HorizontalLayout {
-                    spacing: 8px;
+                    spacing: 6px;
                     Text {
                         text: "Operation:";
                         color: Palette.foreground;
@@ -92,28 +94,30 @@ slint::slint! {
             if is-forwarding: Rectangle {
                 background: #ff990033;
                 border-radius: 4px;
-                height: warning-text.preferred-height + 16px;
+                height: warning-text.preferred-height + 12px;
 
                 warning-text := Text {
                     text: "\u{26A0} Agent forwarding (from remote host)";
                     color: #ff9900;
                     font-size: 13px;
                     x: 8px;
-                    y: 8px;
+                    y: 6px;
                 }
             }
 
             HorizontalLayout {
                 alignment: end;
-                spacing: 12px;
+                spacing: 10px;
 
                 Button {
                     text: "Deny";
+                    height: 30px;
                     clicked => { root.deny(); }
                 }
 
                 Button {
                     text: "Approve";
+                    height: 30px;
                     primary: true;
                     clicked => { root.approve(); }
                 }
@@ -127,13 +131,15 @@ pub struct AuthDialogRequest {
     pub response_tx: tokio::sync::oneshot::Sender<AuthorizationResult>,
 }
 
-#[cfg(windows)]
-fn center_auth_dialog(dialog: &AuthDialog) {
-    slint_center_win::center_window(dialog.window());
+fn center_and_focus_dialog(dialog: &AuthDialog) {
+    let window = dialog.window();
+    slint_center_win::center_window(window);
+    use slint::winit_030::WinitWindowAccessor;
+    let _ = window.with_winit_window(|winit_window: &slint::winit_030::winit::window::Window| {
+        winit_window.focus_window();
+        None::<()>
+    });
 }
-
-#[cfg(not(windows))]
-fn center_auth_dialog(_dialog: &AuthDialog) {}
 
 pub fn show_auth_dialog(request: AuthDialogRequest) {
     let dialog = match AuthDialog::new() {
@@ -198,7 +204,7 @@ pub fn show_auth_dialog(request: AuthDialogRequest) {
         let weak = dialog.as_weak();
         slint::Timer::single_shot(std::time::Duration::from_millis(30), move || {
             if let Some(d) = weak.upgrade() {
-                center_auth_dialog(&d);
+                center_and_focus_dialog(&d);
             }
         });
     }

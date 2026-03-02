@@ -10,7 +10,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 sshwarden-api = { path = "../sshwarden-api" }
-slint = "1.15"
+slint = { version = "1.15", features = ["unstable-winit-030"] }
 slint-center-win = "0.3"
 
 [target.'cfg(windows)'.dependencies]

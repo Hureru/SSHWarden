@@ -51,13 +51,15 @@ slint::slint! {
     }
 }
 
-#[cfg(windows)]
-fn center_pin_dialog(dialog: &PinDialog) {
-    slint_center_win::center_window(dialog.window());
+fn center_and_focus_dialog(dialog: &PinDialog) {
+    let window = dialog.window();
+    slint_center_win::center_window(window);
+    use slint::winit_030::WinitWindowAccessor;
+    let _ = window.with_winit_window(|winit_window: &slint::winit_030::winit::window::Window| {
+        winit_window.focus_window();
+        None::<()>
+    });
 }
-
-#[cfg(not(windows))]
-fn center_pin_dialog(_dialog: &PinDialog) {}
 
 /// Show a PIN dialog on the Slint event loop thread.
 ///
@@ -117,7 +119,7 @@ pub fn show_pin_dialog(response_tx: tokio::sync::oneshot::Sender<Option<String>>
         let weak = dialog.as_weak();
         slint::Timer::single_shot(std::time::Duration::from_millis(30), move || {
             if let Some(d) = weak.upgrade() {
-                center_pin_dialog(&d);
+                center_and_focus_dialog(&d);
             }
         });
     }
