@@ -74,8 +74,10 @@ enum Commands {
     Config,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Type alias for the UI request sender passed through the system.
+type UIRequestTx = Arc<tokio::sync::mpsc::Sender<sshwarden_ui::UIRequest>>;
+
+fn main() -> anyhow::Result<()> {
     // Set Per-Monitor DPI Awareness V2 before any UI calls.
     // This prevents Win32 dialogs (CredUI) from being blurry on high-DPI displays.
     sshwarden_ui::init();
@@ -118,72 +120,162 @@ async fn main() -> anyhow::Result<()> {
 
     let config = sshwarden_config::Config::load().context("Failed to load configuration")?;
 
-    match cli.command {
-        None => run_foreground(config).await,
-        Some(Commands::Daemon { install, uninstall }) => {
-            if install {
-                return cmd_daemon_install().await;
-            }
-            if uninstall {
-                return cmd_daemon_uninstall().await;
-            }
-            // Run daemon directly in this process (no spawn)
-            if is_daemon_running() {
-                info!("SSHWarden daemon is already running");
-                return Ok(());
-            }
-            // Detach from parent console so the terminal regains control
-            #[cfg(windows)]
-            detach_console();
+    // Determine if we need the Slint UI event loop (foreground/daemon modes)
+    let needs_ui = matches!(
+        cli.command,
+        None | Some(Commands::Daemon {
+            install: false,
+            uninstall: false
+        })
+    );
 
-            write_pid_file()?;
-            info!("SSHWarden daemon started (PID: {})", std::process::id());
-            let result = run_foreground(config).await;
-            remove_pid_file();
-            result
+    if needs_ui {
+        // Create UI request channel for tokio <-> Slint communication
+        let (ui_request_tx, ui_request_rx) =
+            tokio::sync::mpsc::channel::<sshwarden_ui::UIRequest>(1);
+        let ui_request_tx = Arc::new(ui_request_tx);
+
+        // Build the tokio runtime manually (not on main thread)
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create tokio runtime")?;
+
+        // Spawn the async logic on the tokio runtime thread
+        let is_daemon_mode = is_daemon;
+        let ui_tx = ui_request_tx.clone();
+        let tokio_handle = std::thread::spawn(move || -> anyhow::Result<()> {
+            rt.block_on(async move {
+                if is_daemon_mode {
+                    if is_daemon_running() {
+                        info!("SSHWarden daemon is already running");
+                        return Ok(());
+                    }
+                    #[cfg(windows)]
+                    detach_console();
+
+                    write_pid_file()?;
+                    info!("SSHWarden daemon started (PID: {})", std::process::id());
+                    let result = run_foreground(config, ui_tx).await;
+                    remove_pid_file();
+                    result
+                } else {
+                    run_foreground(config, ui_tx).await
+                }
+            })
+        });
+
+        // Main thread: run Slint event loop and handle UI requests
+        run_slint_event_loop(ui_request_rx);
+
+        // Wait for tokio thread to finish
+        match tokio_handle.join() {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!("Tokio runtime thread panicked"),
         }
-        Some(Commands::Login { base_url, email }) => {
-            cmd_login(&config, base_url.as_deref(), email.as_deref()).await
-        }
-        Some(Commands::Keys { base_url, email }) => {
-            cmd_keys(&config, base_url.as_deref(), email.as_deref()).await
-        }
-        Some(Commands::Lock) => cmd_control("lock").await,
-        Some(Commands::Unlock {
-            pin,
-            password,
-            hello,
-        }) => {
-            if pin {
-                let pin_value = prompt_password("Enter PIN: ")?;
-                let cmd = format!("unlock-pin:{}", pin_value);
-                cmd_control(&cmd).await
-            } else if password {
-                let pw = prompt_password("Master password: ")?;
-                let cmd = format!("unlock-password:{}", pw);
-                cmd_control(&cmd).await
-            } else if hello {
-                cmd_control("unlock-hello").await
-            } else {
-                cmd_control("unlock").await
+    } else {
+        // Non-UI commands: use a simple tokio runtime
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create tokio runtime")?;
+
+        rt.block_on(async move {
+            match cli.command {
+                None => unreachable!(),
+                Some(Commands::Daemon { install, uninstall }) => {
+                    if install {
+                        cmd_daemon_install().await
+                    } else if uninstall {
+                        cmd_daemon_uninstall().await
+                    } else {
+                        unreachable!()
+                    }
+                }
+                Some(Commands::Login { base_url, email }) => {
+                    cmd_login(&config, base_url.as_deref(), email.as_deref()).await
+                }
+                Some(Commands::Keys { base_url, email }) => {
+                    cmd_keys(&config, base_url.as_deref(), email.as_deref()).await
+                }
+                Some(Commands::Lock) => cmd_control("lock").await,
+                Some(Commands::Unlock {
+                    pin,
+                    password,
+                    hello,
+                }) => {
+                    if pin {
+                        let pin_value = prompt_password("Enter PIN: ")?;
+                        let cmd = format!("unlock-pin:{}", pin_value);
+                        cmd_control(&cmd).await
+                    } else if password {
+                        let pw = prompt_password("Master password: ")?;
+                        let cmd = format!("unlock-password:{}", pw);
+                        cmd_control(&cmd).await
+                    } else if hello {
+                        cmd_control("unlock-hello").await
+                    } else {
+                        cmd_control("unlock").await
+                    }
+                }
+                Some(Commands::Status) => cmd_control("status").await,
+                Some(Commands::Config) => {
+                    let path = sshwarden_config::config_path()?;
+                    if !path.exists() {
+                        config.save()?;
+                        info!("Created default config at: {}", path.display());
+                    } else {
+                        info!("Config file: {}", path.display());
+                    }
+                    Ok(())
+                }
+                Some(Commands::SetPin) => cmd_set_pin().await,
+                Some(Commands::Sync) => cmd_control("sync").await,
             }
-        }
-        Some(Commands::Status) => cmd_control("status").await,
-        Some(Commands::Config) => {
-            let path = sshwarden_config::config_path()?;
-            if !path.exists() {
-                config.save()?;
-                info!("Created default config at: {}", path.display());
-            } else {
-                info!("Config file: {}", path.display());
-            }
-            Ok(())
-        }
-        Some(Commands::SetPin) => cmd_set_pin().await,
-        Some(Commands::Sync) => cmd_control("sync").await,
+        })
     }
 }
 
+/// Run the Slint event loop on the main thread, processing UI requests.
+///
+/// This function blocks until `slint::quit_event_loop()` is called (triggered
+/// when the tokio thread finishes and drops ui_request_tx).
+fn run_slint_event_loop(
+    mut ui_request_rx: tokio::sync::mpsc::Receiver<sshwarden_ui::UIRequest>,
+) {
+    // Bridge thread: receive UI requests synchronously and forward to Slint main event loop.
+    std::thread::spawn(move || {
+        while let Some(request) = ui_request_rx.blocking_recv() {
+            match request {
+                sshwarden_ui::UIRequest::PinDialog { response_tx } => {
+                    let result = slint::invoke_from_event_loop(move || {
+                        sshwarden_ui::unlock::show_pin_dialog(response_tx);
+                    });
+
+                    if result.is_err() {
+                        tracing::error!("Slint event loop is not running, cannot show PIN dialog");
+                    }
+                }
+                sshwarden_ui::UIRequest::AuthDialog { info, response_tx } => {
+                    let auth_request = sshwarden_ui::notify::AuthDialogRequest { info, response_tx };
+                    let result = slint::invoke_from_event_loop(move || {
+                        sshwarden_ui::notify::show_auth_dialog(auth_request);
+                    });
+
+                    if result.is_err() {
+                        tracing::error!("Slint event loop is not running, cannot show auth dialog");
+                    }
+                }
+            }
+        }
+
+        // Channel closed — tokio thread has finished, quit Slint event loop.
+        let _ = slint::quit_event_loop();
+    });
+
+    // Keep event loop alive even if all windows are closed.
+    let _ = slint::run_event_loop_until_quit();
+}
 /// Send a control command to the running daemon via IPC.
 #[cfg(windows)]
 async fn cmd_control(cmd: &str) -> anyhow::Result<()> {
@@ -345,7 +437,10 @@ async fn cmd_keys(
     Ok(())
 }
 
-async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<()> {
+async fn run_foreground(
+    mut config: sshwarden_config::Config,
+    ui_request_tx: UIRequestTx,
+) -> anyhow::Result<()> {
     info!("Starting SSHWarden SSH Agent...");
     info!("Server: {}", config.server.base_url);
 
@@ -515,6 +610,7 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
                     &key_names,
                     &config,
                     auto_unlock,
+                    &ui_request_tx,
                 ).await;
                 let _ = ctrl_req.reply.send(response);
             }
@@ -531,6 +627,8 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
                 let pin_encrypted_clone = pin_encrypted_keys.clone();
                 let vault_file_clone = vault_file_data.clone();
 
+                let ui_tx_clone = ui_request_tx.clone();
+
                 tokio::spawn(async move {
                     handle_ui_request(
                         request,
@@ -543,6 +641,7 @@ async fn run_foreground(mut config: sshwarden_config::Config) -> anyhow::Result<
                         vault_file_clone,
                         prompt_behavior,
                         auto_unlock,
+                        ui_tx_clone,
                     ).await;
                 });
             }
@@ -585,6 +684,7 @@ async fn handle_control_command(
     key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
     config: &Arc<sshwarden_config::Config>,
     auto_unlock: bool,
+    ui_request_tx: &UIRequestTx,
 ) -> sshwarden_agent::ControlResponse {
     use sshwarden_agent::ControlAction;
 
@@ -653,33 +753,54 @@ async fn handle_control_command(
                 }
             }
 
-            // Fall back to UserConsentVerifier (existing Hello UV path)
+            // Fall back to PIN dialog when Hello sign-path fails
             if auto_unlock {
-                let unlock_result = sshwarden_ui::unlock::prompt_windows_hello().await;
-                match unlock_result {
-                    sshwarden_ui::unlock::UnlockResult::Verified => {
-                        let keys = cached_key_tuples.read().await.clone();
-                        if !keys.is_empty() {
-                            if let Err(e) = agent.set_keys(keys) {
-                                return sshwarden_agent::ControlResponse::err(&format!(
-                                    "Failed to reload keys: {}",
-                                    e
-                                ));
+                info!("Hello sign-path failed, trying PIN dialog fallback");
+                let pin_result =
+                    sshwarden_ui::unlock::request_pin_dialog(ui_request_tx).await;
+
+                if let Some(pin) = pin_result {
+                    // Read encrypted data from pin_encrypted_keys or vault_file_data
+                    let enc_data = {
+                        let mem = pin_encrypted_keys.read().await;
+                        if let Some(ref s) = *mem {
+                            Some(s.clone())
+                        } else {
+                            let vf = vault_file_data.read().await;
+                            vf.as_ref().map(|v| v.pin_encrypted.clone())
+                        }
+                    };
+
+                    if let Some(enc_data) = enc_data {
+                        match sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
+                            Ok(keys_json) => {
+                                return finish_unlock_with_json(
+                                    &keys_json,
+                                    agent,
+                                    vault_locked,
+                                    cached_key_tuples,
+                                    key_names,
+                                    "Vault unlocked via PIN dialog",
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                info!("PIN decryption failed: {}", e);
+                                return sshwarden_agent::ControlResponse::err(
+                                    "PIN verification failed. Try: unlock --pin or unlock --password",
+                                );
                             }
                         }
-                        vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
-                        info!("Vault unlocked via Windows Hello UV");
-                        sshwarden_agent::ControlResponse::ok("Vault unlocked")
                     }
-                    _ => sshwarden_agent::ControlResponse::err(
-                        "Windows Hello verification failed or cancelled. Try: unlock --pin or unlock --password",
-                    ),
                 }
-            } else {
-                sshwarden_agent::ControlResponse::err(
-                    "Auto-unlock is disabled. Use: unlock --pin or unlock --password",
-                )
+                return sshwarden_agent::ControlResponse::err(
+                    "Unlock cancelled. Try: unlock --pin or unlock --password",
+                );
             }
+
+            sshwarden_agent::ControlResponse::err(
+                "Auto-unlock is disabled. Use: unlock --pin or unlock --password",
+            )
         }
         ControlAction::UnlockHello => {
             if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1100,6 +1221,7 @@ async fn handle_ui_request(
     vault_file_data: Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
     prompt_behavior: sshwarden_config::PromptBehavior,
     auto_unlock: bool,
+    ui_request_tx: UIRequestTx,
 ) {
     if request.is_list {
         // If vault is locked, try to auto-unlock before listing keys
@@ -1158,21 +1280,45 @@ async fn handle_ui_request(
                 }
             }
 
-            // Fall back to Windows Hello UV
+            // Fall back to PIN dialog
             if !unlocked {
-                let unlock_result = sshwarden_ui::unlock::prompt_windows_hello().await;
-                if let sshwarden_ui::unlock::UnlockResult::Verified = unlock_result {
-                    info!("Windows Hello UV unlock successful (list request), reloading keys");
-                    let keys = cached_key_tuples.read().await.clone();
-                    if !keys.is_empty() {
-                        let mut agent_for_unlock = agent.clone();
-                        if agent_for_unlock.set_keys(keys).is_ok() {
-                            vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
-                            unlocked = true;
+                info!("Hello sign-path failed for list unlock, trying PIN dialog fallback");
+                let pin_encrypted_clone = pin_encrypted_keys.clone();
+                let vault_file_clone = vault_file_data.clone();
+
+                let pin_result =
+                    sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx).await;
+
+                if let Some(pin) = pin_result {
+                    let enc_data = {
+                        let mem = pin_encrypted_clone.read().await;
+                        if let Some(ref s) = *mem {
+                            Some(s.clone())
+                        } else {
+                            let vf = vault_file_clone.read().await;
+                            vf.as_ref().map(|v| v.pin_encrypted.clone())
+                        }
+                    };
+
+                    if let Some(enc_data) = enc_data {
+                        if let Ok(keys_json) = sshwarden_api::crypto::pin_decrypt(&enc_data, &pin)
+                        {
+                            let finish = finish_unlock_with_json(
+                                &keys_json,
+                                &mut agent.clone(),
+                                &vault_locked,
+                                &cached_key_tuples,
+                                &key_names,
+                                "Auto-unlocked via PIN dialog (list request)",
+                            )
+                            .await;
+                            if finish.ok {
+                                unlocked = true;
+                            }
+                        } else {
+                            info!("PIN decryption failed for list unlock");
                         }
                     }
-                } else {
-                    info!(?unlock_result, "UV unlock failed for list request");
                 }
             }
 
@@ -1203,11 +1349,9 @@ async fn handle_ui_request(
             "Vault is locked, attempting auto-unlock"
         );
 
-        let mut unlocked = false;
+        let unlocked = false;
 
         // 1. Try Hello sign-path first (if challenge exists)
-        //    Combine unlock + authorization prompt in a single spawn_blocking to avoid
-        //    an extra async/blocking round-trip.
         #[cfg(windows)]
         if !unlocked {
             let hello_info = {
@@ -1227,100 +1371,156 @@ async fn handle_ui_request(
                         let mut challenge = [0u8; 16];
                         challenge.copy_from_slice(&challenge_bytes);
 
-                        // Determine if we need authorization prompt after unlock
-                        let needs_prompt = match prompt_behavior {
-                            sshwarden_config::PromptBehavior::Always => true,
-                            sshwarden_config::PromptBehavior::Never => false,
-                            sshwarden_config::PromptBehavior::RememberUntilLock => true,
-                        };
-                        let process_name = request.process_name.clone();
-                        let namespace = request.namespace.clone();
-                        let is_forwarding = request.is_forwarding;
-                        let cipher_id = request.cipher_id.clone();
-
-                        // Single spawn_blocking: Hello unlock + optional authorization dialog
-                        let combined_result = tokio::task::spawn_blocking(move || {
-                            let keys_json = try_hello_unlock(&challenge, &hello_encrypted)?;
-                            let keys: Vec<(String, String, String)> =
-                                serde_json::from_str(&keys_json)
-                                    .map_err(|e| anyhow::anyhow!("Failed to parse keys: {}", e))?;
-
-                            // Extract key name for the authorization prompt
-                            let key_name = cipher_id
-                                .as_ref()
-                                .and_then(|cid| keys.iter().find(|(_, _, id)| id == cid))
-                                .map(|(_, name, _)| name.clone())
-                                .unwrap_or_else(|| "Unknown key".to_string());
-
-                            // Show authorization dialog if needed (in same blocking thread)
-                            let approved = if needs_prompt {
-                                let sign_info = sshwarden_ui::SignRequestInfo {
-                                    key_name: key_name.clone(),
-                                    process_name,
-                                    namespace,
-                                    is_forwarding,
-                                };
-                                let result =
-                                    sshwarden_ui::notify::prompt_authorization_blocking(&sign_info);
-                                result == sshwarden_ui::AuthorizationResult::Approved
-                            } else {
-                                true
-                            };
-
-                            Ok::<_, anyhow::Error>((keys, approved))
+                        // spawn_blocking: Hello unlock only
+                        let hello_result = tokio::task::spawn_blocking(move || {
+                            try_hello_unlock(&challenge, &hello_encrypted)
                         })
                         .await;
 
-                        if let Ok(Ok((keys, approved))) = combined_result {
-                            // Update state after successful unlock
-                            {
-                                let mut names = key_names.write().await;
-                                names.clear();
-                                for (_, name, cipher_id) in &keys {
-                                    names.insert(cipher_id.clone(), name.clone());
+                        if let Ok(Ok(keys_json)) = hello_result {
+                            let keys: Result<Vec<(String, String, String)>, _> =
+                                serde_json::from_str(&keys_json);
+                            if let Ok(keys) = keys {
+                                // Extract key name for the authorization prompt
+                                let key_name = request
+                                    .cipher_id
+                                    .as_ref()
+                                    .and_then(|cid| keys.iter().find(|(_, _, id)| id == cid))
+                                    .map(|(_, name, _)| name.clone())
+                                    .unwrap_or_else(|| "Unknown key".to_string());
+
+                                // Update state after successful unlock
+                                {
+                                    let mut names = key_names.write().await;
+                                    names.clear();
+                                    for (_, name, cipher_id) in &keys {
+                                        names.insert(cipher_id.clone(), name.clone());
+                                    }
                                 }
+                                *cached_key_tuples.write().await = keys.clone();
+                                let mut agent_for_unlock = agent.clone();
+                                if agent_for_unlock.set_keys(keys).is_ok() {
+                                    vault_locked
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    info!("Auto-unlocked via Windows Hello sign-path");
+                                }
+
+                                // Authorization via Slint dialog (async)
+                                let needs_prompt = match prompt_behavior {
+                                    sshwarden_config::PromptBehavior::Always => true,
+                                    sshwarden_config::PromptBehavior::Never => false,
+                                    sshwarden_config::PromptBehavior::RememberUntilLock => true,
+                                };
+                                let approved = if needs_prompt {
+                                    let sign_info = sshwarden_ui::SignRequestInfo {
+                                        key_name,
+                                        process_name: request.process_name.clone(),
+                                        namespace: request.namespace.clone(),
+                                        is_forwarding: request.is_forwarding,
+                                    };
+                                    sshwarden_ui::notify::request_authorization(
+                                        &ui_request_tx,
+                                        &sign_info,
+                                    )
+                                    .await
+                                        == sshwarden_ui::AuthorizationResult::Approved
+                                } else {
+                                    true
+                                };
+                                let _ = response_tx.send((request.request_id, approved));
+                                return;
                             }
-                            *cached_key_tuples.write().await = keys.clone();
-                            let mut agent_for_unlock = agent.clone();
-                            if agent_for_unlock.set_keys(keys).is_ok() {
-                                vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
-                                info!("Auto-unlocked via Windows Hello sign-path");
-                            }
-                            // Send authorization result directly
-                            let _ = response_tx.send((request.request_id, approved));
-                            return;
                         } else {
-                            info!("Hello sign-path auto-unlock failed, trying UV fallback");
+                            info!("Hello sign-path auto-unlock failed, trying PIN dialog fallback");
                         }
                     }
                 }
             }
         }
 
-        // 2. Fall back to Windows Hello UV (existing behavior)
+        // 2. Fall back to PIN dialog
         if !unlocked {
-            let unlock_result = sshwarden_ui::unlock::prompt_windows_hello().await;
-            match unlock_result {
-                sshwarden_ui::unlock::UnlockResult::Verified => {
-                    info!("Windows Hello UV unlock successful, reloading keys");
-                    let keys = cached_key_tuples.read().await.clone();
-                    if !keys.is_empty() {
-                        let mut agent_for_unlock = agent.clone();
-                        if let Err(e) = agent_for_unlock.set_keys(keys) {
-                            tracing::error!(error = %e, "Failed to reload keys after unlock");
-                            let _ = response_tx.send((request.request_id, false));
-                            return;
-                        }
+            info!("Hello sign-path auto-unlock failed, trying PIN dialog fallback");
+            let pin_encrypted_clone = pin_encrypted_keys.clone();
+            let vault_file_clone = vault_file_data.clone();
+            let cipher_id_for_pin = request.cipher_id.clone();
+            let process_name_for_pin = request.process_name.clone();
+            let namespace_for_pin = request.namespace.clone();
+            let is_forwarding_for_pin = request.is_forwarding;
+
+            let pin_result =
+                sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx).await;
+
+            if let Some(pin) = pin_result {
+                let enc_data = {
+                    let mem = pin_encrypted_clone.read().await;
+                    if let Some(ref s) = *mem {
+                        Some(s.clone())
+                    } else {
+                        let vf = vault_file_clone.read().await;
+                        vf.as_ref().map(|v| v.pin_encrypted.clone())
                     }
-                    vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
-                    info!("Vault unlocked successfully via UV");
-                    unlocked = true;
-                }
-                _ => {
-                    info!(
-                        ?unlock_result,
-                        "Unlock failed or cancelled, denying request"
-                    );
+                };
+
+                if let Some(enc_data) = enc_data {
+                    if let Ok(keys_json) = sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
+                        let keys: Result<Vec<(String, String, String)>, _> =
+                            serde_json::from_str(&keys_json);
+                        if let Ok(keys) = keys {
+                            // Update state
+                            {
+                                let mut names = key_names.write().await;
+                                names.clear();
+                                for (_, name, cid) in &keys {
+                                    names.insert(cid.clone(), name.clone());
+                                }
+                            }
+                            *cached_key_tuples.write().await = keys.clone();
+
+                            // Get key name for authorization prompt
+                            let key_name = cipher_id_for_pin
+                                .as_ref()
+                                .and_then(|cid| keys.iter().find(|(_, _, id)| id == cid))
+                                .map(|(_, name, _)| name.clone())
+                                .unwrap_or_else(|| "Unknown key".to_string());
+
+                            let mut agent_for_unlock = agent.clone();
+                            if agent_for_unlock.set_keys(keys).is_ok() {
+                                vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
+                                info!("Auto-unlocked via PIN dialog");
+
+                                // Check if we need authorization prompt
+                                let needs_prompt = match prompt_behavior {
+                                    sshwarden_config::PromptBehavior::Always => true,
+                                    sshwarden_config::PromptBehavior::Never => false,
+                                    sshwarden_config::PromptBehavior::RememberUntilLock => true,
+                                };
+
+                                if needs_prompt {
+                                    let sign_info = sshwarden_ui::SignRequestInfo {
+                                        key_name,
+                                        process_name: process_name_for_pin,
+                                        namespace: namespace_for_pin,
+                                        is_forwarding: is_forwarding_for_pin,
+                                    };
+                                    let approved =
+                                        sshwarden_ui::notify::request_authorization(
+                                            &ui_request_tx,
+                                            &sign_info,
+                                        )
+                                        .await
+                                            == sshwarden_ui::AuthorizationResult::Approved;
+                                    let _ = response_tx.send((request.request_id, approved));
+                                    return;
+                                }
+                                // No prompt needed, approve directly
+                                let _ = response_tx.send((request.request_id, true));
+                                return;
+                            }
+                        }
+                    } else {
+                        info!("PIN decryption failed for sign request");
+                    }
                 }
             }
         }
@@ -1376,7 +1576,7 @@ async fn handle_ui_request(
         "Sign request - prompting user"
     );
 
-    let result = sshwarden_ui::notify::prompt_authorization(&sign_info).await;
+    let result = sshwarden_ui::notify::request_authorization(&ui_request_tx, &sign_info).await;
     let approved = result == sshwarden_ui::AuthorizationResult::Approved;
     let _ = response_tx.send((request.request_id, approved));
 }
@@ -1663,3 +1863,9 @@ async fn cmd_daemon_uninstall() -> anyhow::Result<()> {
     info!("Startup uninstallation is only supported on Windows currently");
     Ok(())
 }
+
+
+
+
+
+

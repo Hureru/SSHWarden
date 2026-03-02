@@ -18,11 +18,27 @@ pub enum AuthorizationResult {
     Timeout,
 }
 
+/// Unified UI request type for cross-thread communication.
+///
+/// The tokio thread sends these requests to the Slint main thread via an mpsc channel.
+/// The bridge thread dispatches to the appropriate Slint dialog.
+pub enum UIRequest {
+    /// Request a PIN input dialog.
+    PinDialog {
+        response_tx: tokio::sync::oneshot::Sender<Option<String>>,
+    },
+    /// Request an SSH sign authorization dialog.
+    AuthDialog {
+        info: SignRequestInfo,
+        response_tx: tokio::sync::oneshot::Sender<AuthorizationResult>,
+    },
+}
+
 /// Initialize platform-specific UI settings.
 ///
 /// On Windows, this sets Per-Monitor DPI Awareness V2 so that Win32
-/// dialogs (CredUI, MessageBox) render sharply on high-DPI displays.
-/// Must be called before any UI prompts are shown.
+/// dialogs (Windows Hello CredUI) render sharply on high-DPI displays.
+/// Slint handles DPI for its own windows automatically.
 #[cfg(windows)]
 pub fn init() {
     use windows::Win32::UI::HiDpi::{
