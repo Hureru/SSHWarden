@@ -240,9 +240,7 @@ fn main() -> anyhow::Result<()> {
 ///
 /// This function blocks until `slint::quit_event_loop()` is called (triggered
 /// when the tokio thread finishes and drops ui_request_tx).
-fn run_slint_event_loop(
-    mut ui_request_rx: tokio::sync::mpsc::Receiver<sshwarden_ui::UIRequest>,
-) {
+fn run_slint_event_loop(mut ui_request_rx: tokio::sync::mpsc::Receiver<sshwarden_ui::UIRequest>) {
     // Bridge thread: receive UI requests synchronously and forward to Slint main event loop.
     std::thread::spawn(move || {
         while let Some(request) = ui_request_rx.blocking_recv() {
@@ -257,7 +255,8 @@ fn run_slint_event_loop(
                     }
                 }
                 sshwarden_ui::UIRequest::AuthDialog { info, response_tx } => {
-                    let auth_request = sshwarden_ui::notify::AuthDialogRequest { info, response_tx };
+                    let auth_request =
+                        sshwarden_ui::notify::AuthDialogRequest { info, response_tx };
                     let result = slint::invoke_from_event_loop(move || {
                         sshwarden_ui::notify::show_auth_dialog(auth_request);
                     });
@@ -756,8 +755,7 @@ async fn handle_control_command(
             // Fall back to PIN dialog when Hello sign-path fails
             if auto_unlock {
                 info!("Hello sign-path failed, trying PIN dialog fallback");
-                let pin_result =
-                    sshwarden_ui::unlock::request_pin_dialog(ui_request_tx).await;
+                let pin_result = sshwarden_ui::unlock::request_pin_dialog(ui_request_tx).await;
 
                 if let Some(pin) = pin_result {
                     // Read encrypted data from pin_encrypted_keys or vault_file_data
@@ -1286,8 +1284,7 @@ async fn handle_ui_request(
                 let pin_encrypted_clone = pin_encrypted_keys.clone();
                 let vault_file_clone = vault_file_data.clone();
 
-                let pin_result =
-                    sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx).await;
+                let pin_result = sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx).await;
 
                 if let Some(pin) = pin_result {
                     let enc_data = {
@@ -1301,8 +1298,7 @@ async fn handle_ui_request(
                     };
 
                     if let Some(enc_data) = enc_data {
-                        if let Ok(keys_json) = sshwarden_api::crypto::pin_decrypt(&enc_data, &pin)
-                        {
+                        if let Ok(keys_json) = sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
                             let finish = finish_unlock_with_json(
                                 &keys_json,
                                 &mut agent.clone(),
@@ -1400,8 +1396,7 @@ async fn handle_ui_request(
                                 *cached_key_tuples.write().await = keys.clone();
                                 let mut agent_for_unlock = agent.clone();
                                 if agent_for_unlock.set_keys(keys).is_ok() {
-                                    vault_locked
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
                                     info!("Auto-unlocked via Windows Hello sign-path");
                                 }
 
@@ -1448,8 +1443,7 @@ async fn handle_ui_request(
             let namespace_for_pin = request.namespace.clone();
             let is_forwarding_for_pin = request.is_forwarding;
 
-            let pin_result =
-                sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx).await;
+            let pin_result = sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx).await;
 
             if let Some(pin) = pin_result {
                 let enc_data = {
@@ -1503,13 +1497,12 @@ async fn handle_ui_request(
                                         namespace: namespace_for_pin,
                                         is_forwarding: is_forwarding_for_pin,
                                     };
-                                    let approved =
-                                        sshwarden_ui::notify::request_authorization(
-                                            &ui_request_tx,
-                                            &sign_info,
-                                        )
-                                        .await
-                                            == sshwarden_ui::AuthorizationResult::Approved;
+                                    let approved = sshwarden_ui::notify::request_authorization(
+                                        &ui_request_tx,
+                                        &sign_info,
+                                    )
+                                    .await
+                                        == sshwarden_ui::AuthorizationResult::Approved;
                                     let _ = response_tx.send((request.request_id, approved));
                                     return;
                                 }
@@ -1863,9 +1856,3 @@ async fn cmd_daemon_uninstall() -> anyhow::Result<()> {
     info!("Startup uninstallation is only supported on Windows currently");
     Ok(())
 }
-
-
-
-
-
-

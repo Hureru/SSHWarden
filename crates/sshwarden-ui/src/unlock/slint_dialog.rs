@@ -84,7 +84,11 @@ pub fn show_pin_dialog(response_tx: tokio::sync::oneshot::Sender<Option<String>>
     dialog.on_submit_pin(move |pin| {
         let pin_str = pin.to_string();
         if let Some(sender) = tx.borrow_mut().take() {
-            let _ = sender.send(if pin_str.is_empty() { None } else { Some(pin_str) });
+            let _ = sender.send(if pin_str.is_empty() {
+                None
+            } else {
+                Some(pin_str)
+            });
         }
         if let Some(d) = weak.upgrade() {
             let _ = d.hide();
@@ -155,4 +159,3 @@ pub async fn request_pin_dialog(
         }
     }
 }
-

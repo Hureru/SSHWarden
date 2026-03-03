@@ -61,6 +61,10 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-build-target-
 
+    - name: Install system dependencies (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
+
     - name: Build (Debug)
       run: cargo build --verbose
 
@@ -97,6 +101,9 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
 
     - name: Run clippy
       run: cargo clippy --all-targets --all-features -- -D warnings

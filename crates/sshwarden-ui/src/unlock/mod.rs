@@ -9,7 +9,7 @@ pub use self::windows::prompt_windows_hello;
 
 pub mod slint_dialog;
 
-pub use slint_dialog::{show_pin_dialog, request_pin_dialog};
+pub use slint_dialog::{request_pin_dialog, show_pin_dialog};
 
 #[cfg(not(windows))]
 mod fallback;

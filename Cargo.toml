@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "sshwarden"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 license = "GPL-3.0"
 publish = false
@@ -41,7 +41,7 @@ windows = { version = "0.61", features = [
 winresource = "0.1"
 
 [workspace.package]
-version = "1.0.0"
+version = "2.0.0"
 license = "GPL-3.0"
 edition = "2021"
 publish = false

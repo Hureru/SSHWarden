@@ -240,4 +240,3 @@ pub async fn request_authorization(
         }
     }
 }
-

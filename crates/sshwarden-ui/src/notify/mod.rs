@@ -1,3 +1,3 @@
 mod slint_dialog;
 
-pub use slint_dialog::{show_auth_dialog, request_authorization, AuthDialogRequest};
+pub use slint_dialog::{request_authorization, show_auth_dialog, AuthDialogRequest};
