@@ -10,11 +10,13 @@
 - `src/main.rs` (`main`): 同步入口，判断是否需要 UI。需要时创建 `mpsc::channel<UIRequest>`，在独立线程启动 tokio 运行时，主线程运行 `run_slint_event_loop()`. 参见 `src/main.rs:80-237`.
 - `src/main.rs` (`run_slint_event_loop`): 主线程 Slint 事件循环，bridge 线程从 mpsc 接收 `UIRequest`，match 分发到 `show_pin_dialog()` 或 `show_auth_dialog()`. 参见 `src/main.rs:243-290`.
 - `src/main.rs` (`run_foreground`): tokio 线程中的异步主循环入口，初始化通道和共享状态后进入 `tokio::select!` 循环. 参见 `src/main.rs:436-668`.
-- `src/main.rs` (`handle_control_command`): 处理 8 种 IPC 控制命令，PIN 对话框降级通过 `request_pin_dialog()` 异步请求 Slint 主线程. 参见 `src/main.rs:672-1160`.
-- `src/main.rs` (`handle_ui_request`): 处理 SSH Agent UI 请求（列表/签名），含二级自动解锁（Hello 签名路径 -> Slint PIN 对话框）和 Slint 授权对话框. 参见 `src/main.rs:1209-1599`.
-- `src/main.rs` (`finish_unlock_with_json`): 共用的解锁完成逻辑（JSON 解析 -> key_names 更新 -> Agent 加载 -> 锁定标志清除）. 参见 `src/main.rs:1170-1204`.
+- `src/main.rs` (`handle_control_command`): 处理 8 种 IPC 控制命令，PIN 对话框降级通过 `get_pin_encrypted_data()` + `make_pin_validator()` 构造 validator 后调用 `request_pin_dialog()`. 参见 `src/main.rs:672-1160`.
+- `src/main.rs` (`handle_ui_request`): 处理 SSH Agent UI 请求（列表/签名），含二级自动解锁（Hello 签名路径 -> 带 validator 的 Slint PIN 对话框）和 Slint 授权对话框. 参见 `src/main.rs:1209-1599`.
+- `src/main.rs` (`get_pin_encrypted_data`): 统一读取 PIN 加密数据（优先内存 `pin_encrypted_keys`，降级 `vault_file_data`）. 参见 `src/main.rs:1162-1174`.
+- `src/main.rs` (`make_pin_validator`): 构造 validator 闭包和 `decrypted_cache`。闭包调用 `pin_decrypt()` 验证 PIN，成功时缓存解密结果. 参见 `src/main.rs:1180-1202`.
+- `src/main.rs` (`finish_unlock_with_json`): 共用的解锁完成逻辑（JSON 解析 -> key_names 更新 -> Agent 加载 -> 锁定标志清除）. 参见 `src/main.rs:1204-1240`.
 - `src/main.rs` (`try_hello_unlock`): Windows Hello 签名路径解锁辅助函数. 参见 `src/main.rs:1165-1167`.
-- `crates/sshwarden-ui/src/lib.rs` (`UIRequest`): 统一的跨线程 UI 请求枚举，包含 `PinDialog` 和 `AuthDialog` 两种变体.
+- `crates/sshwarden-ui/src/lib.rs` (`UIRequest`): 统一的跨线程 UI 请求枚举。`PinDialog` 变体含 `response_tx` 和 `validator: Arc<dyn Fn(&str) -> bool + Send + Sync>` 闭包（PIN 验证在对话框内部执行）。`AuthDialog` 变体含 `info` 和 `response_tx`.
 - `crates/sshwarden-ui/src/unlock/slint_dialog.rs` (`show_pin_dialog`, `request_pin_dialog`): Slint PIN 对话框实现及跨线程通信机制.
 - `crates/sshwarden-ui/src/notify/slint_dialog.rs` (`AuthDialogRequest`, `show_auth_dialog`, `request_authorization`): Slint 授权对话框实现及跨线程通信机制.
 
@@ -27,7 +29,7 @@
 - **3. 创建 UI 通道:** `mpsc::channel<UIRequest>(1)` 用于 tokio <-> Slint 跨线程通信，统一 PIN 对话框和授权对话框请求. 参见 `src/main.rs:134-136`.
 - **4. 启动 tokio 线程:** `std::thread::spawn` 中 `rt.block_on(run_foreground(config, ui_tx))`. 参见 `src/main.rs:147-166`.
 - **5. 主线程 Slint 循环:** `run_slint_event_loop(ui_request_rx)` 阻塞直到 `slint::quit_event_loop()`. 参见 `src/main.rs:169`.
-- **6. Bridge 线程:** 在 Slint 循环内 spawn 桥接线程，接收 `UIRequest`，match 分发：`PinDialog` -> `show_pin_dialog()`，`AuthDialog` -> `show_auth_dialog()`，均通过 `slint::invoke_from_event_loop` 调度到主线程. 参见 `src/main.rs:247-289`.
+- **6. Bridge 线程:** 在 Slint 循环内 spawn 桥接线程，接收 `UIRequest`，match 分发：`PinDialog { response_tx, validator }` -> `show_pin_dialog(response_tx, validator)`，`AuthDialog` -> `show_auth_dialog()`，均通过 `slint::invoke_from_event_loop` 调度到主线程. 参见 `src/main.rs:245-276`.
 
 ### 3.2 异步主循环初始化（tokio 线程内）
 
@@ -42,8 +44,8 @@
 
 参见 `src/main.rs:593-662`:
 
-- **control_rx.recv():** IPC 控制命令，`handle_control_command()` 接收 `ui_request_tx` 用于 PIN 对话框降级. 更新 `last_activity`.
-- **request_rx.recv():** SSH Agent UI 请求，spawn 独立 task，传入 `ui_request_tx` 克隆. 自动解锁：Hello 签名 -> Slint PIN 对话框. 授权：Slint 授权对话框（替代原 Toast 通知）.
+- **control_rx.recv():** IPC 控制命令，`handle_control_command()` 使用 `get_pin_encrypted_data()` + `make_pin_validator()` 构造 validator 传入 PIN 对话框. 更新 `last_activity`.
+- **request_rx.recv():** SSH Agent UI 请求，spawn 独立 task，传入 `ui_request_tx` 克隆. 自动解锁：Hello 签名 -> 带 validator 的 Slint PIN 对话框（对话框内验证，支持重试）. 授权：Slint 授权对话框.
 - **lock_check_interval.tick():** 每 60 秒检查自动锁定.
 - **ctrl_c:** break 退出.
 
@@ -57,7 +59,8 @@
 ## 4. Design Rationale
 
 - **双线程模型:** Slint 要求 GUI 事件循环在主线程运行。tokio 异步运行时移至独立线程，通过 `mpsc` 通道和 `slint::invoke_from_event_loop` 桥接跨线程 UI 请求（PIN 对话框 + 授权对话框）。
-- **UIRequest 统一枚举:** `UIRequest` 枚举统一了 `PinDialog` 和 `AuthDialog` 两种跨线程 UI 请求，替代了之前独立的 `PinDialogRequest` 类型。bridge 线程 match 分发到不同的 Slint 对话框。
+- **UIRequest 统一枚举:** `UIRequest` 枚举统一了 `PinDialog` 和 `AuthDialog` 两种跨线程 UI 请求。`PinDialog` 变体携带 `validator` 闭包，bridge 线程解构后透传给 `show_pin_dialog()`。
+- **PIN 对话框 validator 注入:** 验证逻辑从调用方移到对话框内部，通过 `validator: Arc<dyn Fn(&str) -> bool + Send + Sync>` 闭包注入。对话框在验证通过前保持打开，错误 PIN 显示红色提示+抖动动画，支持多次重试。`make_pin_validator()` 构造闭包并通过 `Arc<Mutex<Option<String>>>` 缓存成功解密结果。
 - **Bridge 线程:** 使用独立的 `current_thread` tokio 运行时从 mpsc 接收请求，避免在 Slint 主线程上阻塞等待。
 - **spawn per request:** UI 请求 spawn 独立 task，因为 Windows Hello、PIN 对话框和 Toast 通知可能阻塞数十秒。
 - **vault.enc 启动分支:** 有 vault.enc 时跳过密码提示进入锁定态，适合 daemon 自启动。

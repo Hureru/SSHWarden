@@ -51,6 +51,6 @@ SSHWarden 是一个 Rust CLI 程序，以守护进程模式运行于 Windows Nam
 - **vault.enc 持久化**: 守护进程重启后无需重新输入主密码，通过 PIN/Hello/Password 解锁即可恢复密钥。
 - **双线程架构**: 同步 `fn main()` 主线程运行 Slint 事件循环（PIN 对话框 + 授权对话框），tokio 运行时在独立线程。通过 `mpsc::channel<UIRequest>` + bridge 线程 + `slint::invoke_from_event_loop` 跨线程调度 UI 对话框。`UIRequest` 枚举统一了 `PinDialog` 和 `AuthDialog` 两种跨线程 UI 请求。
 - **跨平台窗口居中+聚焦**: Slint 启用 `unstable-winit-030` feature，通过 `WinitWindowAccessor` 获取底层 winit 窗口，调用 `focus_window()` 确保对话框前置激活。居中使用 `slint_center_win` crate。两者均为跨平台实现，无 `#[cfg]` 条件编译。
-- **Windows Hello 签名路径 + Slint PIN 对话框降级**: KeyCredentialManager 签名路径作为主要自动解锁方式（持久化加密密钥，跨重启可用）。Hello 不可用或失败时，弹出 Slint 跨平台 PIN 对话框（暗色主题、always-on-top）作为降级方案。UV（UserConsentVerifier）路径已从自动解锁流程中移除。
+- **Windows Hello 签名路径 + Slint PIN 对话框降级**: KeyCredentialManager 签名路径作为主要自动解锁方式（持久化加密密钥，跨重启可用）。Hello 不可用或失败时，弹出 Slint 跨平台 PIN 对话框（暗色主题、always-on-top）作为降级方案。PIN 对话框采用 validator 注入模式：验证逻辑通过闭包注入对话框内部，在后台线程执行 Argon2id 验证；错误 PIN 时对话框保持打开（抖动+红色提示），成功时缓存解密结果并关闭。UV（UserConsentVerifier）路径已从自动解锁流程中移除。
 - **自动锁定**: 配置化的 `lock_timeout`（默认 3600 秒），60 秒检查间隔。
 - **启动文件夹自启动**: `daemon --install` 在用户启动文件夹创建快捷方式（而非 Task Scheduler），确保守护进程在交互式桌面会话中运行，支持 Toast 通知和 Windows Hello 等所有 UI 交互。

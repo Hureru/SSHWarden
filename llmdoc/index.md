@@ -40,7 +40,9 @@
 | "SSH 签名请求如何授权？" | `architecture/slint-authorization-dialog.md` |
 | "Windows Hello 解锁如何工作？" | `architecture/sshwarden-windows-hello-unlock.md` |
 | "Hello 签名路径是什么？" | `architecture/sshwarden-windows-hello-unlock.md` (3.1 节) |
+| "PIN 对话框 validator 重试模式如何工作？" | `architecture/sshwarden-windows-hello-unlock.md` (3.2 节) |
 | "PIN 对话框降级如何工作？" | `architecture/sshwarden-windows-hello-unlock.md` (3.2 节) |
+| "make_pin_validator 和 decrypted_cache 如何避免重复 KDF？" | `architecture/sshwarden-windows-hello-unlock.md` (3.2 节) + `architecture/sshwarden-pin-encryption.md` (3.2 节) |
 | "Slint PIN 对话框如何跨线程调度？" | `architecture/sshwarden-windows-hello-unlock.md` (3.2 节) + `architecture/sshwarden-main-loop.md` (3.1 节) |
 | "Slint 授权对话框如何工作？" | `architecture/slint-authorization-dialog.md` |
 | "UIRequest 枚举如何统一 UI 请求？" | `architecture/sshwarden-main-loop.md` (2 节 UIRequest) + `architecture/slint-authorization-dialog.md` (3.2 节) |
@@ -67,7 +69,7 @@
 
 #### 2. `architecture/sshwarden-main-loop.md`
 **身份**: SSHWarden 守护进程双线程架构（Slint 主线程 + tokio 线程）
-**内容**: 双线程启动流程（main -> Slint 事件循环 + tokio 线程）、UIRequest 统一通道桥接（mpsc + slint::invoke_from_event_loop，分发 PinDialog/AuthDialog）、tokio::select! 四路事件（control/request/lock-check/ctrl-c）、8 种控制命令处理、二级自动解锁、关闭流程（channel drop -> quit_event_loop）
+**内容**: 双线程启动流程（main -> Slint 事件循环 + tokio 线程）、UIRequest 统一通道桥接（mpsc + slint::invoke_from_event_loop，PinDialog 携带 validator 闭包、AuthDialog）、tokio::select! 四路事件（control/request/lock-check/ctrl-c）、8 种控制命令处理、get_pin_encrypted_data/make_pin_validator 辅助函数、二级自动解锁、关闭流程（channel drop -> quit_event_loop）
 **适用角色**: 核心架构开发
 
 #### 3. `architecture/slint-authorization-dialog.md`
@@ -76,8 +78,8 @@
 **适用角色**: UI 开发、授权流程开发
 
 #### 4. `architecture/sshwarden-windows-hello-unlock.md`
-**身份**: SSHWarden 的 Windows Hello 解锁流程（签名路径 + Slint PIN 对话框降级）
-**内容**: 签名路径（KeyCredentialManager）、Slint PIN 对话框降级路径（跨平台暗色窗口、跨线程 mpsc+oneshot 通信）、SSH 请求自动解锁优先级（签名 -> PIN 对话框 -> 拒绝）、hello_crypto 模块
+**身份**: SSHWarden 的 Windows Hello 解锁流程（签名路径 + Slint PIN 对话框降级 + validator 重试模式）
+**内容**: 签名路径（KeyCredentialManager）、Slint PIN 对话框降级路径（validator 闭包注入、后台线程验证、错误重试、抖动+红色提示、decrypted_cache 缓存避免重复 KDF）、`get_pin_encrypted_data()`/`make_pin_validator()` 辅助函数、SSH 请求自动解锁优先级（签名 -> PIN 对话框 -> 拒绝）、hello_crypto 模块
 **适用角色**: 解锁流程开发
 
 #### 5. `architecture/ipc-control-channel.md`
@@ -158,7 +160,15 @@
 
 ## 文档更新日志
 
-**最后更新**: 2026-03-03
+**最后更新**: 2026-03-10
+
+### PIN 对话框 validator 重试模式（错误 PIN 保持打开并提示重试）
+- UPDATE `architecture/sshwarden-windows-hello-unlock.md` - PIN 对话框从"提交即关闭"改为 validator 注入重试模式：`UIRequest::PinDialog` 新增 `validator` 字段，对话框在后台线程验证 PIN（`std::thread::spawn` + `invoke_from_event_loop`），失败时保持打开（清空输入+红色提示+抖动动画），`tx_cell` 从 `Rc<RefCell>` 改为 `Arc<Mutex>` 支持跨线程。新增 `get_pin_encrypted_data()`/`make_pin_validator()` 辅助函数，`decrypted_cache` 避免重复 Argon2id KDF
+- UPDATE `architecture/sshwarden-main-loop.md` - `UIRequest::PinDialog` 变体新增 `validator` 字段描述，bridge 线程解构透传 validator，新增 `get_pin_encrypted_data`/`make_pin_validator` 组件，更新 select! 事件和 Design Rationale（validator 注入模式）
+- UPDATE `architecture/sshwarden-pin-encryption.md` - PIN 解锁流程拆分为 CLI 入口和 PIN 对话框入口（validator 重试模式），新增 `make_pin_validator` + `decrypted_cache` 取回解密结果流程
+- UPDATE `architecture/slint-authorization-dialog.md` - 标注 AuthDialog 仍用 `Rc<RefCell>` 而 PinDialog 已改为 `Arc<Mutex>` 的差异
+- UPDATE `overview/project-overview.md` - PIN 对话框降级设计决策新增 validator 注入模式、后台线程验证、错误重试、decrypted_cache 缓存描述
+- UPDATE `llmdoc/index.md` - 新增 validator/make_pin_validator 查询表条目、更新文档描述、新增更新日志
 
 ### Slint 窗口居中+聚焦跨平台改造 & AuthDialog UI 美化
 - UPDATE `architecture/slint-authorization-dialog.md` - `center_and_focus_dialog()` 改为跨平台（移除 `#[cfg]`，使用 winit `focus_window()`），延迟调度改为 `Timer::single_shot(30ms)`，UI 属性更新（380x195px、Segoe UI 字体、22px 进程名、13px 正文、16px 内边距、30px 按钮高度）
