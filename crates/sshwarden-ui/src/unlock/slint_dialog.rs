@@ -5,7 +5,7 @@ slint::slint! {
 
     export component PinDialog inherits Window {
         title: "SSHWarden - Unlock Vault";
-        icon: @image-url("../../assets/shhwarden-32x32.png");
+        icon: @image-url("../../assets/Square44x44Logo.png");
         width: 380px;
         height: 180px;
         background: Palette.background;
