@@ -108,14 +108,11 @@ fn trigger_shake(weak: &slint::Weak<PinDialog>) {
     let offsets: &[f32] = &[10.0, -8.0, 6.0, -4.0, 2.0, 0.0];
     for (i, &offset) in offsets.iter().enumerate() {
         let w = weak.clone();
-        slint::Timer::single_shot(
-            std::time::Duration::from_millis(i as u64 * 60),
-            move || {
-                if let Some(d) = w.upgrade() {
-                    d.set_shake_offset(offset);
-                }
-            },
-        );
+        slint::Timer::single_shot(std::time::Duration::from_millis(i as u64 * 60), move || {
+            if let Some(d) = w.upgrade() {
+                d.set_shake_offset(offset);
+            }
+        });
     }
 }
 

@@ -758,18 +758,15 @@ async fn handle_control_command(
             // Fall back to PIN dialog when Hello sign-path fails
             if auto_unlock {
                 info!("Hello sign-path failed, trying PIN dialog fallback");
-                let enc_data =
-                    get_pin_encrypted_data(pin_encrypted_keys, vault_file_data).await;
+                let enc_data = get_pin_encrypted_data(pin_encrypted_keys, vault_file_data).await;
 
                 if let Some(enc_data) = enc_data {
                     let (validator, decrypted_cache) = make_pin_validator(enc_data);
                     let pin_result =
-                        sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator)
-                            .await;
+                        sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator).await;
 
                     if pin_result.is_some() {
-                        let keys_json =
-                            decrypted_cache.lock().unwrap().take().unwrap();
+                        let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
                         return finish_unlock_with_json(
                             &keys_json,
                             agent,
@@ -1173,30 +1170,27 @@ async fn get_pin_encrypted_data(
     vf.as_ref().map(|v| v.pin_encrypted.clone())
 }
 
+type PinValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type DecryptedCache = Arc<std::sync::Mutex<Option<String>>>;
+
 /// Create a PIN validator closure and a shared cache for the decrypted result.
 ///
 /// The validator performs Argon2id-based decryption, caching the result on success
 /// so the caller can retrieve the decrypted keys without re-running the KDF.
-fn make_pin_validator(
-    enc_data: String,
-) -> (
-    Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    Arc<std::sync::Mutex<Option<String>>>,
-) {
+fn make_pin_validator(enc_data: String) -> (PinValidator, DecryptedCache) {
     let decrypted_cache: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
     let cache_clone = decrypted_cache.clone();
 
-    let validator: Arc<dyn Fn(&str) -> bool + Send + Sync> =
-        Arc::new(move |pin: &str| -> bool {
-            match sshwarden_api::crypto::pin_decrypt(&enc_data, pin) {
-                Ok(keys_json) => {
-                    *cache_clone.lock().unwrap() = Some(keys_json);
-                    true
-                }
-                Err(_) => false,
+    let validator: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(move |pin: &str| -> bool {
+        match sshwarden_api::crypto::pin_decrypt(&enc_data, pin) {
+            Ok(keys_json) => {
+                *cache_clone.lock().unwrap() = Some(keys_json);
+                true
             }
-        });
+            Err(_) => false,
+        }
+    });
 
     (validator, decrypted_cache)
 }
@@ -1314,18 +1308,15 @@ async fn handle_ui_request(
             // Fall back to PIN dialog
             if !unlocked {
                 info!("Hello sign-path failed for list unlock, trying PIN dialog fallback");
-                let enc_data =
-                    get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await;
+                let enc_data = get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await;
 
                 if let Some(enc_data) = enc_data {
                     let (validator, decrypted_cache) = make_pin_validator(enc_data);
                     let pin_result =
-                        sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx, validator)
-                            .await;
+                        sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx, validator).await;
 
                     if pin_result.is_some() {
-                        let keys_json =
-                            decrypted_cache.lock().unwrap().take().unwrap();
+                        let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
                         let finish = finish_unlock_with_json(
                             &keys_json,
                             &mut agent.clone(),
@@ -1460,18 +1451,15 @@ async fn handle_ui_request(
         // 2. Fall back to PIN dialog
         if !unlocked {
             info!("Hello sign-path auto-unlock failed, trying PIN dialog fallback");
-            let enc_data =
-                get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await;
+            let enc_data = get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await;
 
             if let Some(enc_data) = enc_data {
                 let (validator, decrypted_cache) = make_pin_validator(enc_data);
                 let pin_result =
-                    sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx, validator)
-                        .await;
+                    sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx, validator).await;
 
                 if pin_result.is_some() {
-                    let keys_json =
-                        decrypted_cache.lock().unwrap().take().unwrap();
+                    let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
                     let keys: Result<Vec<(String, String, String)>, _> =
                         serde_json::from_str(&keys_json);
                     if let Ok(keys) = keys {
