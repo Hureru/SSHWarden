@@ -5,20 +5,39 @@ slint::slint! {
 
     export component PinDialog inherits Window {
         title: "SSHWarden - Unlock Vault";
-        icon: @image-url("../../assets/shhwarden-32x32.png");
+        icon: @image-url("../../assets/Square44x44Logo.png");
         width: 380px;
-        height: 180px;
+        height: 195px;
         background: Palette.background;
         always-on-top: true;
 
         forward-focus: pin-input;
 
+        in-out property <bool> show-error: false;
+        in-out property <length> shake-offset: 0px;
+        in-out property <string> error-message: "PIN cannot be empty";
+        in-out property <bool> verifying: false;
+        in-out property <string> pin-text: "";
+
         callback submit-pin(string);
         callback cancel();
+        callback empty-submit();
+
+        function try-submit() {
+            if root.verifying { return; }
+            if pin-input.text == "" {
+                root.error-message = "PIN cannot be empty";
+                show-error = true;
+                root.empty-submit();
+            } else {
+                show-error = false;
+                root.submit-pin(pin-input.text);
+            }
+        }
 
         VerticalBox {
             padding: 24px;
-            spacing: 16px;
+            spacing: 12px;
 
             Text {
                 text: "Enter PIN to unlock SSHWarden";
@@ -26,10 +45,33 @@ slint::slint! {
                 font-size: 14px;
             }
 
-            pin-input := LineEdit {
-                input-type: password;
-                font-size: 16px;
-                accepted => { root.submit-pin(self.text); }
+            VerticalLayout {
+                spacing: 4px;
+
+                Rectangle {
+                    clip: false;
+                    height: pin-input.preferred-height;
+
+                    pin-input := LineEdit {
+                        text <=> root.pin-text;
+                        x: root.shake-offset;
+                        width: parent.width;
+                        input-type: password;
+                        font-size: 16px;
+                        enabled: !root.verifying;
+                        edited => {
+                            root.show-error = false;
+                        }
+                        accepted => { root.try-submit(); }
+                    }
+                }
+
+                Text {
+                    text: root.show-error ? root.error-message : "";
+                    color: #e74c3c;
+                    font-size: 12px;
+                    height: 16px;
+                }
             }
 
             HorizontalLayout {
@@ -42,9 +84,10 @@ slint::slint! {
                 }
 
                 Button {
-                    text: "Unlock";
+                    text: root.verifying ? "Verifying..." : "Unlock";
                     primary: true;
-                    clicked => { root.submit-pin(pin-input.text); }
+                    enabled: !root.verifying;
+                    clicked => { root.try-submit(); }
                 }
             }
         }
@@ -61,11 +104,28 @@ fn center_and_focus_dialog(dialog: &PinDialog) {
     });
 }
 
+fn trigger_shake(weak: &slint::Weak<PinDialog>) {
+    let offsets: &[f32] = &[10.0, -8.0, 6.0, -4.0, 2.0, 0.0];
+    for (i, &offset) in offsets.iter().enumerate() {
+        let w = weak.clone();
+        slint::Timer::single_shot(std::time::Duration::from_millis(i as u64 * 60), move || {
+            if let Some(d) = w.upgrade() {
+                d.set_shake_offset(offset);
+            }
+        });
+    }
+}
+
 /// Show a PIN dialog on the Slint event loop thread.
 ///
 /// This must be called from within the Slint event loop (e.g. via `slint::invoke_from_event_loop`).
-/// The result is sent back through the provided oneshot channel.
-pub fn show_pin_dialog(response_tx: tokio::sync::oneshot::Sender<Option<String>>) {
+/// The validator closure is invoked in a background thread to avoid blocking the UI.
+/// On success, the PIN is sent back through the oneshot channel and the dialog closes.
+/// On failure, the dialog stays open with an error message and shake animation.
+pub fn show_pin_dialog(
+    response_tx: tokio::sync::oneshot::Sender<Option<String>>,
+    validator: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+) {
     let dialog = match PinDialog::new() {
         Ok(d) => d,
         Err(e) => {
@@ -75,31 +135,64 @@ pub fn show_pin_dialog(response_tx: tokio::sync::oneshot::Sender<Option<String>>
         }
     };
 
-    // Shared mutable cell for the oneshot sender (consumed once on submit/cancel/close/show-fail)
-    let tx_cell = std::rc::Rc::new(std::cell::RefCell::new(Some(response_tx)));
+    // Shared sender: Arc<Mutex> so it can be accessed from invoke_from_event_loop
+    let tx_cell = std::sync::Arc::new(std::sync::Mutex::new(Some(response_tx)));
     let tx_for_show_error = tx_cell.clone();
 
+    // Shake animation on empty submit
+    let weak = dialog.as_weak();
+    dialog.on_empty_submit(move || {
+        trigger_shake(&weak);
+    });
+
+    // Submit PIN: spawn validation in background thread
     let weak = dialog.as_weak();
     let tx = tx_cell.clone();
     dialog.on_submit_pin(move |pin| {
         let pin_str = pin.to_string();
-        if let Some(sender) = tx.borrow_mut().take() {
-            let _ = sender.send(if pin_str.is_empty() {
-                None
-            } else {
-                Some(pin_str)
-            });
-        }
+
+        // Set verifying state (disables input + changes button text)
         if let Some(d) = weak.upgrade() {
-            let _ = d.hide();
+            d.set_verifying(true);
         }
+
+        let validator = validator.clone();
+        let tx = tx.clone();
+        let weak = weak.clone();
+
+        std::thread::spawn(move || {
+            let is_valid = validator(&pin_str);
+
+            let _ = slint::invoke_from_event_loop(move || {
+                if is_valid {
+                    if let Ok(mut guard) = tx.lock() {
+                        if let Some(sender) = guard.take() {
+                            let _ = sender.send(Some(pin_str));
+                        }
+                    }
+                    if let Some(d) = weak.upgrade() {
+                        let _ = d.hide();
+                    }
+                } else {
+                    if let Some(d) = weak.upgrade() {
+                        d.set_pin_text("".into());
+                        d.set_error_message("Incorrect PIN, please try again".into());
+                        d.set_show_error(true);
+                        d.set_verifying(false);
+                    }
+                    trigger_shake(&weak);
+                }
+            });
+        });
     });
 
     let weak = dialog.as_weak();
     let tx = tx_cell.clone();
     dialog.on_cancel(move || {
-        if let Some(sender) = tx.borrow_mut().take() {
-            let _ = sender.send(None);
+        if let Ok(mut guard) = tx.lock() {
+            if let Some(sender) = guard.take() {
+                let _ = sender.send(None);
+            }
         }
         if let Some(d) = weak.upgrade() {
             let _ = d.hide();
@@ -108,16 +201,20 @@ pub fn show_pin_dialog(response_tx: tokio::sync::oneshot::Sender<Option<String>>
 
     let tx = tx_cell;
     dialog.window().on_close_requested(move || {
-        if let Some(sender) = tx.borrow_mut().take() {
-            let _ = sender.send(None);
+        if let Ok(mut guard) = tx.lock() {
+            if let Some(sender) = guard.take() {
+                let _ = sender.send(None);
+            }
         }
         slint::CloseRequestResponse::HideWindow
     });
 
     if let Err(e) = dialog.show() {
         tracing::error!(error = %e, "Failed to show PIN dialog");
-        if let Some(sender) = tx_for_show_error.borrow_mut().take() {
-            let _ = sender.send(None);
+        if let Ok(mut guard) = tx_for_show_error.lock() {
+            if let Some(sender) = guard.take() {
+                let _ = sender.send(None);
+            }
         }
     } else {
         let weak = dialog.as_weak();
@@ -132,13 +229,18 @@ pub fn show_pin_dialog(response_tx: tokio::sync::oneshot::Sender<Option<String>>
 /// Request a PIN dialog from the tokio async context.
 ///
 /// Sends a request to the Slint main thread and awaits the result.
-/// Returns `Some(pin)` if the user entered a PIN, or `None` if cancelled.
+/// The validator is called in a background thread for each PIN attempt.
+/// Returns `Some(pin)` if validation succeeded, or `None` if cancelled.
 pub async fn request_pin_dialog(
     request_tx: &tokio::sync::mpsc::Sender<crate::UIRequest>,
+    validator: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
 ) -> Option<String> {
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
-    let request = crate::UIRequest::PinDialog { response_tx };
+    let request = crate::UIRequest::PinDialog {
+        response_tx,
+        validator,
+    };
 
     if request_tx.send(request).await.is_err() {
         tracing::error!("Failed to send PIN dialog request to UI thread");

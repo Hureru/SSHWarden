@@ -245,9 +245,12 @@ fn run_slint_event_loop(mut ui_request_rx: tokio::sync::mpsc::Receiver<sshwarden
     std::thread::spawn(move || {
         while let Some(request) = ui_request_rx.blocking_recv() {
             match request {
-                sshwarden_ui::UIRequest::PinDialog { response_tx } => {
+                sshwarden_ui::UIRequest::PinDialog {
+                    response_tx,
+                    validator,
+                } => {
                     let result = slint::invoke_from_event_loop(move || {
-                        sshwarden_ui::unlock::show_pin_dialog(response_tx);
+                        sshwarden_ui::unlock::show_pin_dialog(response_tx, validator);
                     });
 
                     if result.is_err() {
@@ -755,40 +758,24 @@ async fn handle_control_command(
             // Fall back to PIN dialog when Hello sign-path fails
             if auto_unlock {
                 info!("Hello sign-path failed, trying PIN dialog fallback");
-                let pin_result = sshwarden_ui::unlock::request_pin_dialog(ui_request_tx).await;
+                let enc_data = get_pin_encrypted_data(pin_encrypted_keys, vault_file_data).await;
 
-                if let Some(pin) = pin_result {
-                    // Read encrypted data from pin_encrypted_keys or vault_file_data
-                    let enc_data = {
-                        let mem = pin_encrypted_keys.read().await;
-                        if let Some(ref s) = *mem {
-                            Some(s.clone())
-                        } else {
-                            let vf = vault_file_data.read().await;
-                            vf.as_ref().map(|v| v.pin_encrypted.clone())
-                        }
-                    };
+                if let Some(enc_data) = enc_data {
+                    let (validator, decrypted_cache) = make_pin_validator(enc_data);
+                    let pin_result =
+                        sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator).await;
 
-                    if let Some(enc_data) = enc_data {
-                        match sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
-                            Ok(keys_json) => {
-                                return finish_unlock_with_json(
-                                    &keys_json,
-                                    agent,
-                                    vault_locked,
-                                    cached_key_tuples,
-                                    key_names,
-                                    "Vault unlocked via PIN dialog",
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                info!("PIN decryption failed: {}", e);
-                                return sshwarden_agent::ControlResponse::err(
-                                    "PIN verification failed. Try: unlock --pin or unlock --password",
-                                );
-                            }
-                        }
+                    if pin_result.is_some() {
+                        let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
+                        return finish_unlock_with_json(
+                            &keys_json,
+                            agent,
+                            vault_locked,
+                            cached_key_tuples,
+                            key_names,
+                            "Vault unlocked via PIN dialog",
+                        )
+                        .await;
                     }
                 }
                 return sshwarden_agent::ControlResponse::err(
@@ -1168,6 +1155,46 @@ fn try_hello_unlock(challenge: &[u8; 16], hello_encrypted: &str) -> anyhow::Resu
     sshwarden_ui::unlock::hello_crypto::hello_decrypt_keys(hello_encrypted, challenge)
 }
 
+/// Read PIN-encrypted data from in-memory cache or vault file.
+async fn get_pin_encrypted_data(
+    pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
+    vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
+) -> Option<String> {
+    {
+        let mem = pin_encrypted_keys.read().await;
+        if let Some(ref s) = *mem {
+            return Some(s.clone());
+        }
+    }
+    let vf = vault_file_data.read().await;
+    vf.as_ref().map(|v| v.pin_encrypted.clone())
+}
+
+type PinValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type DecryptedCache = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Create a PIN validator closure and a shared cache for the decrypted result.
+///
+/// The validator performs Argon2id-based decryption, caching the result on success
+/// so the caller can retrieve the decrypted keys without re-running the KDF.
+fn make_pin_validator(enc_data: String) -> (PinValidator, DecryptedCache) {
+    let decrypted_cache: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let cache_clone = decrypted_cache.clone();
+
+    let validator: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(move |pin: &str| -> bool {
+        match sshwarden_api::crypto::pin_decrypt(&enc_data, pin) {
+            Ok(keys_json) => {
+                *cache_clone.lock().unwrap() = Some(keys_json);
+                true
+            }
+            Err(_) => false,
+        }
+    });
+
+    (validator, decrypted_cache)
+}
+
 /// Finish an unlock by parsing keys JSON and loading into agent.
 async fn finish_unlock_with_json(
     keys_json: &str,
@@ -1281,38 +1308,26 @@ async fn handle_ui_request(
             // Fall back to PIN dialog
             if !unlocked {
                 info!("Hello sign-path failed for list unlock, trying PIN dialog fallback");
-                let pin_encrypted_clone = pin_encrypted_keys.clone();
-                let vault_file_clone = vault_file_data.clone();
+                let enc_data = get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await;
 
-                let pin_result = sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx).await;
+                if let Some(enc_data) = enc_data {
+                    let (validator, decrypted_cache) = make_pin_validator(enc_data);
+                    let pin_result =
+                        sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx, validator).await;
 
-                if let Some(pin) = pin_result {
-                    let enc_data = {
-                        let mem = pin_encrypted_clone.read().await;
-                        if let Some(ref s) = *mem {
-                            Some(s.clone())
-                        } else {
-                            let vf = vault_file_clone.read().await;
-                            vf.as_ref().map(|v| v.pin_encrypted.clone())
-                        }
-                    };
-
-                    if let Some(enc_data) = enc_data {
-                        if let Ok(keys_json) = sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
-                            let finish = finish_unlock_with_json(
-                                &keys_json,
-                                &mut agent.clone(),
-                                &vault_locked,
-                                &cached_key_tuples,
-                                &key_names,
-                                "Auto-unlocked via PIN dialog (list request)",
-                            )
-                            .await;
-                            if finish.ok {
-                                unlocked = true;
-                            }
-                        } else {
-                            info!("PIN decryption failed for list unlock");
+                    if pin_result.is_some() {
+                        let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
+                        let finish = finish_unlock_with_json(
+                            &keys_json,
+                            &mut agent.clone(),
+                            &vault_locked,
+                            &cached_key_tuples,
+                            &key_names,
+                            "Auto-unlocked via PIN dialog (list request)",
+                        )
+                        .await;
+                        if finish.ok {
+                            unlocked = true;
                         }
                     }
                 }
@@ -1436,83 +1451,68 @@ async fn handle_ui_request(
         // 2. Fall back to PIN dialog
         if !unlocked {
             info!("Hello sign-path auto-unlock failed, trying PIN dialog fallback");
-            let pin_encrypted_clone = pin_encrypted_keys.clone();
-            let vault_file_clone = vault_file_data.clone();
-            let cipher_id_for_pin = request.cipher_id.clone();
-            let process_name_for_pin = request.process_name.clone();
-            let namespace_for_pin = request.namespace.clone();
-            let is_forwarding_for_pin = request.is_forwarding;
+            let enc_data = get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await;
 
-            let pin_result = sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx).await;
+            if let Some(enc_data) = enc_data {
+                let (validator, decrypted_cache) = make_pin_validator(enc_data);
+                let pin_result =
+                    sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx, validator).await;
 
-            if let Some(pin) = pin_result {
-                let enc_data = {
-                    let mem = pin_encrypted_clone.read().await;
-                    if let Some(ref s) = *mem {
-                        Some(s.clone())
-                    } else {
-                        let vf = vault_file_clone.read().await;
-                        vf.as_ref().map(|v| v.pin_encrypted.clone())
-                    }
-                };
-
-                if let Some(enc_data) = enc_data {
-                    if let Ok(keys_json) = sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
-                        let keys: Result<Vec<(String, String, String)>, _> =
-                            serde_json::from_str(&keys_json);
-                        if let Ok(keys) = keys {
-                            // Update state
-                            {
-                                let mut names = key_names.write().await;
-                                names.clear();
-                                for (_, name, cid) in &keys {
-                                    names.insert(cid.clone(), name.clone());
-                                }
-                            }
-                            *cached_key_tuples.write().await = keys.clone();
-
-                            // Get key name for authorization prompt
-                            let key_name = cipher_id_for_pin
-                                .as_ref()
-                                .and_then(|cid| keys.iter().find(|(_, _, id)| id == cid))
-                                .map(|(_, name, _)| name.clone())
-                                .unwrap_or_else(|| "Unknown key".to_string());
-
-                            let mut agent_for_unlock = agent.clone();
-                            if agent_for_unlock.set_keys(keys).is_ok() {
-                                vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
-                                info!("Auto-unlocked via PIN dialog");
-
-                                // Check if we need authorization prompt
-                                let needs_prompt = match prompt_behavior {
-                                    sshwarden_config::PromptBehavior::Always => true,
-                                    sshwarden_config::PromptBehavior::Never => false,
-                                    sshwarden_config::PromptBehavior::RememberUntilLock => true,
-                                };
-
-                                if needs_prompt {
-                                    let sign_info = sshwarden_ui::SignRequestInfo {
-                                        key_name,
-                                        process_name: process_name_for_pin,
-                                        namespace: namespace_for_pin,
-                                        is_forwarding: is_forwarding_for_pin,
-                                    };
-                                    let approved = sshwarden_ui::notify::request_authorization(
-                                        &ui_request_tx,
-                                        &sign_info,
-                                    )
-                                    .await
-                                        == sshwarden_ui::AuthorizationResult::Approved;
-                                    let _ = response_tx.send((request.request_id, approved));
-                                    return;
-                                }
-                                // No prompt needed, approve directly
-                                let _ = response_tx.send((request.request_id, true));
-                                return;
+                if pin_result.is_some() {
+                    let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
+                    let keys: Result<Vec<(String, String, String)>, _> =
+                        serde_json::from_str(&keys_json);
+                    if let Ok(keys) = keys {
+                        // Update state
+                        {
+                            let mut names = key_names.write().await;
+                            names.clear();
+                            for (_, name, cid) in &keys {
+                                names.insert(cid.clone(), name.clone());
                             }
                         }
-                    } else {
-                        info!("PIN decryption failed for sign request");
+                        *cached_key_tuples.write().await = keys.clone();
+
+                        // Get key name for authorization prompt
+                        let key_name = request
+                            .cipher_id
+                            .as_ref()
+                            .and_then(|cid| keys.iter().find(|(_, _, id)| id == cid))
+                            .map(|(_, name, _)| name.clone())
+                            .unwrap_or_else(|| "Unknown key".to_string());
+
+                        let mut agent_for_unlock = agent.clone();
+                        if agent_for_unlock.set_keys(keys).is_ok() {
+                            vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
+                            info!("Auto-unlocked via PIN dialog");
+
+                            // Check if we need authorization prompt
+                            let needs_prompt = match prompt_behavior {
+                                sshwarden_config::PromptBehavior::Always => true,
+                                sshwarden_config::PromptBehavior::Never => false,
+                                sshwarden_config::PromptBehavior::RememberUntilLock => true,
+                            };
+
+                            if needs_prompt {
+                                let sign_info = sshwarden_ui::SignRequestInfo {
+                                    key_name,
+                                    process_name: request.process_name.clone(),
+                                    namespace: request.namespace.clone(),
+                                    is_forwarding: request.is_forwarding,
+                                };
+                                let approved = sshwarden_ui::notify::request_authorization(
+                                    &ui_request_tx,
+                                    &sign_info,
+                                )
+                                .await
+                                    == sshwarden_ui::AuthorizationResult::Approved;
+                                let _ = response_tx.send((request.request_id, approved));
+                                return;
+                            }
+                            // No prompt needed, approve directly
+                            let _ = response_tx.send((request.request_id, true));
+                            return;
+                        }
                     }
                 }
             }

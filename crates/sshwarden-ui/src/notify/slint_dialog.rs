@@ -5,7 +5,7 @@ slint::slint! {
 
     export component AuthDialog inherits Window {
         title: "SSHWarden - Authorization";
-        icon: @image-url("../../assets/shhwarden-32x32.png");
+        icon: @image-url("../../assets/Square44x44Logo.png");
         default-font-family: "Segoe UI";
         width: 380px;
         height: 195px;

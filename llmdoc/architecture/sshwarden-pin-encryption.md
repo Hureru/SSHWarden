@@ -23,13 +23,22 @@
 - **6. 双重存储:** 加密字符串同时存入内存 `pin_encrypted_keys` 和磁盘 vault.enc 文件. 参见 `src/main.rs:865-931`.
 - **7. Hello 签名路径注册（可选）:** 若 Windows Hello 可用，生成 16 字节随机 challenge，用 KeyCredentialManager 签名 challenge 派生密钥加密密钥缓存，存入 Credential Manager，challenge 写入 vault.enc. 参见 `src/main.rs:880-920`.
 
-### 3.2 PIN 解锁流程 (UnlockPin)
+### 3.2 PIN 解锁流程 (UnlockPin / PIN 对话框)
 
+PIN 解锁有两种入口，但验证逻辑统一通过 `pin_decrypt()`:
+
+**CLI 入口 (unlock --pin):**
 - **1. CLI 触发:** `sshwarden unlock --pin` 提示输入 PIN，发送 `unlock-pin:{pin}` IPC 命令. 参见 `src/main.rs:137-140`.
-- **2. 读取加密数据:** 优先从内存 `pin_encrypted_keys` 读取，若为空则从 `vault_file_data` 读取. 参见 `src/main.rs:695-702`.
-- **3. PIN 解密:** 调用 `pin_decrypt(&enc_data, &pin)`. 参见 `src/main.rs:706`.
-- **4. HMAC 验证 + AES 解密:** `decrypt_enc_string()` 先验证 HMAC-SHA256（错误 PIN 导致 HMAC 不匹配而失败），再 AES-256-CBC 解密.
-- **5. 重载密钥:** 调用 `finish_unlock_with_json()` 解析 JSON、更新 key_names、加载到 Agent、清除锁定标志. 参见 `src/main.rs:956-991`.
+- **2. 读取加密数据:** 调用 `get_pin_encrypted_data()` 优先从内存 `pin_encrypted_keys` 读取，若为空则从 `vault_file_data` 读取. 参见 `src/main.rs:1162-1174`.
+- **3. PIN 解密:** 调用 `pin_decrypt(&enc_data, &pin)`. HMAC 验证 + AES 解密.
+- **4. 重载密钥:** 调用 `finish_unlock_with_json()` 解析 JSON、更新 key_names、加载到 Agent、清除锁定标志.
+
+**PIN 对话框入口 (validator 重试模式):**
+- **1. 触发:** Hello 签名路径失败后的降级（3 处调用点）。调用 `get_pin_encrypted_data()` 读取加密数据.
+- **2. 构造 validator:** `make_pin_validator(enc_data)` 返回 `(validator, decrypted_cache)`。validator 闭包内部调用 `pin_decrypt()` 验证 PIN. 参见 `src/main.rs:1180-1202`.
+- **3. 对话框内验证:** `request_pin_dialog(tx, validator)` 发送到 Slint 主线程。对话框在后台线程调用 validator，失败时显示错误提示并允许重试，成功时将解密结果缓存到 `decrypted_cache`.
+- **4. 取回结果:** 调用方从 `decrypted_cache.lock().unwrap().take().unwrap()` 取回已缓存的解密 JSON，避免重复执行 Argon2id KDF.
+- **5. 重载密钥:** 调用 `finish_unlock_with_json()` 解析 JSON、加载密钥.
 
 ## 4. Design Rationale
 

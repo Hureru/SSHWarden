@@ -26,6 +26,7 @@ pub enum UIRequest {
     /// Request a PIN input dialog.
     PinDialog {
         response_tx: tokio::sync::oneshot::Sender<Option<String>>,
+        validator: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
     },
     /// Request an SSH sign authorization dialog.
     AuthDialog {

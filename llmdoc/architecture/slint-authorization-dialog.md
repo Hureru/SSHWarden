@@ -48,6 +48,6 @@
 - **Slint 替代 Toast 通知:** 原方案使用 Windows WinRT ToastNotification（需 AUMID、PowerShell fallback）+ TaskDialog + MessageBox fallback，仅 Windows 可用。Slint 实现跨平台（Windows/Linux/macOS），无平台依赖。
 - **移除条件编译:** 不再有 `notify/windows.rs`（Toast+TaskDialog）和 `notify/fallback.rs`（non-Windows 自动批准），所有平台使用统一的 Slint 授权对话框。
 - **复用 UIRequest 通道:** 授权对话框复用与 PIN 对话框相同的 `mpsc::channel<UIRequest>` + bridge 线程 + `slint::invoke_from_event_loop` 架构，无需额外的 `spawn_blocking`。
-- **Rc<RefCell<Option<Sender>>>:** 多个回调（approve/deny/close）共享 oneshot sender 的标准模式，确保只发送一次结果。
+- **Rc<RefCell<Option<Sender>>>:** AuthDialog 多个回调（approve/deny/close）共享 oneshot sender 的标准模式，确保只发送一次结果。注意 PinDialog 已改为 `Arc<Mutex>` 以支持跨线程 validator（参见 `/llmdoc/architecture/sshwarden-windows-hello-unlock.md`）。
 - **跨平台窗口居中+聚焦:** `center_and_focus_dialog()` 移除了原先的 `#[cfg(windows)]`/`#[cfg(not(windows))]` 条件编译分支，改为统一的跨平台实现。通过 Slint `unstable-winit-030` feature 暴露 `WinitWindowAccessor` API，获取底层 winit 窗口调用 `focus_window()` 确保前置激活。配合 `slint_center_win::center_window()` 实现居中。
 - **UI 美化:** AuthDialog 调整为紧凑布局（380x195px、16px 内边距、8px 间距），设置 `default-font-family: "Segoe UI"` 解决 Windows 字体问题，进程名 22px 加粗突出显示，正文统一 13px，按钮高度显式 30px。
