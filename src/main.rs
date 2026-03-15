@@ -6,9 +6,40 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use tokio::sync::RwLock;
 use tracing::info;
+use zeroize::Zeroize;
 
-// Type alias for cached key tuples (name, public_key, private_key)
-type CachedKeyTuples = Arc<RwLock<Vec<(String, String, String)>>>;
+/// Secure key cache: automatically zeroes PEM private keys on drop/clear.
+struct SecureKeyCache(Vec<(String, String, String)>);
+
+impl SecureKeyCache {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn set(&mut self, keys: Vec<(String, String, String)>) {
+        self.clear();
+        self.0 = keys;
+    }
+
+    fn clear(&mut self) {
+        for (pem, _, _) in &mut self.0 {
+            pem.zeroize();
+        }
+        self.0.clear();
+    }
+
+    fn clone_inner(&self) -> Vec<(String, String, String)> {
+        self.0.clone()
+    }
+}
+
+impl Drop for SecureKeyCache {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+type CachedKeyTuples = Arc<RwLock<SecureKeyCache>>;
 
 #[derive(Parser)]
 #[command(
@@ -81,6 +112,9 @@ fn main() -> anyhow::Result<()> {
     // Set Per-Monitor DPI Awareness V2 before any UI calls.
     // This prevents Win32 dialogs (CredUI) from being blurry on high-DPI displays.
     sshwarden_ui::init();
+
+    // Initialize rustls CryptoProvider for tokio-tungstenite (WebSocket TLS)
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
 
@@ -206,11 +240,11 @@ fn main() -> anyhow::Result<()> {
                 }) => {
                     if pin {
                         let pin_value = prompt_password("Enter PIN: ")?;
-                        let cmd = format!("unlock-pin:{}", pin_value);
+                        let cmd = format!("unlock-pin:{}", &*pin_value);
                         cmd_control(&cmd).await
                     } else if password {
                         let pw = prompt_password("Master password: ")?;
-                        let cmd = format!("unlock-password:{}", pw);
+                        let cmd = format!("unlock-password:{}", &*pw);
                         cmd_control(&cmd).await
                     } else if hello {
                         cmd_control("unlock-hello").await
@@ -326,13 +360,16 @@ async fn cmd_set_pin() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cmd = format!("set-pin:{}", pin);
+    let cmd = format!("set-pin:{}", &*pin);
     cmd_control(&cmd).await
 }
 
 /// Prompt for a password from the terminal (hides input).
-fn prompt_password(prompt: &str) -> anyhow::Result<String> {
-    rpassword::prompt_password(prompt).context("Failed to read password")
+/// Returns `Zeroizing<String>` to ensure the password is wiped from memory when dropped.
+fn prompt_password(prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    Ok(zeroize::Zeroizing::new(
+        rpassword::prompt_password(prompt).context("Failed to read password")?,
+    ))
 }
 
 /// Prompt for an email from the terminal.
@@ -425,9 +462,9 @@ async fn cmd_keys(
         info!("Found {} SSH key(s):", keys.len());
         for key in &keys {
             // Show first line of PEM to identify key type
-            let key_type = if key.private_key_pem.contains("ed25519") {
+            let key_type = if key.private_key_pem.as_str().contains("ed25519") {
                 "ED25519"
-            } else if key.private_key_pem.contains("BEGIN RSA") {
+            } else if key.private_key_pem.as_str().contains("BEGIN RSA") {
                 "RSA"
             } else {
                 "SSH"
@@ -528,7 +565,7 @@ async fn run_foreground(
     );
 
     // Cache key tuples for re-loading after unlock, and track vault lock state
-    let cached_key_tuples: CachedKeyTuples = Arc::new(RwLock::new(Vec::new()));
+    let cached_key_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
     let vault_locked = Arc::new(std::sync::atomic::AtomicBool::new(has_vault_file));
     let api_client: Arc<RwLock<Option<sshwarden_api::BitwardenClient>>> =
         Arc::new(RwLock::new(api_client));
@@ -545,7 +582,7 @@ async fn run_foreground(
             .iter()
             .map(|k| {
                 (
-                    k.private_key_pem.clone(),
+                    (*k.private_key_pem).clone(),
                     k.name.clone(),
                     k.cipher_id.clone(),
                 )
@@ -553,7 +590,7 @@ async fn run_foreground(
             .collect();
         let count = key_tuples.len();
         if count > 0 {
-            *cached_key_tuples.write().await = key_tuples.clone();
+            cached_key_tuples.write().await.set(key_tuples.clone());
             agent.set_keys(key_tuples)?;
             info!("Loaded {} SSH key(s) into agent", count);
 
@@ -564,6 +601,7 @@ async fn run_foreground(
                     &pin_encrypted_keys,
                     &vault_file_data,
                     &config,
+                    &api_client,
                 )
                 .await;
             }
@@ -595,6 +633,37 @@ async fn run_foreground(
     let config = Arc::new(config);
     let mut last_activity = tokio::time::Instant::now();
     let mut lock_check_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut token_refresh_interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+    // Skip the first immediate tick for token refresh
+    token_refresh_interval.tick().await;
+
+    // Notification hub state
+    let mut notification_rx: Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>> = None;
+    let mut _notification_client: Option<sshwarden_api::NotificationClient> = None;
+
+    // Connect to notification hub if we already have an API session (first login)
+    {
+        let client_guard = api_client.read().await;
+        if let Some(ref client) = *client_guard {
+            if let Some(token) = client.access_token() {
+                let notif_url = config.server.notifications_url();
+                info!("Attempting to connect to notification hub: {}", notif_url);
+                match sshwarden_api::NotificationClient::connect(&notif_url, token).await {
+                    Ok((notif_client, rx)) => {
+                        info!("Connected to notification hub");
+                        notification_rx = Some(rx);
+                        _notification_client = Some(notif_client);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to notification hub: {:?}", e);
+                    }
+                }
+
+                // Save device session for this host
+                save_device_session(client, &config, None).await;
+            }
+        }
+    }
 
     loop {
         tokio::select! {
@@ -613,6 +682,8 @@ async fn run_foreground(
                     &config,
                     auto_unlock,
                     &ui_request_tx,
+                    &mut notification_rx,
+                    &mut _notification_client,
                 ).await;
                 let _ = ctrl_req.reply.send(response);
             }
@@ -647,6 +718,45 @@ async fn run_foreground(
                     ).await;
                 });
             }
+            // Notification hub events
+            Some(event) = async {
+                match notification_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match event {
+                    sshwarden_api::SyncEvent::CipherChanged => {
+                        info!("Notification: cipher changed, syncing...");
+                        match do_sync(&api_client, &cached_key_tuples, &vault_locked, &mut agent, &key_names).await {
+                            Ok(count) => info!("Auto-synced: {} SSH keys", count),
+                            Err(e) => tracing::warn!("Auto-sync failed: {}", e),
+                        }
+                    }
+                    sshwarden_api::SyncEvent::LogOut => {
+                        info!("Notification: remote logout");
+                        let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, &key_names).await;
+                    }
+                }
+            }
+            // Token auto-refresh
+            _ = token_refresh_interval.tick() => {
+                let mut client_guard = api_client.write().await;
+                if let Some(ref mut client) = *client_guard {
+                    if client.is_token_expiring_soon() {
+                        match client.refresh_access_token().await {
+                            Ok(()) => {
+                                info!("Access token refreshed");
+                                // Update session file with new refresh token
+                                save_device_session(client, &config, None).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!("Token refresh failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
             // Auto-lock check
             _ = lock_check_interval.tick() => {
                 if lock_timeout > 0
@@ -654,9 +764,7 @@ async fn run_foreground(
                     && last_activity.elapsed().as_secs() >= lock_timeout
                 {
                     info!("Auto-locking vault due to inactivity ({} seconds)", lock_timeout);
-                    if agent.lock().is_ok() {
-                        vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, &key_names).await;
                 }
             }
             // Shutdown signal
@@ -670,6 +778,21 @@ async fn run_foreground(
     cancel_token.cancel();
     agent.stop();
     info!("SSHWarden stopped.");
+    Ok(())
+}
+
+/// Lock the vault: clear agent keys, cached key tuples, and key names.
+/// Centralizes all lock-related cleanup to prevent data leakage.
+async fn lock_vault(
+    agent: &mut sshwarden_agent::SshWardenAgent,
+    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
+    cached_key_tuples: &CachedKeyTuples,
+    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+) -> Result<(), anyhow::Error> {
+    agent.lock()?;
+    vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
+    cached_key_tuples.write().await.clear();
+    key_names.write().await.clear();
     Ok(())
 }
 
@@ -687,6 +810,8 @@ async fn handle_control_command(
     config: &Arc<sshwarden_config::Config>,
     auto_unlock: bool,
     ui_request_tx: &UIRequestTx,
+    notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
+    notification_client: &mut Option<sshwarden_api::NotificationClient>,
 ) -> sshwarden_agent::ControlResponse {
     use sshwarden_agent::ControlAction;
 
@@ -695,9 +820,8 @@ async fn handle_control_command(
             if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
                 sshwarden_agent::ControlResponse::ok("Vault is already locked")
             } else {
-                match agent.lock() {
+                match lock_vault(agent, vault_locked, cached_key_tuples, key_names).await {
                     Ok(()) => {
-                        vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
                         info!("Vault locked via control command");
                         sshwarden_agent::ControlResponse::ok("Vault locked")
                     }
@@ -739,7 +863,7 @@ async fn handle_control_command(
                             .await;
 
                             if let Ok(Ok(keys_json)) = hello_result {
-                                return finish_unlock_with_json(
+                                let resp = finish_unlock_with_json(
                                     &keys_json,
                                     agent,
                                     vault_locked,
@@ -748,6 +872,18 @@ async fn handle_control_command(
                                     "Vault unlocked via Windows Hello",
                                 )
                                 .await;
+
+                                if resp.ok {
+                                    try_restore_api_session_hello(
+                                        api_client,
+                                        config,
+                                        notification_rx,
+                                        notification_client,
+                                    )
+                                    .await;
+                                }
+
+                                return resp;
                             }
                             info!("Hello unlock failed or cancelled, trying fallback");
                         }
@@ -765,9 +901,10 @@ async fn handle_control_command(
                     let pin_result =
                         sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator).await;
 
-                    if pin_result.is_some() {
-                        let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
-                        return finish_unlock_with_json(
+                    if let Some(ref entered_pin) = pin_result {
+                        let keys_json =
+                            decrypted_cache.lock().unwrap().take().unwrap();
+                        let resp = finish_unlock_with_json(
                             &keys_json,
                             agent,
                             vault_locked,
@@ -776,6 +913,19 @@ async fn handle_control_command(
                             "Vault unlocked via PIN dialog",
                         )
                         .await;
+
+                        if resp.ok {
+                            try_restore_api_session(
+                                api_client,
+                                config,
+                                entered_pin,
+                                notification_rx,
+                                notification_client,
+                            )
+                            .await;
+                        }
+
+                        return resp;
                     }
                 }
                 return sshwarden_agent::ControlResponse::err(
@@ -889,6 +1039,7 @@ async fn handle_control_command(
             resp
         }
         ControlAction::UnlockPin { pin } => {
+            let pin = zeroize::Zeroizing::new(pin);
             if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
@@ -910,7 +1061,7 @@ async fn handle_control_command(
             match encrypted {
                 Some(enc_data) => match sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
                     Ok(keys_json) => {
-                        finish_unlock_with_json(
+                        let resp = finish_unlock_with_json(
                             &keys_json,
                             agent,
                             vault_locked,
@@ -918,7 +1069,21 @@ async fn handle_control_command(
                             key_names,
                             "Vault unlocked via PIN",
                         )
-                        .await
+                        .await;
+
+                        if resp.ok {
+                            // Try to restore API session from device session file
+                            try_restore_api_session(
+                                api_client,
+                                config,
+                                &pin,
+                                notification_rx,
+                                notification_client,
+                            )
+                            .await;
+                        }
+
+                        resp
                     }
                     Err(_) => sshwarden_agent::ControlResponse::err("Invalid PIN"),
                 },
@@ -928,6 +1093,7 @@ async fn handle_control_command(
             }
         }
         ControlAction::UnlockPassword { password } => {
+            let password = zeroize::Zeroizing::new(password);
             if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
@@ -960,14 +1126,14 @@ async fn handle_control_command(
                         .iter()
                         .map(|k| {
                             (
-                                k.private_key_pem.clone(),
+                                (*k.private_key_pem).clone(),
                                 k.name.clone(),
                                 k.cipher_id.clone(),
                             )
                         })
                         .collect();
                     let count = key_tuples.len();
-                    *cached_key_tuples.write().await = key_tuples.clone();
+                    cached_key_tuples.write().await.set(key_tuples.clone());
 
                     // Update key_names
                     {
@@ -985,15 +1151,26 @@ async fn handle_control_command(
                         ));
                     }
                     vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
-                    *api_client.write().await = Some(client);
 
-                    // Update vault.enc if PIN is configured
-                    let pin_enc = pin_encrypted_keys.read().await.clone();
-                    if pin_enc.is_some() {
-                        // Vault file already has the old pin_encrypted; update it with re-encrypted keys
-                        // We can't re-encrypt without knowing the PIN, so just keep the vault file as-is.
-                        // The user can run set-pin again if they want to update.
+                    // Save device session + connect notifications
+                    save_device_session(&client, config, None).await;
+
+                    if let Some(token) = client.access_token() {
+                        let notif_url = config.server.notifications_url();
+                        info!("Attempting to connect to notification hub: {}", notif_url);
+                        match sshwarden_api::NotificationClient::connect(&notif_url, token).await {
+                            Ok((notif_client, rx)) => {
+                                info!("Connected to notification hub");
+                                *notification_rx = Some(rx);
+                                *notification_client = Some(notif_client);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to connect to notification hub: {:?}", e);
+                            }
+                        }
                     }
+
+                    *api_client.write().await = Some(client);
 
                     info!("Vault unlocked via master password, {} keys loaded", count);
                     sshwarden_agent::ControlResponse::ok(&format!(
@@ -1008,49 +1185,20 @@ async fn handle_control_command(
             }
         }
         ControlAction::Sync => {
-            let client_guard = api_client.read().await;
-            if let Some(ref client) = *client_guard {
-                match client.sync_ssh_keys().await {
-                    Ok(keys) => {
-                        let key_tuples: Vec<(String, String, String)> = keys
-                            .iter()
-                            .map(|k| {
-                                (
-                                    k.private_key_pem.clone(),
-                                    k.name.clone(),
-                                    k.cipher_id.clone(),
-                                )
-                            })
-                            .collect();
-                        let count = key_tuples.len();
-                        *cached_key_tuples.write().await = key_tuples.clone();
-                        drop(client_guard);
-
-                        if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
-                            if let Err(e) = agent.set_keys(key_tuples) {
-                                return sshwarden_agent::ControlResponse::err(&format!(
-                                    "Sync succeeded but failed to reload keys: {}",
-                                    e
-                                ));
-                            }
-                        }
-                        info!("Vault synced: {} SSH keys", count);
-                        sshwarden_agent::ControlResponse::ok(&format!("Synced {} SSH keys", count))
-                    }
-                    Err(e) => sshwarden_agent::ControlResponse::err(&format!("Sync failed: {}", e)),
+            match do_sync(api_client, cached_key_tuples, vault_locked, agent, key_names).await {
+                Ok(count) => {
+                    sshwarden_agent::ControlResponse::ok(&format!("Synced {} SSH keys", count))
                 }
-            } else {
-                sshwarden_agent::ControlResponse::err(
-                    "Not authenticated. Use 'unlock --password' to login.",
-                )
+                Err(e) => sshwarden_agent::ControlResponse::err(&e),
             }
         }
         ControlAction::SetPin { pin } => {
+            let pin = zeroize::Zeroizing::new(pin);
             if pin.len() < 4 {
                 return sshwarden_agent::ControlResponse::err("PIN must be at least 4 characters");
             }
 
-            let keys = cached_key_tuples.read().await.clone();
+            let keys = cached_key_tuples.read().await.clone_inner();
             if keys.is_empty() {
                 return sshwarden_agent::ControlResponse::err("No keys loaded. Login first.");
             }
@@ -1134,6 +1282,14 @@ async fn handle_control_command(
 
                     *vault_file_data.write().await = Some(vault);
 
+                    // Save device session with PIN-encrypted refresh token
+                    {
+                        let client_guard = api_client.read().await;
+                        if let Some(ref client) = *client_guard {
+                            save_device_session(client, config, Some(&pin)).await;
+                        }
+                    }
+
                     info!("PIN set successfully, keys encrypted with PIN");
                     sshwarden_agent::ControlResponse::ok(
                         "PIN set successfully (persisted to vault.enc)",
@@ -1195,6 +1351,304 @@ fn make_pin_validator(enc_data: String) -> (PinValidator, DecryptedCache) {
     (validator, decrypted_cache)
 }
 
+/// Try to restore an API session from the device session file after Hello unlock.
+///
+/// Uses the Hello-encrypted refresh token stored in the session file.
+#[cfg(windows)]
+async fn try_restore_api_session_hello(
+    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
+    config: &Arc<sshwarden_config::Config>,
+    notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
+    notification_client: &mut Option<sshwarden_api::NotificationClient>,
+) {
+    if api_client.read().await.is_some() {
+        return;
+    }
+
+    let session = match sshwarden_config::session::SessionFile::load() {
+        Ok(Some(s)) => s,
+        _ => return,
+    };
+
+    // Need hello_encrypted_token and the vault's hello_challenge
+    let hello_enc_token = match session.hello_encrypted_token {
+        Some(ref t) => t.clone(),
+        None => {
+            info!("Session file has no Hello-encrypted token, skipping API restore");
+            return;
+        }
+    };
+
+    // Get challenge from vault file
+    let vault_file = match sshwarden_config::vault::VaultFile::load() {
+        Ok(Some(v)) => v,
+        _ => return,
+    };
+
+    let challenge_b64 = match vault_file.hello_challenge {
+        Some(ref c) => c.clone(),
+        None => return,
+    };
+
+    let challenge_bytes = match base64::engine::general_purpose::STANDARD.decode(&challenge_b64) {
+        Ok(b) if b.len() == 16 => {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return,
+    };
+
+    // Decrypt with Hello
+    let hello_result = tokio::task::spawn_blocking(move || {
+        sshwarden_ui::unlock::hello_crypto::hello_decrypt_keys(&hello_enc_token, &challenge_bytes)
+    })
+    .await;
+
+    let refresh_token = match hello_result {
+        Ok(Ok(token)) => token,
+        _ => {
+            info!("Hello decrypt of session token failed");
+            return;
+        }
+    };
+
+    let base = &config.server.base_url;
+    let api_url = config.server.api_url();
+    let mut client = sshwarden_api::BitwardenClient::new_with_device_id(
+        base,
+        &api_url,
+        &session.identity_url,
+        &session.device_id,
+    );
+    client.set_refresh_token(refresh_token);
+
+    match client.refresh_access_token().await {
+        Ok(()) => {
+            info!("Restored API session from device session file (Hello)");
+
+            if let Some(token) = client.access_token() {
+                let notif_url = config.server.notifications_url();
+                match sshwarden_api::NotificationClient::connect(&notif_url, token).await {
+                    Ok((notif_client, rx)) => {
+                        info!("Connected to notification hub");
+                        *notification_rx = Some(rx);
+                        *notification_client = Some(notif_client);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to notification hub: {}", e);
+                    }
+                }
+            }
+
+            *api_client.write().await = Some(client);
+        }
+        Err(e) => {
+            tracing::warn!("Hello session restore failed: {}", e);
+        }
+    }
+}
+
+/// Sync SSH keys from the Bitwarden API and reload into the agent.
+async fn do_sync(
+    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
+    cached_key_tuples: &CachedKeyTuples,
+    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
+    agent: &mut sshwarden_agent::SshWardenAgent,
+    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+) -> Result<usize, String> {
+    let client_guard = api_client.read().await;
+    let client = match *client_guard {
+        Some(ref c) => c,
+        None => {
+            return Err("Not authenticated. Use 'unlock --password' to login.".to_string())
+        }
+    };
+
+    let keys = client
+        .sync_ssh_keys()
+        .await
+        .map_err(|e| format!("Sync failed: {}", e))?;
+
+    let key_tuples: Vec<(String, String, String)> = keys
+        .iter()
+        .map(|k| {
+            (
+                (*k.private_key_pem).clone(),
+                k.name.clone(),
+                k.cipher_id.clone(),
+            )
+        })
+        .collect();
+    let count = key_tuples.len();
+    cached_key_tuples.write().await.set(key_tuples.clone());
+
+    // Update key_names
+    {
+        let mut names = key_names.write().await;
+        names.clear();
+        for k in &keys {
+            names.insert(k.cipher_id.clone(), k.name.clone());
+        }
+    }
+
+    drop(client_guard);
+
+    if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Err(e) = agent.set_keys(key_tuples) {
+            return Err(format!("Sync succeeded but failed to reload keys: {}", e));
+        }
+    }
+    info!("Vault synced: {} SSH keys", count);
+    Ok(count)
+}
+
+/// Try to restore an API session from the device session file after PIN unlock.
+///
+/// Decrypts the stored refresh_token using the PIN, refreshes the access token,
+/// and connects to the notification hub.
+async fn try_restore_api_session(
+    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
+    config: &Arc<sshwarden_config::Config>,
+    pin: &str,
+    notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
+    notification_client: &mut Option<sshwarden_api::NotificationClient>,
+) {
+    // Only restore if we don't already have an API client
+    if api_client.read().await.is_some() {
+        return;
+    }
+
+    let session = match sshwarden_config::session::SessionFile::load() {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            info!("No device session file found, skipping API session restore");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load session file: {}", e);
+            return;
+        }
+    };
+
+    // Decrypt refresh token using PIN
+    let refresh_token = match session.pin_encrypted_token {
+        Some(ref enc) => match sshwarden_api::crypto::pin_decrypt(enc, pin) {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!("Failed to decrypt session refresh token: {}", e);
+                return;
+            }
+        },
+        None => {
+            info!("Session file has no PIN-encrypted token");
+            return;
+        }
+    };
+
+    // Create client with stored device_id and try to refresh
+    let base = &config.server.base_url;
+    let api_url = config.server.api_url();
+    let mut client = sshwarden_api::BitwardenClient::new_with_device_id(
+        base,
+        &api_url,
+        &session.identity_url,
+        &session.device_id,
+    );
+    client.set_refresh_token(refresh_token);
+
+    match client.refresh_access_token().await {
+        Ok(()) => {
+            info!("Restored API session from device session file");
+
+            // Connect to notification hub
+            if let Some(token) = client.access_token() {
+                let notif_url = config.server.notifications_url();
+                match sshwarden_api::NotificationClient::connect(&notif_url, token).await {
+                    Ok((notif_client, rx)) => {
+                        info!("Connected to notification hub");
+                        *notification_rx = Some(rx);
+                        *notification_client = Some(notif_client);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to notification hub: {}", e);
+                    }
+                }
+            }
+
+            // Update session file with new refresh token
+            save_device_session(&client, config, Some(pin)).await;
+
+            *api_client.write().await = Some(client);
+        }
+        Err(e) => {
+            tracing::warn!("API session restore failed (token refresh): {}", e);
+            // Session file may have an expired refresh token — clean it up
+            if let Err(e) = sshwarden_config::session::SessionFile::delete() {
+                tracing::warn!("Failed to delete stale session file: {}", e);
+            }
+        }
+    }
+}
+
+/// Save the current API client's device session to disk.
+///
+/// If `pin` is provided, the refresh token is encrypted with it.
+/// Otherwise, the existing session file's encrypted tokens are preserved.
+async fn save_device_session(
+    client: &sshwarden_api::BitwardenClient,
+    _config: &sshwarden_config::Config,
+    pin: Option<&str>,
+) {
+    let refresh_token = match client.refresh_token() {
+        Some(t) => t.to_string(),
+        None => return, // No refresh token to save
+    };
+
+    // Load existing session to preserve hello_encrypted_token if present
+    let existing = sshwarden_config::session::SessionFile::load()
+        .ok()
+        .flatten();
+
+    let pin_encrypted_token = if let Some(pin) = pin {
+        match sshwarden_api::crypto::pin_encrypt(&refresh_token, pin) {
+            Ok(enc) => Some(enc),
+            Err(e) => {
+                tracing::warn!("Failed to encrypt refresh token with PIN: {}", e);
+                // Fall back to existing
+                existing.as_ref().and_then(|s| s.pin_encrypted_token.clone())
+            }
+        }
+    } else {
+        // Re-encrypt with existing PIN is not possible without the PIN.
+        // Keep existing encrypted token if available.
+        existing.as_ref().and_then(|s| s.pin_encrypted_token.clone())
+    };
+
+    let hello_encrypted_token = existing
+        .as_ref()
+        .and_then(|s| s.hello_encrypted_token.clone());
+
+    let session = sshwarden_config::session::SessionFile {
+        version: 1,
+        device_id: client.device_id().to_string(),
+        pin_encrypted_token,
+        hello_encrypted_token,
+        identity_url: client.identity_url().to_string(),
+    };
+
+    if let Err(e) = session.save() {
+        tracing::warn!("Failed to save device session: {}", e);
+    } else {
+        info!(
+            "Device session saved to {}",
+            sshwarden_config::session::SessionFile::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        );
+    }
+}
+
 /// Finish an unlock by parsing keys JSON and loading into agent.
 async fn finish_unlock_with_json(
     keys_json: &str,
@@ -1223,7 +1677,7 @@ async fn finish_unlock_with_json(
         }
     }
 
-    *cached_key_tuples.write().await = keys.clone();
+    cached_key_tuples.write().await.set(keys.clone());
     if let Err(e) = agent.set_keys(keys) {
         return sshwarden_agent::ControlResponse::err(&format!("Failed to reload keys: {}", e));
     }
@@ -1408,7 +1862,7 @@ async fn handle_ui_request(
                                         names.insert(cipher_id.clone(), name.clone());
                                     }
                                 }
-                                *cached_key_tuples.write().await = keys.clone();
+                                cached_key_tuples.write().await.set(keys.clone());
                                 let mut agent_for_unlock = agent.clone();
                                 if agent_for_unlock.set_keys(keys).is_ok() {
                                     vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1471,7 +1925,7 @@ async fn handle_ui_request(
                                 names.insert(cid.clone(), name.clone());
                             }
                         }
-                        *cached_key_tuples.write().await = keys.clone();
+                        cached_key_tuples.write().await.set(keys.clone());
 
                         // Get key name for authorization prompt
                         let key_name = request
@@ -1598,6 +2052,7 @@ async fn prompt_setup_pin(
     pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
     vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
     config: &sshwarden_config::Config,
+    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
 ) {
     #[allow(clippy::print_stderr)]
     {
@@ -1630,7 +2085,7 @@ async fn prompt_setup_pin(
         return;
     }
 
-    let keys = cached_key_tuples.read().await.clone();
+    let keys = cached_key_tuples.read().await.clone_inner();
     let keys_json = match serde_json::to_string(&keys) {
         Ok(j) => j,
         Err(e) => {
@@ -1693,6 +2148,14 @@ async fn prompt_setup_pin(
         tracing::warn!("Failed to save vault file: {}", e);
     } else {
         info!("PIN set. Next time just use 'sshwarden unlock --pin' or Windows Hello.");
+    }
+
+    // Save device session with PIN-encrypted refresh token
+    {
+        let client_guard = api_client.read().await;
+        if let Some(ref client) = *client_guard {
+            save_device_session(client, config, Some(&pin)).await;
+        }
     }
 
     *vault_file_data.write().await = Some(vault);

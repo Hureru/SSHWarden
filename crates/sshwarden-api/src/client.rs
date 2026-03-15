@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context};
 use reqwest::Client as HttpClient;
 use tracing::{debug, info};
+use zeroize::Zeroizing;
 
 use crate::crypto::{self, SymmetricKey};
 use crate::models::{Cipher, CipherType, PreloginResponse, SyncResponse, TokenResponse};
@@ -18,9 +19,10 @@ pub struct BitwardenClient {
 }
 
 /// A decrypted SSH key ready for use by the agent.
+/// The private key PEM is wrapped in `Zeroizing` for automatic memory cleanup.
 #[derive(Debug, Clone)]
 pub struct DecryptedSshKey {
-    pub private_key_pem: String,
+    pub private_key_pem: Zeroizing<String>,
     pub name: String,
     pub cipher_id: String,
 }
@@ -275,7 +277,7 @@ impl BitwardenClient {
         };
 
         Ok(DecryptedSshKey {
-            private_key_pem,
+            private_key_pem: Zeroizing::new(private_key_pem),
             name,
             cipher_id: cipher.id.clone(),
         })

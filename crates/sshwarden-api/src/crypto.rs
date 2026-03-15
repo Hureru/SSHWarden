@@ -4,6 +4,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tracing::trace;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::models::{KdfType, PreloginResponse};
 
@@ -11,8 +12,9 @@ type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type HmacSha256 = Hmac<Sha256>;
 
-/// Symmetric key: 32-byte encryption key + 32-byte MAC key
-#[derive(Clone)]
+/// Symmetric key: 32-byte encryption key + 32-byte MAC key.
+/// Automatically zeroed from memory when dropped.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SymmetricKey {
     pub enc_key: Vec<u8>, // 32 bytes
     pub mac_key: Vec<u8>, // 32 bytes
@@ -29,17 +31,17 @@ impl std::fmt::Debug for SymmetricKey {
 
 /// Derive the master key from master password using the KDF parameters.
 ///
-/// Returns a 32-byte master key.
+/// Returns a 32-byte master key wrapped in `Zeroizing` for automatic memory cleanup.
 pub fn derive_master_key(
     password: &str,
     email: &str,
     prelogin: &PreloginResponse,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let salt = email.trim().to_lowercase();
 
     match prelogin.kdf {
         KdfType::Pbkdf2 => {
-            let mut master_key = vec![0u8; 32];
+            let mut master_key = Zeroizing::new(vec![0u8; 32]);
             pbkdf2::pbkdf2_hmac::<Sha256>(
                 password.as_bytes(),
                 salt.as_bytes(),
@@ -67,7 +69,7 @@ pub fn derive_master_key(
             let argon2 =
                 argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-            let mut master_key = vec![0u8; 32];
+            let mut master_key = Zeroizing::new(vec![0u8; 32]);
             argon2
                 .hash_password_into(password.as_bytes(), &salt_hash, &mut master_key)
                 .map_err(|e| anyhow!("Argon2 hashing failed: {e}"))?;
@@ -78,11 +80,12 @@ pub fn derive_master_key(
 
 /// Derive the password hash that gets sent to the server for authentication.
 ///
-/// This is PBKDF2-SHA256 with 1 iteration: PBKDF2(masterKey, password, 1)
-pub fn derive_password_hash(master_key: &[u8], password: &str) -> anyhow::Result<String> {
-    let mut password_hash = vec![0u8; 32];
+/// This is PBKDF2-SHA256 with 1 iteration: PBKDF2(masterKey, password, 1).
+/// Result is wrapped in `Zeroizing` for automatic memory cleanup.
+pub fn derive_password_hash(master_key: &[u8], password: &str) -> anyhow::Result<Zeroizing<String>> {
+    let mut password_hash = Zeroizing::new(vec![0u8; 32]);
     pbkdf2::pbkdf2_hmac::<Sha256>(master_key, password.as_bytes(), 1, &mut password_hash);
-    Ok(STANDARD.encode(&password_hash))
+    Ok(Zeroizing::new(STANDARD.encode(&*password_hash)))
 }
 
 /// Stretch the 32-byte master key into a SymmetricKey (enc_key + mac_key) using HKDF-Expand-SHA256.
@@ -91,13 +94,16 @@ pub fn derive_password_hash(master_key: &[u8], password: &str) -> anyhow::Result
 pub fn stretch_master_key(master_key: &[u8]) -> anyhow::Result<SymmetricKey> {
     let hk = hkdf::Hkdf::<Sha256>::from_prk(master_key)
         .map_err(|e| anyhow!("HKDF from_prk failed: {e}"))?;
-    let mut enc_key = vec![0u8; 32];
-    let mut mac_key = vec![0u8; 32];
+    let mut enc_key = Zeroizing::new(vec![0u8; 32]);
+    let mut mac_key = Zeroizing::new(vec![0u8; 32]);
     hk.expand(b"enc", &mut enc_key)
         .map_err(|e| anyhow!("HKDF expand enc failed: {e}"))?;
     hk.expand(b"mac", &mut mac_key)
         .map_err(|e| anyhow!("HKDF expand mac failed: {e}"))?;
-    Ok(SymmetricKey { enc_key, mac_key })
+    Ok(SymmetricKey {
+        enc_key: enc_key.to_vec(),
+        mac_key: mac_key.to_vec(),
+    })
 }
 
 /// Decrypt the user's encrypted symmetric key (Profile.Key from token/sync response).
@@ -109,8 +115,10 @@ pub fn decrypt_user_key(
     master_key: &[u8],
 ) -> anyhow::Result<SymmetricKey> {
     let stretched = stretch_master_key(master_key)?;
-    let decrypted = decrypt_enc_string(encrypted_key_str, &stretched)
-        .context("Failed to decrypt user symmetric key")?;
+    let mut decrypted = Zeroizing::new(
+        decrypt_enc_string(encrypted_key_str, &stretched)
+            .context("Failed to decrypt user symmetric key")?,
+    );
 
     if decrypted.len() != 64 {
         return Err(anyhow!(
@@ -119,10 +127,12 @@ pub fn decrypt_user_key(
         ));
     }
 
-    Ok(SymmetricKey {
+    let key = SymmetricKey {
         enc_key: decrypted[..32].to_vec(),
         mac_key: decrypted[32..].to_vec(),
-    })
+    };
+    decrypted.zeroize();
+    Ok(key)
 }
 
 /// Parse and decrypt a Bitwarden EncString.
@@ -254,7 +264,7 @@ pub fn derive_pin_key(pin: &str) -> anyhow::Result<SymmetricKey> {
         .map_err(|e| anyhow!("Invalid Argon2 params: {e}"))?;
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-    let mut key_material = vec![0u8; 64];
+    let mut key_material = Zeroizing::new(vec![0u8; 64]);
     argon2
         .hash_password_into(pin.as_bytes(), &salt, &mut key_material)
         .map_err(|e| anyhow!("Argon2 PIN derivation failed: {e}"))?;
@@ -297,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_derive_password_hash() {
-        let master_key = vec![0u8; 32];
+        let master_key = Zeroizing::new(vec![0u8; 32]);
         let hash = derive_password_hash(&master_key, "password123").unwrap();
         // Base64 of 32 bytes = 44 chars
         assert_eq!(hash.len(), 44);
