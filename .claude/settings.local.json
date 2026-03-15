@@ -23,7 +23,12 @@
       "WebFetch(domain:docs.rs)",
       "Bash(cargo check:*)",
       "WebFetch(domain:slint.dev)",
-      "Bash(cargo tree:*)"
+      "Bash(cargo tree:*)",
+      "mcp__grok-search__web_search",
+      "mcp__grok-search__plan_sub_query",
+      "mcp__grok-search__plan_search_term",
+      "mcp__grok-search__plan_tool_mapping",
+      "mcp__grok-search__web_fetch"
     ]
   }
 }
