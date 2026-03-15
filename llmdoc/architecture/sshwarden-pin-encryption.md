@@ -7,7 +7,7 @@
 
 ## 2. Core Components
 
-- `crates/sshwarden-api/src/crypto.rs` (`derive_pin_key`, `pin_encrypt`, `pin_decrypt`, `encrypt_enc_string`): PIN 加解密核心函数。
+- `crates/sshwarden-api/src/crypto.rs` (`derive_pin_key`, `pin_encrypt`, `pin_decrypt`, `encrypt_enc_string`): PIN 加解密核心函数。`derive_pin_key` 的 key_material 使用 `Zeroizing` 包装，scope 结束自动擦零。
 - `crates/sshwarden-config/src/vault.rs` (`VaultFile`): vault.enc 持久化文件结构（version, pin_encrypted, hello_challenge, email, server_url），存放于 exe 同目录，支持 load/save/delete。
 - `src/main.rs` (`handle_control_command` -- `SetPin`/`UnlockPin` 分支): PIN 设置和 PIN 解锁的业务逻辑。参见 `src/main.rs:837-941` (SetPin), `src/main.rs:689-720` (UnlockPin).
 
@@ -18,7 +18,7 @@
 - **1. CLI 触发:** `sshwarden set-pin` 命令提示输入 PIN（>= 4 字符），两次确认后发送 `set-pin:{pin}` IPC 命令. 参见 `src/main.rs:203-217`.
 - **2. 序列化密钥:** 主循环将 `cached_key_tuples` (Vec<(String, String, String)>) 序列化为 JSON. 参见 `src/main.rs:852-860`.
 - **3. PIN 加密:** 调用 `sshwarden_api::crypto::pin_encrypt(&keys_json, &pin)`. 参见 `src/main.rs:862`.
-- **4. Argon2id 派生:** `derive_pin_key(pin)` 使用 Argon2id（64 MiB memory, 3 iterations, parallelism=1）从 PIN 派生 64 字节密钥材料，拆分为 32 字节 enc_key + 32 字节 mac_key. 参见 `crates/sshwarden-api/src/crypto.rs`.
+- **4. Argon2id 派生:** `derive_pin_key(pin)` 使用 Argon2id（64 MiB memory, 3 iterations, parallelism=1）从 PIN 派生 64 字节密钥材料（`Zeroizing` 包装），拆分为 32 字节 enc_key + 32 字节 mac_key. 参见 `crates/sshwarden-api/src/crypto.rs`.
 - **5. AES-256-CBC 加密:** `encrypt_enc_string()` 生成随机 16 字节 IV，AES-256-CBC + PKCS7 加密，HMAC-SHA256 签名(IV+密文)，输出 `2.{iv}|{data}|{mac}` 格式.
 - **6. 双重存储:** 加密字符串同时存入内存 `pin_encrypted_keys` 和磁盘 vault.enc 文件. 参见 `src/main.rs:865-931`.
 - **7. Hello 签名路径注册（可选）:** 若 Windows Hello 可用，生成 16 字节随机 challenge，用 KeyCredentialManager 签名 challenge 派生密钥加密密钥缓存，存入 Credential Manager，challenge 写入 vault.enc. 参见 `src/main.rs:880-920`.

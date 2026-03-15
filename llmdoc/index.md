@@ -1,9 +1,9 @@
 # SSHWarden 完整文档索引
 
 **项目**: SSHWarden -- Bitwarden SSH Agent (独立 CLI)
-**版本**: Phase 5 complete
+**版本**: Phase 6 complete
 **License**: GPL-3.0
-**技术栈**: Pure Rust (Tokio + Clap + Slint + winit + WinRT + bitwarden-russh)
+**技术栈**: Pure Rust (Tokio + Clap + Slint + winit + WinRT + bitwarden-russh + zeroize)
 
 ---
 
@@ -16,7 +16,7 @@
    - `overview/project-overview.md` - SSHWarden 是什么、技术栈、crate 结构、实现阶段
 
 2. **核心架构理解**
-   - `architecture/sshwarden-main-loop.md` - 双线程架构（Slint 主线程 + tokio 线程）tokio::select! 四路事件处理
+   - `architecture/sshwarden-main-loop.md` - 双线程架构（Slint 主线程 + tokio 线程）tokio::select! 六路事件处理（+SignalR 通知 +token 刷新）
    - `architecture/ipc-control-channel.md` - IPC 控制通道架构（Named Pipe JSON 协议，8 种命令）
    - `architecture/slint-authorization-dialog.md` - Slint 跨平台授权对话框（SSH 签名请求 Approve/Deny）
    - `architecture/sshwarden-windows-hello-unlock.md` - Windows Hello 解锁（签名路径 + Slint PIN 对话框降级）
@@ -35,6 +35,9 @@
 | 问题 | 文档 |
 |------|------|
 | "项目是什么，crate 结构如何？" | `overview/project-overview.md` |
+| "内存敏感数据如何擦零？" | `overview/project-overview.md` (6 节 内存敏感数据自动擦零) + `architecture/sshwarden-main-loop.md` (2 节 SecureKeyCache, 4 节 内存安全) |
+| "lock_vault() 统一锁定逻辑？" | `architecture/sshwarden-main-loop.md` (2 节 lock_vault, 3.3 节 notification_rx/lock_check) |
+| "SymmetricKey 如何安全销毁？" | `crates/sshwarden-api/src/crypto.rs` (`SymmetricKey` — Zeroize/ZeroizeOnDrop) |
 | "守护进程主循环如何工作？" | `architecture/sshwarden-main-loop.md` |
 | "双线程架构怎么工作？" | `architecture/sshwarden-main-loop.md` (3.1 节) |
 | "SSH 签名请求如何授权？" | `architecture/slint-authorization-dialog.md` |
@@ -51,6 +54,11 @@
 | "IPC 控制通道如何通信？" | `architecture/ipc-control-channel.md` |
 | "CLI 命令有哪些？怎么用？" | `guides/how-to-use-cli-commands.md` |
 | "IPC 协议的具体格式？" | `reference/ipc-control-protocol.md` |
+| "SignalR 实时通知如何工作？" | `architecture/sshwarden-main-loop.md` (3.3 节 notification_rx) + `crates/sshwarden-api/src/notifications.rs` |
+| "session 文件如何恢复 API 会话？" | `architecture/sshwarden-main-loop.md` (2 节 try_restore_api_session) + `crates/sshwarden-config/src/session.rs` |
+| "token 自动刷新如何工作？" | `architecture/sshwarden-main-loop.md` (3.3 节 token_refresh) + `crates/sshwarden-api/src/client.rs` |
+| "notifications_url 如何解析？" | `crates/sshwarden-config/src/lib.rs` (`ServerConfig::notifications_url`) |
+| "设备独立 session 文件格式？" | `crates/sshwarden-config/src/session.rs` (`SessionFile`) |
 
 ---
 
@@ -60,7 +68,7 @@
 
 #### 1. `overview/project-overview.md`
 **身份**: SSHWarden -- Bitwarden SSH Agent
-**内容**: 项目定义、技术栈（Rust + Tokio + Clap + Slint + WinRT）、5 个 crate 的职责、5 个实现阶段状态、关键设计决策
+**内容**: 项目定义、技术栈（Rust + Tokio + Clap + Slint + WinRT + tokio-tungstenite + rmpv + zeroize）、5 个 crate 的职责、6 个实现阶段状态、关键设计决策（含 SignalR 通知、session 文件、token 刷新、内存敏感数据自动擦零）
 **适用角色**: 任何人 - 快速了解项目
 
 ---
@@ -69,7 +77,7 @@
 
 #### 2. `architecture/sshwarden-main-loop.md`
 **身份**: SSHWarden 守护进程双线程架构（Slint 主线程 + tokio 线程）
-**内容**: 双线程启动流程（main -> Slint 事件循环 + tokio 线程）、UIRequest 统一通道桥接（mpsc + slint::invoke_from_event_loop，PinDialog 携带 validator 闭包、AuthDialog）、tokio::select! 四路事件（control/request/lock-check/ctrl-c）、8 种控制命令处理、get_pin_encrypted_data/make_pin_validator 辅助函数、二级自动解锁、关闭流程（channel drop -> quit_event_loop）
+**内容**: 双线程启动流程（main -> Slint 事件循环 + tokio 线程）、UIRequest 统一通道桥接（mpsc + slint::invoke_from_event_loop，PinDialog 携带 validator 闭包、AuthDialog）、tokio::select! 六路事件（control/request/notification/token-refresh/lock-check/ctrl-c）、8 种控制命令处理、SecureKeyCache 安全密钥缓存（PEM 擦零）、lock_vault() 统一锁定辅助函数、get_pin_encrypted_data/make_pin_validator 辅助函数、do_sync/try_restore_api_session/save_device_session 辅助函数、二级自动解锁、SignalR 通知集成、token 自动刷新、IPC PIN/password Zeroizing 包装、关闭流程（channel drop -> quit_event_loop）
 **适用角色**: 核心架构开发
 
 #### 3. `architecture/slint-authorization-dialog.md`
@@ -89,7 +97,7 @@
 
 #### 6. `architecture/sshwarden-pin-encryption.md`
 **身份**: PIN 加解密 + vault.enc 持久化架构
-**内容**: Argon2id PIN 密钥派生（64 MiB/3 iter）、AES-256-CBC + HMAC-SHA256 加密、type 2 EncString 格式、vault.enc 文件结构（VaultFile）、PIN 设置/解锁流程、Hello 签名路径注册
+**内容**: Argon2id PIN 密钥派生（64 MiB/3 iter，Zeroizing 包装中间密钥材料）、AES-256-CBC + HMAC-SHA256 加密、type 2 EncString 格式、vault.enc 文件结构（VaultFile）、PIN 设置/解锁流程、Hello 签名路径注册
 **适用角色**: 加密/安全/持久化开发
 
 ---
@@ -160,7 +168,18 @@
 
 ## 文档更新日志
 
-**最后更新**: 2026-03-10
+**最后更新**: 2026-03-15
+
+### 安全重构: 内存敏感数据自动擦零（对标 Bitwarden Desktop 安全模型）
+- UPDATE `overview/project-overview.md` - Crypto 层新增 zeroize，sshwarden-api crate 新增 zeroize 擦零描述，Key Design Decisions 新增"内存敏感数据自动擦零"完整条目
+- UPDATE `architecture/sshwarden-main-loop.md` - 新增 SecureKeyCache/lock_vault 组件，共享状态标注擦零安全，notification_rx LogOut 改为 lock_vault() 调用，Design Rationale 新增内存安全条目
+- UPDATE `architecture/sshwarden-pin-encryption.md` - derive_pin_key 组件新增 Zeroizing 描述，Argon2id 派生步骤标注 Zeroizing 包装
+- UPDATE `llmdoc/index.md` - 技术栈新增 zeroize，查询表新增 3 条（擦零/lock_vault/SymmetricKey），main-loop 文档描述更新，pin-encryption 文档描述更新，新增更新日志
+
+### Phase 6: SignalR 实时通知、设备独立 Session、Token 自动刷新
+- UPDATE `overview/project-overview.md` - High-Level Description 新增 SignalR 通知/session 文件/token 刷新描述，Tech Stack Bitwarden API 层新增 tokio-tungstenite+rmpv，Config & Vault 层新增 session 文件，sshwarden-api crate 新增通知客户端和 token 刷新，sshwarden-config crate 新增 session 文件，新增 Phase 6，Key Design Decisions 新增 SignalR 通知/设备独立 Session/Token 自动刷新/便携模式文件列表更新
+- UPDATE `architecture/sshwarden-main-loop.md` - select! 从四路扩展为六路（+notification_rx +token_refresh_interval），新增 do_sync/try_restore_api_session/try_restore_api_session_hello/save_device_session 组件，新增 NotificationClient/BitwardenClient/SessionFile/ServerConfig 外部组件，初始化流程新增通知服务连接和 token 刷新定时器，Design Rationale 新增 SignalR 通知/Token 自动刷新/设备独立 Session/do_sync 复用
+- UPDATE `llmdoc/index.md` - 版本更新为 Phase 6，查询表新增 6 条（SignalR/session/token/notifications_url），文档描述更新，新增更新日志
 
 ### PIN 对话框 validator 重试模式（错误 PIN 保持打开并提示重试）
 - UPDATE `architecture/sshwarden-windows-hello-unlock.md` - PIN 对话框从"提交即关闭"改为 validator 注入重试模式：`UIRequest::PinDialog` 新增 `validator` 字段，对话框在后台线程验证 PIN（`std::thread::spawn` + `invoke_from_event_loop`），失败时保持打开（清空输入+红色提示+抖动动画），`tx_cell` 从 `Rc<RefCell>` 改为 `Arc<Mutex>` 支持跨线程。新增 `get_pin_encrypted_data()`/`make_pin_validator()` 辅助函数，`decrypted_cache` 避免重复 Argon2id KDF
