@@ -1,3 +1,4 @@
+pub mod session;
 pub mod vault;
 
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ pub struct ServerConfig {
     pub base_url: String,
     pub api_url: Option<String>,
     pub identity_url: Option<String>,
+    pub notifications_url: Option<String>,
 }
 
 fn default_base_url() -> String {
@@ -37,6 +39,7 @@ impl Default for ServerConfig {
             base_url: default_base_url(),
             api_url: None,
             identity_url: None,
+            notifications_url: None,
         }
     }
 }
@@ -52,6 +55,16 @@ impl ServerConfig {
         self.identity_url
             .clone()
             .unwrap_or_else(|| format!("{}/identity", self.base_url))
+    }
+
+    pub fn notifications_url(&self) -> String {
+        self.notifications_url.clone().unwrap_or_else(|| {
+            if self.base_url.contains("vault.bitwarden.com") {
+                "https://notifications.bitwarden.com".to_string()
+            } else {
+                format!("{}/notifications", self.base_url)
+            }
+        })
     }
 }
 
