@@ -7,6 +7,16 @@ pub struct SignRequestInfo {
     pub key_name: String,
     pub process_name: String,
     pub namespace: Option<String>,
+    pub operation_kind: String,
+    pub is_forwarding: bool,
+}
+
+/// Context shown when an unlock is caused by a signing request.
+#[derive(Debug, Clone)]
+pub struct UnlockRequestContext {
+    pub key_name: String,
+    pub process_name: String,
+    pub operation_kind: String,
     pub is_forwarding: bool,
 }
 
@@ -27,6 +37,7 @@ pub enum UIRequest {
     PinDialog {
         response_tx: tokio::sync::oneshot::Sender<Option<String>>,
         validator: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+        context: Option<UnlockRequestContext>,
     },
     /// Request an SSH sign authorization dialog.
     AuthDialog {

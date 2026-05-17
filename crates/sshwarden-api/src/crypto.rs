@@ -82,7 +82,10 @@ pub fn derive_master_key(
 ///
 /// This is PBKDF2-SHA256 with 1 iteration: PBKDF2(masterKey, password, 1).
 /// Result is wrapped in `Zeroizing` for automatic memory cleanup.
-pub fn derive_password_hash(master_key: &[u8], password: &str) -> anyhow::Result<Zeroizing<String>> {
+pub fn derive_password_hash(
+    master_key: &[u8],
+    password: &str,
+) -> anyhow::Result<Zeroizing<String>> {
     let mut password_hash = Zeroizing::new(vec![0u8; 32]);
     pbkdf2::pbkdf2_hmac::<Sha256>(master_key, password.as_bytes(), 1, &mut password_hash);
     Ok(Zeroizing::new(STANDARD.encode(&*password_hash)))
@@ -273,6 +276,44 @@ pub fn derive_pin_key(pin: &str) -> anyhow::Result<SymmetricKey> {
         enc_key: key_material[..32].to_vec(),
         mac_key: key_material[32..].to_vec(),
     })
+}
+
+pub fn random_symmetric_key() -> SymmetricKey {
+    use rand::RngCore;
+    let mut enc_key = vec![0u8; 32];
+    let mut mac_key = vec![0u8; 32];
+    rand::thread_rng().fill_bytes(&mut enc_key);
+    rand::thread_rng().fill_bytes(&mut mac_key);
+    SymmetricKey { enc_key, mac_key }
+}
+
+pub fn encode_symmetric_key(key: &SymmetricKey) -> String {
+    let mut material = Vec::with_capacity(64);
+    material.extend_from_slice(&key.enc_key);
+    material.extend_from_slice(&key.mac_key);
+    let encoded = STANDARD.encode(&material);
+    material.zeroize();
+    encoded
+}
+
+pub fn decode_symmetric_key(encoded: &str) -> anyhow::Result<SymmetricKey> {
+    let mut material = Zeroizing::new(
+        STANDARD
+            .decode(encoded)
+            .context("Failed to decode symmetric key material")?,
+    );
+    if material.len() != 64 {
+        return Err(anyhow!(
+            "Symmetric key material has unexpected length: {}",
+            material.len()
+        ));
+    }
+    let key = SymmetricKey {
+        enc_key: material[..32].to_vec(),
+        mac_key: material[32..].to_vec(),
+    };
+    material.zeroize();
+    Ok(key)
 }
 
 /// Encrypt a string with a PIN-derived key.

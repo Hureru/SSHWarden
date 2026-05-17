@@ -16,6 +16,15 @@ base_url = "https://vault.bitwarden.com"
 # Identity URL（可选，默认为 base_url/identity）
 # identity_url = "https://vault.bitwarden.com/identity"
 
+# Notification URL（可选）
+# 如果不设置：
+#   - vault.bitwarden.com -> https://notifications.bitwarden.com
+#   - vault.bitwarden.eu  -> https://notifications.bitwarden.eu
+#   - 其它自托管地址       -> {base_url}/notifications
+# 可填写 notifications base，也可填写完整 hub URL：
+# notifications_url = "https://your-bitwarden-server.com/notifications"
+# notifications_url = "wss://your-bitwarden-server.com/notifications/hub"
+
 # ============================================
 # 认证配置
 # ============================================
@@ -41,10 +50,28 @@ email = ""
 # 默认: "always"
 prompt_behavior = "always"
 
-# 自动同步间隔（秒）
-# 定期从 Bitwarden 同步 SSH 密钥
+# 通知降级同步间隔（秒）
+# WebSocket 通知正常时不会盲目轮询；当通知连接断开并重连失败后，
+# 最多按此间隔执行一次 fallback sync。设置为 0 可禁用 fallback sync。
 # 默认: 300（5 分钟）
 sync_interval = 300
+
+# Notification Hub keepalive 间隔（秒）
+# 默认: 30
+notification_keepalive_interval = 30
+
+# Notification Hub 空闲超时（秒）
+# 超过该时间未收到任何消息/echo/ping/pong 则重连。
+# 默认: 90
+notification_idle_timeout = 90
+
+# 触发 fallback sync 前允许的连续重连失败次数
+# 默认: 3
+notification_reconnect_attempts_before_fallback = 3
+
+# Notification Hub 重连最大退避时间（秒）
+# 默认: 60
+notification_reconnect_max_backoff = 60
 
 # 自动锁定超时（秒）
 # 无活动后自动锁定 Agent
@@ -79,10 +106,24 @@ fallback = "pin"
 auto_unlock_on_request = true
 
 # ============================================
+# 存储配置
+# ============================================
+[storage]
+# 默认使用平台标准用户目录：
+#   Windows: %APPDATA%\SSHWarden
+#   Linux:   $XDG_CONFIG_HOME/sshwarden 或 ~/.config/sshwarden
+#   macOS:   ~/Library/Application Support/SSHWarden
+# 便携模式是显式选择；也可用 SSHWARDEN_PORTABLE=1 或 SSHWARDEN_HOME 覆盖。
+portable = false
+# portable_dir = "./sshwarden-data"
+
+# ============================================
 # Socket 配置（高级）
 # ============================================
 [socket]
-# 自定义 socket 路径（可选）
+# 自定义 agent endpoint 路径（可选）
 # Windows 默认: \\.\pipe\openssh-ssh-agent
-# Unix 默认: $SSH_AUTH_SOCK 或 /tmp/ssh-agent.sock
+# Linux 默认:   $XDG_RUNTIME_DIR/sshwarden/agent.sock（无 XDG_RUNTIME_DIR 时使用临时目录）
+# macOS 默认:   临时 runtime 目录中的 sshwarden/agent.sock
 # path = "\\\\.\\pipe\\openssh-ssh-agent"
+# path = "/run/user/1000/sshwarden/agent.sock"

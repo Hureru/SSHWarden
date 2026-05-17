@@ -1,8 +1,7 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context as _};
 use bitwarden_russh::ssh_agent;
-use homedir::my_home;
 use tokio::net::UnixListener;
 use tracing::{error, info};
 
@@ -11,16 +10,15 @@ use crate::peercred_unix_listener_stream::PeercredUnixListenerStream;
 
 const ENV_SSHWARDEN_SSH_AUTH_SOCK: &str = "SSHWARDEN_SSH_AUTH_SOCK";
 
-const SOCKFILE_NAME: &str = ".sshwarden-agent.sock";
-
 impl SshWardenAgent {
-    pub fn start_server(
+    pub fn start_server_with_endpoint(
         auth_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
         auth_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
+        endpoint: Option<PathBuf>,
     ) -> Result<Self, anyhow::Error> {
         let agent_state = SshWardenAgent::new(auth_request_tx, auth_response_tx);
 
-        let socket_path = get_socket_path()?;
+        let socket_path = get_socket_path(endpoint)?;
 
         remove_path(&socket_path)?;
 
@@ -64,8 +62,10 @@ impl SshWardenAgent {
     }
 }
 
-fn get_socket_path() -> Result<PathBuf, anyhow::Error> {
-    if let Ok(path) = std::env::var(ENV_SSHWARDEN_SSH_AUTH_SOCK) {
+fn get_socket_path(endpoint: Option<PathBuf>) -> Result<PathBuf, anyhow::Error> {
+    if let Some(path) = endpoint {
+        Ok(path)
+    } else if let Ok(path) = std::env::var(ENV_SSHWARDEN_SSH_AUTH_SOCK) {
         Ok(PathBuf::from(path))
     } else {
         info!("SSHWARDEN_SSH_AUTH_SOCK not set, using default path");
@@ -74,16 +74,17 @@ fn get_socket_path() -> Result<PathBuf, anyhow::Error> {
 }
 
 fn get_default_socket_path() -> Result<PathBuf, anyhow::Error> {
-    let Ok(Some(mut ssh_agent_directory)) = my_home() else {
-        error!("Could not determine home directory");
-        return Err(anyhow!("Could not determine home directory."));
-    };
-
-    ssh_agent_directory = ssh_agent_directory.join(SOCKFILE_NAME);
-    Ok(ssh_agent_directory)
+    sshwarden_config::default_agent_socket_path()
 }
 
 fn set_user_permissions(path: &PathBuf) -> Result<(), anyhow::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create socket directory {parent:?}"))?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            anyhow!("Could not set socket directory permissions for {parent:?}: {e}")
+        })?;
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|e| anyhow!("Could not set socket permissions for {path:?}: {e}"))
 }

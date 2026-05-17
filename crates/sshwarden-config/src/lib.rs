@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod session;
 pub mod vault;
 
@@ -18,6 +19,8 @@ pub struct Config {
     pub unlock: UnlockConfig,
     #[serde(default)]
     pub socket: SocketConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,13 +61,25 @@ impl ServerConfig {
     }
 
     pub fn notifications_url(&self) -> String {
-        self.notifications_url.clone().unwrap_or_else(|| {
-            if self.base_url.contains("vault.bitwarden.com") {
-                "https://notifications.bitwarden.com".to_string()
-            } else {
-                format!("{}/notifications", self.base_url)
-            }
-        })
+        self.notifications_url
+            .clone()
+            .unwrap_or_else(|| default_notifications_url(&self.base_url))
+    }
+}
+
+fn default_notifications_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let host = base
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(base);
+
+    match host {
+        "vault.bitwarden.com" => "https://notifications.bitwarden.com".to_string(),
+        "vault.bitwarden.eu" => "https://notifications.bitwarden.eu".to_string(),
+        _ => format!("{base}/notifications"),
     }
 }
 
@@ -106,6 +121,14 @@ pub struct AgentConfig {
     pub sync_interval: u64,
     #[serde(default = "default_lock_timeout")]
     pub lock_timeout: u64,
+    #[serde(default = "default_notification_keepalive_interval")]
+    pub notification_keepalive_interval: u64,
+    #[serde(default = "default_notification_idle_timeout")]
+    pub notification_idle_timeout: u64,
+    #[serde(default = "default_notification_reconnect_attempts_before_fallback")]
+    pub notification_reconnect_attempts_before_fallback: usize,
+    #[serde(default = "default_notification_reconnect_max_backoff")]
+    pub notification_reconnect_max_backoff: u64,
 }
 
 fn default_sync_interval() -> u64 {
@@ -116,12 +139,33 @@ fn default_lock_timeout() -> u64 {
     3600
 }
 
+fn default_notification_keepalive_interval() -> u64 {
+    30
+}
+
+fn default_notification_idle_timeout() -> u64 {
+    90
+}
+
+fn default_notification_reconnect_attempts_before_fallback() -> usize {
+    3
+}
+
+fn default_notification_reconnect_max_backoff() -> u64 {
+    60
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             prompt_behavior: PromptBehavior::default(),
             sync_interval: default_sync_interval(),
             lock_timeout: default_lock_timeout(),
+            notification_keepalive_interval: default_notification_keepalive_interval(),
+            notification_idle_timeout: default_notification_idle_timeout(),
+            notification_reconnect_attempts_before_fallback:
+                default_notification_reconnect_attempts_before_fallback(),
+            notification_reconnect_max_backoff: default_notification_reconnect_max_backoff(),
         }
     }
 }
@@ -183,7 +227,17 @@ impl Default for UnlockConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SocketConfig {
+    /// Optional custom SSH agent endpoint path.
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Keep user data beside the executable instead of platform-standard storage.
+    #[serde(default)]
+    pub portable: bool,
+    /// Optional explicit portable directory. Used only when portable is true.
+    pub portable_dir: Option<String>,
 }
 
 impl Config {
@@ -213,19 +267,143 @@ impl Config {
     }
 }
 
-/// Get the base directory for all SSHWarden data files.
+/// Get the base directory for persistent SSHWarden configuration/data files.
 ///
-/// Uses the directory where the executable is located, making the
-/// application fully portable (all files travel with the exe).
+/// Standard storage is the default. Portable storage is opt-in via either:
+/// - `SSHWARDEN_PORTABLE=1`, or
+/// - `SSHWARDEN_HOME=<dir>` for an explicit portable/data directory.
 pub fn config_dir() -> anyhow::Result<PathBuf> {
-    let exe = std::env::current_exe().context("Could not determine executable path")?;
-    let dir = exe
-        .parent()
-        .context("Executable has no parent directory")?
-        .to_path_buf();
-    Ok(dir)
+    if let Some(dir) = env_path("SSHWARDEN_HOME") {
+        return Ok(dir);
+    }
+
+    if env_bool("SSHWARDEN_PORTABLE") {
+        return executable_dir();
+    }
+
+    platform_config_dir()
 }
 
 pub fn config_path() -> anyhow::Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
+}
+
+pub fn runtime_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = env_path("SSHWARDEN_RUNTIME_DIR") {
+        return Ok(dir);
+    }
+
+    #[cfg(windows)]
+    {
+        Ok(config_dir()?.join("run"))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(dir) = env_path("XDG_RUNTIME_DIR") {
+            return Ok(dir.join("sshwarden"));
+        }
+        Ok(std::env::temp_dir().join(format!("sshwarden-{}", user_runtime_suffix())))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(std::env::temp_dir().join(format!("sshwarden-{}", user_runtime_suffix())))
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
+    {
+        Ok(std::env::temp_dir().join(format!("sshwarden-{}", user_runtime_suffix())))
+    }
+}
+
+pub fn default_agent_socket_path() -> anyhow::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        Ok(PathBuf::from(r"\\.\pipe\openssh-ssh-agent"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(runtime_dir()?.join("agent.sock"))
+    }
+}
+
+pub fn default_control_socket_path() -> anyhow::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        Ok(PathBuf::from(r"\\.\pipe\sshwarden-control"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(runtime_dir()?.join("control.sock"))
+    }
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn env_bool(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn executable_dir() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe().context("Could not determine executable path")?;
+    exe.parent()
+        .context("Executable has no parent directory")
+        .map(PathBuf::from)
+}
+
+#[cfg(windows)]
+fn platform_config_dir() -> anyhow::Result<PathBuf> {
+    env_path("APPDATA")
+        .context("APPDATA environment variable not set")
+        .map(|dir| dir.join("SSHWarden"))
+}
+
+#[cfg(target_os = "linux")]
+fn platform_config_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = env_path("XDG_CONFIG_HOME") {
+        return Ok(dir.join("sshwarden"));
+    }
+    home_dir().map(|home| home.join(".config").join("sshwarden"))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_config_dir() -> anyhow::Result<PathBuf> {
+    home_dir().map(|home| {
+        home.join("Library")
+            .join("Application Support")
+            .join("SSHWarden")
+    })
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
+fn platform_config_dir() -> anyhow::Result<PathBuf> {
+    home_dir().map(|home| home.join(".sshwarden"))
+}
+
+#[cfg(not(windows))]
+fn home_dir() -> anyhow::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME environment variable not set")
+}
+
+#[cfg(not(windows))]
+fn user_runtime_suffix() -> String {
+    std::env::var("UID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "unknown".to_string())
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect()
 }

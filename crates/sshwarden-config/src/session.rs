@@ -53,10 +53,7 @@ impl SessionFile {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create session directory: {}",
-                    parent.display()
-                )
+                format!("Failed to create session directory: {}", parent.display())
             })?;
         }
         let content =
@@ -81,9 +78,7 @@ impl SessionFile {
 fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .or_else(|_| {
-            gethostname()
-        })
+        .or_else(|_| gethostname())
         .unwrap_or_else(|_| "unknown".to_string())
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')

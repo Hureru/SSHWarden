@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "sync", "macros", "net"] }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing = { workspace = true }
+sshwarden-config = { path = "../sshwarden-config" }
 
 [target.'cfg(windows)'.dependencies]
 pin-project = "1"
@@ -26,9 +27,6 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Pipes",
 ] }
-
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-homedir = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

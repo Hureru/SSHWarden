@@ -2219,18 +2219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "homedir"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68df315d2857b2d8d2898be54a85e1d001bbbe0dbb5f8ef847b48dd3a23c4527"
-dependencies = [
- "cfg-if",
- "nix",
- "widestring",
- "windows 0.61.3",
-]
-
-[[package]]
 name = "htmlparser"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5247,8 +5235,11 @@ dependencies = [
  "rand 0.8.5",
  "rpassword",
  "rustls",
+ "serde",
  "serde_json",
+ "sha2",
  "slint",
+ "ssh-key",
  "sshwarden-agent",
  "sshwarden-api",
  "sshwarden-config",
@@ -5272,11 +5263,11 @@ dependencies = [
  "bitwarden-russh",
  "bytes",
  "futures",
- "homedir",
  "pin-project",
  "serde",
  "serde_json",
  "ssh-key",
+ "sshwarden-config",
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",
@@ -6510,12 +6501,6 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
-
-[[package]]
-name = "widestring"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "winapi"

@@ -29,11 +29,20 @@ pub struct NamedPipeServerStream {
 
 impl NamedPipeServerStream {
     #[allow(clippy::unwrap_used)]
-    pub fn new(cancellation_token: CancellationToken, is_running: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        endpoint: Option<std::path::PathBuf>,
+        cancellation_token: CancellationToken,
+        is_running: Arc<AtomicBool>,
+    ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
-            info!("Creating named pipe server on {}", PIPE_NAME);
-            let mut listener = match ServerOptions::new().create(PIPE_NAME) {
+            let pipe_name = endpoint
+                .as_ref()
+                .and_then(|path| path.to_str())
+                .unwrap_or(PIPE_NAME)
+                .to_string();
+            info!("Creating named pipe server on {}", pipe_name);
+            let mut listener = match ServerOptions::new().create(&pipe_name) {
                 Ok(pipe) => pipe,
                 Err(e) => {
                     error!(error = %e, "Encountered an error creating the first pipe. The system's openssh service must likely be disabled");
@@ -71,7 +80,7 @@ impl NamedPipeServerStream {
 
                         tx.send((listener, peer_info)).await.unwrap();
 
-                        listener = match ServerOptions::new().create(PIPE_NAME) {
+                        listener = match ServerOptions::new().create(&pipe_name) {
                             Ok(pipe) => pipe,
                             Err(e) => {
                                 error!(error = %e, "Encountered an error creating a new pipe");

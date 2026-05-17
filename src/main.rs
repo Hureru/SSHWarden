@@ -8,8 +8,94 @@ use tokio::sync::RwLock;
 use tracing::info;
 use zeroize::Zeroize;
 
+#[derive(Clone, Debug)]
+struct NotificationRuntimeState {
+    state: NotificationConnectionState,
+    url: Option<String>,
+    last_error: Option<String>,
+    reconnect_attempts: usize,
+    last_connected_at: Option<std::time::Instant>,
+    last_event_at: Option<std::time::Instant>,
+    last_fallback_sync_at: Option<std::time::Instant>,
+    stale_cache: bool,
+    stale_cache_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum NotificationConnectionState {
+    NotStarted,
+    Starting,
+    Running,
+    Stopped,
+    Failed,
+}
+
+impl Default for NotificationRuntimeState {
+    fn default() -> Self {
+        Self {
+            state: NotificationConnectionState::NotStarted,
+            url: None,
+            last_error: None,
+            reconnect_attempts: 0,
+            last_connected_at: None,
+            last_event_at: None,
+            last_fallback_sync_at: None,
+            stale_cache: false,
+            stale_cache_error: None,
+        }
+    }
+}
+
+impl NotificationRuntimeState {
+    fn state_name(&self) -> &'static str {
+        match self.state {
+            NotificationConnectionState::NotStarted => "not_started",
+            NotificationConnectionState::Starting => "starting",
+            NotificationConnectionState::Running => "running",
+            NotificationConnectionState::Stopped => "stopped",
+            NotificationConnectionState::Failed => "failed",
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.state_name(),
+            "url": self.url,
+            "last_error": self.last_error,
+            "reconnect_attempts": self.reconnect_attempts,
+            "last_connected_age_secs": self.last_connected_at.map(|t| t.elapsed().as_secs()),
+            "last_event_age_secs": self.last_event_at.map(|t| t.elapsed().as_secs()),
+            "last_fallback_sync_age_secs": self.last_fallback_sync_at.map(|t| t.elapsed().as_secs()),
+            "stale_cache": self.stale_cache,
+            "stale_cache_error": self.stale_cache_error,
+        })
+    }
+}
+
 /// Secure key cache: automatically zeroes PEM private keys on drop/clear.
 struct SecureKeyCache(Vec<(String, String, String)>);
+
+type AuthorizationMemorySet = Arc<RwLock<std::collections::HashSet<(String, String)>>>;
+type KeyMaterialFingerprints = Arc<RwLock<std::collections::HashMap<String, String>>>;
+
+#[derive(Default)]
+struct LocalCacheKeyState(Option<sshwarden_api::crypto::SymmetricKey>);
+
+impl LocalCacheKeyState {
+    fn set(&mut self, key: sshwarden_api::crypto::SymmetricKey) {
+        self.0 = Some(key);
+    }
+
+    fn clone_key(&self) -> Option<sshwarden_api::crypto::SymmetricKey> {
+        self.0.clone()
+    }
+
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
+type LocalCacheKeyHandle = Arc<RwLock<LocalCacheKeyState>>;
 
 impl SecureKeyCache {
     fn new() -> Self {
@@ -83,13 +169,29 @@ enum Commands {
         /// Use Windows Hello sign-path to unlock
         #[arg(long)]
         hello: bool,
+        /// Use platform-native unlock (macOS Keychain / Linux Secret Service)
+        #[arg(long)]
+        native: bool,
     },
     /// Lock the vault (clear private keys from memory)
     Lock,
     /// Set or update PIN for quick unlock
     SetPin,
     /// Show agent status
-    Status,
+    Status {
+        /// Print full machine-readable status JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run read-only diagnostics
+    Doctor {
+        /// Print machine-readable diagnostic JSON
+        #[arg(long)]
+        json: bool,
+        /// Explicitly allow repairs (no repairs implemented yet)
+        #[arg(long)]
+        fix: bool,
+    },
     /// List available SSH keys from vault (requires login)
     Keys {
         /// Bitwarden server base URL (overrides config)
@@ -101,12 +203,38 @@ enum Commands {
     },
     /// Manually trigger vault sync
     Sync,
+    /// Forget local remembered key/session material
+    Forget,
+    /// Print shell environment exports for SSHWarden agent discovery
+    Env {
+        /// Shell syntax to emit: sh, powershell, fish, or cmd
+        #[arg(long, default_value = "sh")]
+        shell: String,
+    },
+    /// Print SSH config snippets using selector files
+    SshConfig {
+        /// Bitwarden server base URL (overrides config)
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Email address
+        #[arg(long)]
+        email: Option<String>,
+        /// Write selector files, a managed include file, and add it to ~/.ssh/config
+        #[arg(long)]
+        write: bool,
+    },
     /// Edit configuration
     Config,
 }
 
 /// Type alias for the UI request sender passed through the system.
 type UIRequestTx = Arc<tokio::sync::mpsc::Sender<sshwarden_ui::UIRequest>>;
+
+/// Internal events emitted by spawned SSH request handlers back to the main loop.
+enum RuntimeEvent {
+    AutoUnlockedWindowsHello,
+    AutoUnlockedPin { pin: String },
+}
 
 fn main() -> anyhow::Result<()> {
     // Set Per-Monitor DPI Awareness V2 before any UI calls.
@@ -237,6 +365,7 @@ fn main() -> anyhow::Result<()> {
                     pin,
                     password,
                     hello,
+                    native,
                 }) => {
                     if pin {
                         let pin_value = prompt_password("Enter PIN: ")?;
@@ -248,11 +377,25 @@ fn main() -> anyhow::Result<()> {
                         cmd_control(&cmd).await
                     } else if hello {
                         cmd_control("unlock-hello").await
+                    } else if native {
+                        cmd_control("unlock-native").await
                     } else {
                         cmd_control("unlock").await
                     }
                 }
-                Some(Commands::Status) => cmd_control("status").await,
+                Some(Commands::Status { json }) => {
+                    if json {
+                        cmd_control("status-json").await
+                    } else {
+                        cmd_control("status").await
+                    }
+                }
+                Some(Commands::Doctor { json, fix }) => cmd_doctor(&config, json, fix).await,
+                Some(Commands::SshConfig {
+                    base_url,
+                    email,
+                    write,
+                }) => cmd_ssh_config(&config, base_url.as_deref(), email.as_deref(), write).await,
                 Some(Commands::Config) => {
                     let path = sshwarden_config::config_path()?;
                     if !path.exists() {
@@ -265,6 +408,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 Some(Commands::SetPin) => cmd_set_pin().await,
                 Some(Commands::Sync) => cmd_control("sync").await,
+                Some(Commands::Forget) => cmd_control("forget").await,
+                Some(Commands::Env { shell }) => cmd_env(&config, &shell),
             }
         })
     }
@@ -282,9 +427,10 @@ fn run_slint_event_loop(mut ui_request_rx: tokio::sync::mpsc::Receiver<sshwarden
                 sshwarden_ui::UIRequest::PinDialog {
                     response_tx,
                     validator,
+                    context,
                 } => {
                     let result = slint::invoke_from_event_loop(move || {
-                        sshwarden_ui::unlock::show_pin_dialog(response_tx, validator);
+                        sshwarden_ui::unlock::show_pin_dialog(response_tx, validator, context);
                     });
 
                     if result.is_err() {
@@ -313,11 +459,22 @@ fn run_slint_event_loop(mut ui_request_rx: tokio::sync::mpsc::Receiver<sshwarden
     let _ = slint::run_event_loop_until_quit();
 }
 /// Send a control command to the running daemon via IPC.
-#[cfg(windows)]
 async fn cmd_control(cmd: &str) -> anyhow::Result<()> {
     match sshwarden_agent::control::send_control_command(cmd).await {
         Ok(response) => {
             if response.ok {
+                if cmd == "status-json" {
+                    let value = response
+                        .details
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::to_value(&response).unwrap_or_default());
+                    #[allow(clippy::print_stdout)]
+                    {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    }
+                    return Ok(());
+                }
                 if let Some(msg) = &response.message {
                     info!("{}", msg);
                 }
@@ -326,6 +483,17 @@ async fn cmd_control(cmd: &str) -> anyhow::Result<()> {
                 }
                 if let Some(count) = response.key_count {
                     info!("  Keys: {}", count);
+                }
+                if let Some(details) = &response.details {
+                    if let Some(notification) = details.get("notification") {
+                        info!("  Notification: {}", notification);
+                    }
+                    if let Some(pending) = details.get("pending_sync") {
+                        info!("  Pending sync: {}", pending);
+                    }
+                    if let Some(authenticated) = details.get("authenticated") {
+                        info!("  Authenticated: {}", authenticated);
+                    }
                 }
             } else {
                 let err = response.error.as_deref().unwrap_or("Unknown error");
@@ -341,9 +509,429 @@ async fn cmd_control(cmd: &str) -> anyhow::Result<()> {
     }
 }
 
+#[derive(serde::Serialize)]
+struct DoctorCheck {
+    name: String,
+    ok: bool,
+    message: String,
+}
+
+impl DoctorCheck {
+    fn ok(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ok: true,
+            message: message.into(),
+        }
+    }
+
+    fn warn(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ok: false,
+            message: message.into(),
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn fetch_status_details_for_doctor() -> anyhow::Result<serde_json::Value> {
+    let response = sshwarden_agent::control::send_control_command("status-json").await?;
+    Ok(response
+        .details
+        .clone()
+        .unwrap_or_else(|| serde_json::to_value(&response).unwrap_or_default()))
+}
+
 #[cfg(not(windows))]
-async fn cmd_control(_cmd: &str) -> anyhow::Result<()> {
-    info!("IPC control is only supported on Windows currently");
+async fn fetch_status_details_for_doctor() -> anyhow::Result<serde_json::Value> {
+    anyhow::bail!("IPC control is only supported on Windows currently")
+}
+
+#[cfg(windows)]
+fn windows_openssh_pipe_exists() -> bool {
+    std::path::Path::new(r"\\.\pipe\openssh-ssh-agent").exists()
+}
+
+#[cfg(not(windows))]
+fn windows_openssh_pipe_exists() -> bool {
+    false
+}
+
+fn count_key_selector_files() -> anyhow::Result<(std::path::PathBuf, usize)> {
+    let dir = key_selector_dir()?;
+    let count = if dir.exists() {
+        std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pub"))
+            .count()
+    } else {
+        0
+    };
+    Ok((dir, count))
+}
+
+async fn cmd_doctor(
+    config: &sshwarden_config::Config,
+    json: bool,
+    fix: bool,
+) -> anyhow::Result<()> {
+    let mut checks = Vec::new();
+
+    if fix {
+        checks.push(DoctorCheck::ok(
+            "doctor.fix",
+            "doctor --fix requested; applying only explicit safe repairs implemented by doctor",
+        ));
+    }
+
+    let discovery_client = create_client(config, None);
+    match discovery_client.discover_notifications_url().await {
+        Ok(Some(url)) => checks.push(DoctorCheck::ok(
+            "server.discovery",
+            format!("/api/config advertises notifications URL: {url}"),
+        )),
+        Ok(None) => checks.push(DoctorCheck::warn(
+            "server.discovery",
+            "/api/config is reachable but did not advertise environment.notifications",
+        )),
+        Err(e) => checks.push(DoctorCheck::warn(
+            "server.discovery",
+            format!("/api/config discovery failed; built-in URL rules will be used: {e}"),
+        )),
+    }
+
+    checks.push(DoctorCheck::ok(
+        "notification.resolved_url",
+        format!(
+            "Configured fallback notification URL resolves to {}",
+            config.server.notifications_url()
+        ),
+    ));
+
+    let status = match fetch_status_details_for_doctor().await {
+        Ok(status) => {
+            checks.push(DoctorCheck::ok(
+                "daemon",
+                "SSHWarden daemon control channel is reachable",
+            ));
+            Some(status)
+        }
+        Err(e) => {
+            checks.push(DoctorCheck::warn(
+                "daemon",
+                format!("SSHWarden daemon control channel is not reachable: {e}"),
+            ));
+            None
+        }
+    };
+
+    if let Some(status) = status.as_ref() {
+        let authenticated = status
+            .get("authenticated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if authenticated {
+            checks.push(DoctorCheck::ok(
+                "session",
+                "Bitwarden API session is restored in the daemon",
+            ));
+        } else {
+            checks.push(DoctorCheck::warn(
+                "session",
+                "Bitwarden API session is not restored; notifications and online sync will not run until login/unlock restores it",
+            ));
+        }
+
+        let pending_sync = status
+            .get("pending_sync")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if pending_sync {
+            checks.push(DoctorCheck::warn(
+                "sync.pending",
+                "Pending Sync is recorded; unlock or restore connectivity to resolve it",
+            ));
+        } else {
+            checks.push(DoctorCheck::ok(
+                "sync.pending",
+                "No Pending Sync is recorded",
+            ));
+        }
+
+        let has_local_key_cache = status
+            .get("has_local_key_cache")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let has_vault_file = status
+            .get("has_vault_file")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let legacy_migration_available = status
+            .get("legacy_migration_available")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(has_vault_file && !has_local_key_cache);
+        if has_local_key_cache {
+            checks.push(DoctorCheck::ok(
+                "local_key_cache",
+                "Envelope Local Key Cache is present",
+            ));
+        } else if legacy_migration_available {
+            checks.push(DoctorCheck::warn(
+                "local_key_cache.migration",
+                "Legacy vault.enc is present without envelope Local Key Cache; run `sshwarden unlock --pin` to migrate",
+            ));
+        } else {
+            checks.push(DoctorCheck::warn(
+                "local_key_cache",
+                "No remembered Local Key Cache is present",
+            ));
+        }
+
+        let notification = status.get("notification").cloned().unwrap_or_default();
+        let notification_state = notification
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if notification
+            .get("stale_cache")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            checks.push(DoctorCheck::warn(
+                "local_key_cache.stale",
+                format!(
+                    "Local Key Cache is stale: {}",
+                    notification
+                        .get("stale_cache_error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown refresh error")
+                ),
+            ));
+        } else {
+            checks.push(DoctorCheck::ok(
+                "local_key_cache.stale",
+                "Local Key Cache is not marked stale",
+            ));
+        }
+
+        match notification_state {
+            "running" => checks.push(DoctorCheck::ok(
+                "notification",
+                format!(
+                    "Notification client is running ({})",
+                    notification
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown URL")
+                ),
+            )),
+            "not_started" => checks.push(DoctorCheck::warn(
+                "notification",
+                "Notification client has not started; usually no API session/token is available yet",
+            )),
+            "failed" => checks.push(DoctorCheck::warn(
+                "notification",
+                format!(
+                    "Notification client failed: {}",
+                    notification
+                        .get("last_error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error")
+                ),
+            )),
+            other => checks.push(DoctorCheck::warn(
+                "notification",
+                format!("Notification client state is {other}"),
+            )),
+        }
+    }
+
+    match count_key_selector_files() {
+        Ok((dir, count)) if count > 0 => {
+            checks.push(DoctorCheck::ok(
+                "key_selectors",
+                format!(
+                    "Found {count} key selector .pub file(s) in {}",
+                    dir.display()
+                ),
+            ));
+            if count > 5 {
+                checks.push(DoctorCheck::warn(
+                    "ssh.max_auth_tries",
+                    format!(
+                        "{count} selector files/keys detected; without Host-specific IdentityFile + IdentitiesOnly yes, OpenSSH servers may fail with MaxAuthTries"
+                    ),
+                ));
+            } else {
+                checks.push(DoctorCheck::ok(
+                    "ssh.max_auth_tries",
+                    "Key count is not high enough to trigger the common MaxAuthTries failure by itself",
+                ));
+            }
+        }
+        Ok((dir, _)) if dir.exists() => checks.push(DoctorCheck::warn(
+            "key_selectors",
+            format!("No key selector .pub files found in {}", dir.display()),
+        )),
+        Ok((dir, _)) => checks.push(DoctorCheck::warn(
+            "key_selectors",
+            format!("Key selector directory does not exist: {}", dir.display()),
+        )),
+        Err(e) => checks.push(DoctorCheck::warn(
+            "key_selectors",
+            format!("Could not determine key selector directory: {e}"),
+        )),
+    }
+
+    #[cfg(windows)]
+    {
+        if windows_openssh_pipe_exists() {
+            checks.push(DoctorCheck::ok(
+                "agent_endpoint.windows_pipe",
+                r"Windows OpenSSH agent pipe exists at \\.\pipe\openssh-ssh-agent",
+            ));
+        } else {
+            checks.push(DoctorCheck::warn(
+                "agent_endpoint.windows_pipe",
+                r"Windows OpenSSH agent pipe is not present at \\.\pipe\openssh-ssh-agent; SSH clients may not be using SSHWarden",
+            ));
+        }
+    }
+
+    let include_path = managed_sshwarden_include_path().ok();
+    let config_path = user_ssh_config_path().ok();
+    match (include_path, config_path) {
+        (Some(include_path), Some(config_path)) => {
+            if include_path.exists() {
+                checks.push(DoctorCheck::ok(
+                    "ssh_config.include_file",
+                    format!("Managed SSH config exists: {}", include_path.display()),
+                ));
+                let managed_content = std::fs::read_to_string(&include_path).unwrap_or_default();
+                if managed_content.contains("IdentityFile")
+                    && managed_content.contains("IdentitiesOnly yes")
+                {
+                    checks.push(DoctorCheck::ok(
+                        "ssh_config.selector_rules",
+                        "Managed SSH config contains IdentityFile and IdentitiesOnly yes selector rules",
+                    ));
+                } else {
+                    checks.push(DoctorCheck::warn(
+                        "ssh_config.selector_rules",
+                        "Managed SSH config does not contain Host-specific IdentityFile + IdentitiesOnly yes rules; run `sshwarden ssh-config` to print examples or `sshwarden ssh-config --write` to replace the managed include",
+                    ));
+                }
+            } else {
+                checks.push(DoctorCheck::warn(
+                    "ssh_config.include_file",
+                    format!(
+                        "Managed SSH config does not exist: {}",
+                        include_path.display()
+                    ),
+                ));
+            }
+
+            let include_line = format!("Include {}", include_path.display());
+            let has_include = std::fs::read_to_string(&config_path)
+                .map(|content| content.lines().any(|line| line.trim() == include_line))
+                .unwrap_or(false);
+
+            if fix && !has_include {
+                if let Some(parent) = include_path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        checks.push(DoctorCheck::warn(
+                            "doctor.fix.ssh_config_dir",
+                            format!(
+                                "Failed to create SSH config directory {}: {e}",
+                                parent.display()
+                            ),
+                        ));
+                    }
+                }
+                if !include_path.exists() {
+                    let managed = "# SSHWarden managed key selector snippets\n# Run `sshwarden ssh-config` to print Host-specific examples.\n";
+                    match std::fs::write(&include_path, managed) {
+                        Ok(()) => checks.push(DoctorCheck::ok(
+                            "doctor.fix.include_file",
+                            format!(
+                                "Created managed SSH config placeholder: {}",
+                                include_path.display()
+                            ),
+                        )),
+                        Err(e) => checks.push(DoctorCheck::warn(
+                            "doctor.fix.include_file",
+                            format!(
+                                "Failed to create managed SSH config {}: {e}",
+                                include_path.display()
+                            ),
+                        )),
+                    }
+                }
+                match write_sshwarden_include_line(&config_path, &include_path) {
+                    Ok(()) => checks.push(DoctorCheck::ok(
+                        "doctor.fix.include",
+                        format!("Added SSHWarden Include line to {}", config_path.display()),
+                    )),
+                    Err(e) => checks.push(DoctorCheck::warn(
+                        "doctor.fix.include",
+                        format!(
+                            "Failed to add SSHWarden Include line to {}: {e}",
+                            config_path.display()
+                        ),
+                    )),
+                }
+            }
+
+            let has_include = std::fs::read_to_string(&config_path)
+                .map(|content| content.lines().any(|line| line.trim() == include_line))
+                .unwrap_or(false);
+            if has_include {
+                checks.push(DoctorCheck::ok(
+                    "ssh_config.include",
+                    format!(
+                        "{} includes SSHWarden managed config",
+                        config_path.display()
+                    ),
+                ));
+            } else {
+                checks.push(DoctorCheck::warn(
+                    "ssh_config.include",
+                    format!(
+                        "{} does not include SSHWarden managed config; run `sshwarden ssh-config --write` if desired",
+                        config_path.display()
+                    ),
+                ));
+            }
+        }
+        _ => checks.push(DoctorCheck::warn(
+            "ssh_config",
+            "Could not determine ~/.ssh/config or managed include path",
+        )),
+    }
+
+    let all_ok = checks.iter().all(|check| check.ok);
+    if json {
+        #[allow(clippy::print_stdout)]
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": all_ok,
+                    "checks": checks,
+                }))?
+            );
+        }
+    } else {
+        for check in &checks {
+            if check.ok {
+                info!("[ok] {}: {}", check.name, check.message);
+            } else {
+                info!("[warn] {}: {}", check.name, check.message);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -437,6 +1025,598 @@ async fn cmd_login(
     Ok(())
 }
 
+fn key_selector_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(sshwarden_config::config_dir()?.join("keys"))
+}
+
+fn slugify_key_name(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        let is_allowed = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+        if is_allowed {
+            slug.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "ssh-key".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn vault_item_id_prefix(cipher_id: &str) -> String {
+    cipher_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+}
+
+fn selector_file_name(key_name: &str, cipher_id: &str) -> String {
+    let prefix = vault_item_id_prefix(cipher_id);
+    if prefix.is_empty() {
+        format!("{}.pub", slugify_key_name(key_name))
+    } else {
+        format!("{}--{}.pub", slugify_key_name(key_name), prefix)
+    }
+}
+
+fn selector_path_for_key(key_name: &str, cipher_id: &str) -> anyhow::Result<std::path::PathBuf> {
+    Ok(key_selector_dir()?.join(selector_file_name(key_name, cipher_id)))
+}
+
+fn write_key_selector_files(keys: &[sshwarden_api::DecryptedSshKey]) -> anyhow::Result<()> {
+    let dir = key_selector_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create key selector directory: {}", dir.display()))?;
+
+    let mut active_paths = std::collections::HashSet::new();
+    for key in keys {
+        let path = selector_path_for_key(&key.name, &key.cipher_id)?;
+        active_paths.insert(path.clone());
+        let content = format!("{}\n", key.public_key_openssh.trim());
+        std::fs::write(&path, content)
+            .with_context(|| format!("Failed to write key selector file: {}", path.display()))?;
+    }
+
+    // Remove selector files for deleted/archived/unavailable items. Rename aliases
+    // are retained because they have a different path for the same Vault Item Id.
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("Failed to read key selector directory: {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("pub")
+                && !active_paths.contains(&path)
+            {
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                let active_key_for_alias = keys.iter().find(|key| {
+                    let prefix = vault_item_id_prefix(&key.cipher_id);
+                    !prefix.is_empty() && file_name.ends_with(&format!("--{prefix}.pub"))
+                });
+                if let Some(key) = active_key_for_alias {
+                    let content = format!("{}\n", key.public_key_openssh.trim());
+                    std::fs::write(&path, content).with_context(|| {
+                        format!("Failed to update key selector alias: {}", path.display())
+                    })?;
+                } else {
+                    std::fs::remove_file(&path).with_context(|| {
+                        format!(
+                            "Failed to remove stale key selector file: {}",
+                            path.display()
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ssh_config_snippet_for_keys(keys: &[sshwarden_api::DecryptedSshKey]) -> anyhow::Result<String> {
+    let mut lines = Vec::new();
+    lines.push("# SSHWarden key selector snippets".to_string());
+    lines.push("# Copy a Host block and replace <host> with the destination host.".to_string());
+    lines.push("".to_string());
+
+    for key in keys {
+        let path = selector_path_for_key(&key.name, &key.cipher_id)?;
+        lines.push(format!("# {} ({})", key.name, key.cipher_id));
+        lines.push("Host <host>".to_string());
+        lines.push(format!("    IdentityFile {}", path.display()));
+        lines.push("    IdentitiesOnly yes".to_string());
+        lines.push("".to_string());
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn managed_sshwarden_include_path() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .context("Could not determine home directory")?;
+    Ok(home.join(".ssh").join("sshwarden_config"))
+}
+
+fn user_ssh_config_path() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .context("Could not determine home directory")?;
+    Ok(home.join(".ssh").join("config"))
+}
+
+fn write_sshwarden_include_line(
+    config_path: &std::path::Path,
+    include_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create SSH config directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let include_line = format!("Include {}", include_path.display());
+    let existing = std::fs::read_to_string(config_path).unwrap_or_default();
+    if !existing.lines().any(|line| line.trim() == include_line) {
+        let mut new_config = existing;
+        if !new_config.is_empty() && !new_config.ends_with('\n') {
+            new_config.push('\n');
+        }
+        new_config.push_str("\n# SSHWarden managed key selector snippets\n");
+        new_config.push_str(&include_line);
+        new_config.push('\n');
+        std::fs::write(config_path, new_config)
+            .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn write_managed_ssh_config(snippet: &str) -> anyhow::Result<()> {
+    let include_path = managed_sshwarden_include_path()?;
+    if let Some(parent) = include_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create SSH config directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(&include_path, snippet).with_context(|| {
+        format!(
+            "Failed to write managed SSHWarden SSH config: {}",
+            include_path.display()
+        )
+    })?;
+
+    let config_path = user_ssh_config_path()?;
+    write_sshwarden_include_line(&config_path, &include_path)?;
+
+    info!("Wrote managed SSH config: {}", include_path.display());
+    info!("Ensured Include line in: {}", config_path.display());
+    Ok(())
+}
+
+fn cmd_env(config: &sshwarden_config::Config, shell: &str) -> anyhow::Result<()> {
+    let endpoint = config
+        .socket
+        .path
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or(sshwarden_config::default_agent_socket_path()?);
+    let endpoint = endpoint.display().to_string();
+
+    #[allow(clippy::print_stdout)]
+    match shell {
+        "sh" | "bash" | "zsh" | "posix" => {
+            println!("export SSH_AUTH_SOCK='{}'", shell_single_quote(&endpoint));
+            println!(
+                "export SSHWARDEN_SSH_AUTH_SOCK='{}'",
+                shell_single_quote(&endpoint)
+            );
+        }
+        "fish" => {
+            println!("set -gx SSH_AUTH_SOCK '{}';", shell_single_quote(&endpoint));
+            println!(
+                "set -gx SSHWARDEN_SSH_AUTH_SOCK '{}';",
+                shell_single_quote(&endpoint)
+            );
+        }
+        "powershell" | "pwsh" | "ps" => {
+            println!(
+                "$env:SSH_AUTH_SOCK = '{}'",
+                powershell_single_quote(&endpoint)
+            );
+            println!(
+                "$env:SSHWARDEN_SSH_AUTH_SOCK = '{}'",
+                powershell_single_quote(&endpoint)
+            );
+        }
+        "cmd" => {
+            println!("set SSH_AUTH_SOCK={endpoint}");
+            println!("set SSHWARDEN_SSH_AUTH_SOCK={endpoint}");
+        }
+        other => {
+            anyhow::bail!("Unsupported shell syntax '{other}'. Use sh, fish, powershell, or cmd.")
+        }
+    }
+
+    Ok(())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    value.replace('\'', "'\\''")
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn key_identities_from_tuples(
+    keys: &[(String, String, String)],
+) -> Vec<sshwarden_config::cache::KeyIdentity> {
+    keys.iter()
+        .map(
+            |(pem, name, vault_item_id)| sshwarden_config::cache::KeyIdentity {
+                name: name.clone(),
+                vault_item_id: vault_item_id.clone(),
+                public_key_openssh: public_key_openssh_from_pem(pem).unwrap_or_default(),
+            },
+        )
+        .collect()
+}
+
+fn public_key_openssh_from_pem(pem: &str) -> anyhow::Result<String> {
+    let private_key = ssh_key::private::PrivateKey::from_openssh(pem)
+        .map_err(|e| anyhow::anyhow!("Failed to parse private key for public identity: {e}"))?;
+    private_key
+        .public_key()
+        .to_openssh()
+        .map_err(|e| anyhow::anyhow!("Failed to encode public key: {e}"))
+}
+
+fn build_envelope_local_key_cache(
+    keys: &[(String, String, String)],
+    email: &str,
+    server_url: &str,
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+    pin_encrypted: Option<String>,
+    hello_challenge: Option<String>,
+    hello_encrypted: Option<String>,
+    native_encrypted: Option<String>,
+) -> anyhow::Result<sshwarden_config::cache::LocalKeyCacheFile> {
+    let keys_json = serde_json::to_string(keys).context("Failed to serialize cache payload")?;
+    let encrypted_payload =
+        sshwarden_api::crypto::encrypt_enc_string(keys_json.as_bytes(), &local_cache_key)?;
+    let cache = sshwarden_config::cache::LocalKeyCacheFile {
+        version: 2,
+        header: sshwarden_config::cache::LocalKeyCacheHeader {
+            email: email.to_string(),
+            server_url: server_url.to_string(),
+            keys: key_identities_from_tuples(keys),
+        },
+        encrypted_payload,
+        local_cache_key: sshwarden_config::cache::LocalCacheKeySlots {
+            pin_encrypted,
+            hello_challenge,
+            hello_encrypted,
+            native_encrypted,
+        },
+    };
+    Ok(cache)
+}
+
+fn write_envelope_local_key_cache(
+    keys: &[(String, String, String)],
+    email: &str,
+    server_url: &str,
+    pin: &str,
+) -> anyhow::Result<(
+    sshwarden_config::cache::LocalKeyCacheFile,
+    sshwarden_api::crypto::SymmetricKey,
+)> {
+    let local_cache_key = sshwarden_api::crypto::random_symmetric_key();
+    let pin_encrypted = encrypt_local_cache_key_with_pin(&local_cache_key, pin)?;
+    let mut cache = build_envelope_local_key_cache(
+        keys,
+        email,
+        server_url,
+        &local_cache_key,
+        Some(pin_encrypted),
+        None,
+        None,
+        None,
+    )?;
+    if let Err(e) = enroll_native_for_local_key_cache(&mut cache, &local_cache_key) {
+        tracing::debug!("Native unlock enrollment skipped: {}", e);
+    }
+    #[cfg(windows)]
+    {
+        if sshwarden_ui::unlock::hello_crypto::hello_available() {
+            if let Err(e) = enroll_hello_for_local_key_cache(&mut cache, &local_cache_key) {
+                tracing::warn!("Failed to enroll Windows Hello for local key cache: {}", e);
+            }
+        }
+    }
+    cache.save()?;
+    Ok((cache, local_cache_key))
+}
+
+fn refresh_envelope_local_key_cache(
+    keys: &[(String, String, String)],
+    existing: &sshwarden_config::cache::LocalKeyCacheFile,
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+) -> anyhow::Result<sshwarden_config::cache::LocalKeyCacheFile> {
+    let cache = build_envelope_local_key_cache(
+        keys,
+        &existing.header.email,
+        &existing.header.server_url,
+        local_cache_key,
+        existing.local_cache_key.pin_encrypted.clone(),
+        existing.local_cache_key.hello_challenge.clone(),
+        existing.local_cache_key.hello_encrypted.clone(),
+        existing.local_cache_key.native_encrypted.clone(),
+    )?;
+    cache.save()?;
+    Ok(cache)
+}
+
+fn enroll_native_for_local_key_cache(
+    cache: &mut sshwarden_config::cache::LocalKeyCacheFile,
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+) -> anyhow::Result<()> {
+    if !sshwarden_ui::unlock::native::native_available() {
+        anyhow::bail!("native unlock is not available");
+    }
+    let encoded_local_cache_key = sshwarden_api::crypto::encode_symmetric_key(local_cache_key);
+    let native_slot =
+        sshwarden_ui::unlock::native::native_encrypt_local_cache_key(&encoded_local_cache_key)?;
+    cache.local_cache_key.native_encrypted = Some(native_slot);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn enroll_hello_for_local_key_cache(
+    cache: &mut sshwarden_config::cache::LocalKeyCacheFile,
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+) -> anyhow::Result<()> {
+    let challenge: [u8; 16] = rand::random();
+    let hello_encrypted = encrypt_local_cache_key_with_hello(local_cache_key, &challenge)?;
+    cache.local_cache_key.hello_challenge =
+        Some(base64::engine::general_purpose::STANDARD.encode(challenge));
+    cache.local_cache_key.hello_encrypted = Some(hello_encrypted);
+    Ok(())
+}
+
+fn encrypt_local_cache_key_with_pin(
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+    pin: &str,
+) -> anyhow::Result<String> {
+    let encoded_local_cache_key = sshwarden_api::crypto::encode_symmetric_key(local_cache_key);
+    sshwarden_api::crypto::pin_encrypt(&encoded_local_cache_key, pin)
+}
+
+#[cfg(windows)]
+fn encrypt_local_cache_key_with_hello(
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+    challenge: &[u8; 16],
+) -> anyhow::Result<String> {
+    let encoded_local_cache_key = sshwarden_api::crypto::encode_symmetric_key(local_cache_key);
+    try_hello_encrypt(&encoded_local_cache_key, challenge)
+}
+
+fn decrypt_envelope_payload(
+    cache: &sshwarden_config::cache::LocalKeyCacheFile,
+    local_cache_key: sshwarden_api::crypto::SymmetricKey,
+) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
+    let payload =
+        sshwarden_api::crypto::decrypt_enc_string(&cache.encrypted_payload, &local_cache_key)
+            .context("Failed to decrypt local key cache payload")?;
+    let keys_json =
+        String::from_utf8(payload).context("Local key cache payload is not valid UTF-8")?;
+    Ok((keys_json, local_cache_key))
+}
+
+#[allow(dead_code)]
+fn decrypt_envelope_local_key_cache_with_native(
+    cache: &sshwarden_config::cache::LocalKeyCacheFile,
+) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
+    let native_slot = cache
+        .local_cache_key
+        .native_encrypted
+        .as_deref()
+        .context("Local key cache has no native unlock slot")?;
+    let encoded_lck = sshwarden_ui::unlock::native::native_decrypt_local_cache_key(native_slot)
+        .context("Failed to unlock Local Cache Key with native unlock")?;
+    let local_cache_key = sshwarden_api::crypto::decode_symmetric_key(&encoded_lck)
+        .context("Failed to decode Local Cache Key")?;
+    decrypt_envelope_payload(cache, local_cache_key)
+}
+
+async fn finish_native_unlock_response(
+    cache: sshwarden_config::cache::LocalKeyCacheFile,
+    agent: &mut sshwarden_agent::SshWardenAgent,
+    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
+    cached_key_tuples: &CachedKeyTuples,
+    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+    local_cache_key_state: &LocalCacheKeyHandle,
+    success_msg: &str,
+) -> sshwarden_agent::ControlResponse {
+    match decrypt_envelope_local_key_cache_with_native(&cache) {
+        Ok((keys_json, local_cache_key)) => {
+            local_cache_key_state.write().await.set(local_cache_key);
+            finish_unlock_with_json(
+                &keys_json,
+                agent,
+                vault_locked,
+                cached_key_tuples,
+                key_names,
+                success_msg,
+            )
+            .await
+        }
+        Err(e) => sshwarden_agent::ControlResponse::err(&format!("Native unlock failed: {}", e)),
+    }
+}
+
+fn decrypt_envelope_local_key_cache_with_pin(
+    cache: &sshwarden_config::cache::LocalKeyCacheFile,
+    pin: &str,
+) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
+    let encrypted_lck = cache
+        .local_cache_key
+        .pin_encrypted
+        .as_deref()
+        .context("Local key cache has no PIN unlock slot")?;
+    let encoded_lck = sshwarden_api::crypto::pin_decrypt(encrypted_lck, pin)
+        .context("Failed to unlock Local Cache Key with PIN")?;
+    let local_cache_key = sshwarden_api::crypto::decode_symmetric_key(&encoded_lck)
+        .context("Failed to decode Local Cache Key")?;
+    decrypt_envelope_payload(cache, local_cache_key)
+}
+
+#[cfg(windows)]
+fn decrypt_envelope_local_key_cache_with_hello(
+    cache: &sshwarden_config::cache::LocalKeyCacheFile,
+) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
+    let challenge_b64 = cache
+        .local_cache_key
+        .hello_challenge
+        .as_deref()
+        .context("Local key cache has no Windows Hello challenge")?;
+    let hello_encrypted = cache
+        .local_cache_key
+        .hello_encrypted
+        .as_deref()
+        .context("Local key cache has no Windows Hello unlock slot")?;
+    let challenge_bytes = base64::engine::general_purpose::STANDARD
+        .decode(challenge_b64)
+        .context("Failed to decode Windows Hello challenge")?;
+    if challenge_bytes.len() != 16 {
+        anyhow::bail!("Invalid Windows Hello challenge length");
+    }
+    let mut challenge = [0u8; 16];
+    challenge.copy_from_slice(&challenge_bytes);
+    let encoded_lck = try_hello_unlock(&challenge, hello_encrypted)
+        .context("Failed to unlock Local Cache Key with Windows Hello")?;
+    let local_cache_key = sshwarden_api::crypto::decode_symmetric_key(&encoded_lck)
+        .context("Failed to decode Local Cache Key")?;
+    decrypt_envelope_payload(cache, local_cache_key)
+}
+
+fn key_material_fingerprints_from_tuples(
+    keys: &[(String, String, String)],
+) -> std::collections::HashMap<String, String> {
+    use sha2::{Digest, Sha256};
+
+    keys.iter()
+        .map(|(pem, _name, vault_item_id)| {
+            let mut hasher = Sha256::new();
+            hasher.update(pem.as_bytes());
+            (vault_item_id.clone(), format!("{:x}", hasher.finalize()))
+        })
+        .collect()
+}
+
+async fn clear_authorization_memory_for_changed_keys_async(
+    old_fingerprints: &std::collections::HashMap<String, String>,
+    new_keys: &[(String, String, String)],
+    authorization_memory: &AuthorizationMemorySet,
+) -> (usize, std::collections::HashMap<String, String>) {
+    let new_fingerprints = key_material_fingerprints_from_tuples(new_keys);
+    let changed_or_removed: std::collections::HashSet<String> = old_fingerprints
+        .iter()
+        .filter_map(
+            |(vault_item_id, old_fingerprint)| match new_fingerprints.get(vault_item_id) {
+                Some(new_fingerprint) if new_fingerprint == old_fingerprint => None,
+                _ => Some(vault_item_id.clone()),
+            },
+        )
+        .chain(
+            new_fingerprints
+                .keys()
+                .filter(|id| !old_fingerprints.contains_key(*id))
+                .cloned(),
+        )
+        .collect();
+
+    if changed_or_removed.is_empty() {
+        return (0, new_fingerprints);
+    }
+
+    let mut memory = authorization_memory.write().await;
+    let before = memory.len();
+    memory.retain(|(vault_item_id, _operation)| !changed_or_removed.contains(vault_item_id));
+    (before.saturating_sub(memory.len()), new_fingerprints)
+}
+
+fn key_tuples_from_cache_header(
+    cache: &sshwarden_config::cache::LocalKeyCacheFile,
+) -> Vec<(String, String, String)> {
+    cache
+        .header
+        .keys
+        .iter()
+        .map(|key| {
+            (
+                key.public_key_openssh.clone(),
+                key.name.clone(),
+                key.vault_item_id.clone(),
+            )
+        })
+        .collect()
+}
+
+async fn cmd_ssh_config(
+    config: &sshwarden_config::Config,
+    base_url: Option<&str>,
+    email: Option<&str>,
+    write: bool,
+) -> anyhow::Result<()> {
+    let email = match email {
+        Some(e) => e.to_string(),
+        None if !config.auth.email.is_empty() => config.auth.email.clone(),
+        None => prompt_email("Email: ")?,
+    };
+    let password = prompt_password("Master password: ")?;
+
+    let mut client = create_client(config, base_url);
+    info!("Logging in as {}...", email);
+    client.login_password(&email, &password).await?;
+    let keys = client.sync_ssh_keys().await?;
+    write_key_selector_files(&keys)?;
+    let snippet = ssh_config_snippet_for_keys(&keys)?;
+
+    if write {
+        write_managed_ssh_config(&snippet)?;
+    } else {
+        #[allow(clippy::print_stdout)]
+        {
+            println!("{}", snippet);
+        }
+    }
+
+    Ok(())
+}
+
 /// Keys command: login, sync, and list SSH keys.
 async fn cmd_keys(
     config: &sshwarden_config::Config,
@@ -483,20 +1663,30 @@ async fn run_foreground(
     info!("Starting SSHWarden SSH Agent...");
     info!("Server: {}", config.server.base_url);
 
-    // Check for persisted vault file BEFORE prompting for master password
+    // Check for persisted cache/vault files BEFORE prompting for master password.
+    let local_key_cache = sshwarden_config::cache::LocalKeyCacheFile::load().unwrap_or_else(|e| {
+        tracing::warn!("Failed to load local key cache: {}", e);
+        None
+    });
     let vault_file = sshwarden_config::vault::VaultFile::load().unwrap_or_else(|e| {
         tracing::warn!("Failed to load vault file: {}", e);
         None
     });
 
+    let has_local_key_cache = local_key_cache.is_some();
     let has_vault_file = vault_file.is_some();
+    let has_remembered_device = has_local_key_cache || has_vault_file;
 
     // Login and fetch keys BEFORE starting the agent server (so password prompt works cleanly)
-    // Skip if we have a vault file — user will unlock with PIN/Hello/password later
+    // Skip if we have a remembered device — user will unlock with PIN/Hello/password later.
     let mut api_client: Option<sshwarden_api::BitwardenClient> = None;
     let mut first_login = false;
-    let vault_keys = if has_vault_file {
-        info!("Vault file found. Use Hello/PIN/password to unlock.");
+    let vault_keys = if has_remembered_device {
+        if has_local_key_cache {
+            info!("Local key cache found. Starting locked with listable key identities.");
+        } else {
+            info!("Legacy vault file found. Use Hello/PIN/password to unlock.");
+        }
         None
     } else {
         // No vault file — need to login with master password
@@ -547,10 +1737,16 @@ async fn run_foreground(
         tokio::sync::mpsc::channel::<sshwarden_agent::SshAgentUIRequest>(32);
     let (response_tx, _response_rx) = tokio::sync::broadcast::channel::<(u32, bool)>(32);
     let response_tx = Arc::new(response_tx);
+    let (runtime_event_tx, mut runtime_event_rx) = tokio::sync::mpsc::channel::<RuntimeEvent>(32);
 
     // Start the SSH agent server
-    let mut agent = sshwarden_agent::SshWardenAgent::start_server(request_tx, response_tx.clone())
-        .context("Failed to start SSH agent server")?;
+    let agent_endpoint = config.socket.path.as_deref().map(std::path::PathBuf::from);
+    let mut agent = sshwarden_agent::SshWardenAgent::start_server_with_endpoint(
+        request_tx,
+        response_tx.clone(),
+        agent_endpoint,
+    )
+    .context("Failed to start SSH agent server")?;
 
     // Build a map of cipher_id -> key_name for UI display
     let key_names: Arc<std::collections::HashMap<String, String>> = Arc::new(
@@ -564,9 +1760,11 @@ async fn run_foreground(
             .unwrap_or_default(),
     );
 
-    // Cache key tuples for re-loading after unlock, and track vault lock state
+    // Cache key tuples for re-loading after unlock, track public key identities,
+    // and track vault lock state.
     let cached_key_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
-    let vault_locked = Arc::new(std::sync::atomic::AtomicBool::new(has_vault_file));
+    let public_key_identity_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
+    let vault_locked = Arc::new(std::sync::atomic::AtomicBool::new(has_remembered_device));
     let api_client: Arc<RwLock<Option<sshwarden_api::BitwardenClient>>> =
         Arc::new(RwLock::new(api_client));
     let pin_encrypted_keys: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(
@@ -574,6 +1772,15 @@ async fn run_foreground(
     ));
     let vault_file_data: Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>> =
         Arc::new(RwLock::new(vault_file));
+    let local_key_cache_data: Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>> =
+        Arc::new(RwLock::new(local_key_cache));
+    let local_cache_key_state: LocalCacheKeyHandle =
+        Arc::new(RwLock::new(LocalCacheKeyState::default()));
+    let authorization_memory: AuthorizationMemorySet =
+        Arc::new(RwLock::new(std::collections::HashSet::new()));
+    let key_material_fingerprints: KeyMaterialFingerprints =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let pending_sync = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let key_names = Arc::new(RwLock::new((*key_names).clone()));
 
     // Load vault keys into agent
@@ -590,7 +1797,16 @@ async fn run_foreground(
             .collect();
         let count = key_tuples.len();
         if count > 0 {
+            if let Err(e) = write_key_selector_files(&keys) {
+                tracing::warn!("Failed to write key selector files: {}", e);
+            }
+            public_key_identity_tuples
+                .write()
+                .await
+                .set(key_tuples.clone());
             cached_key_tuples.write().await.set(key_tuples.clone());
+            *key_material_fingerprints.write().await =
+                key_material_fingerprints_from_tuples(&key_tuples);
             agent.set_keys(key_tuples)?;
             info!("Loaded {} SSH key(s) into agent", count);
 
@@ -600,11 +1816,42 @@ async fn run_foreground(
                     &cached_key_tuples,
                     &pin_encrypted_keys,
                     &vault_file_data,
+                    &local_key_cache_data,
+                    &local_cache_key_state,
                     &config,
                     &api_client,
                 )
                 .await;
             }
+        }
+    } else if let Some(cache) = local_key_cache_data.read().await.as_ref() {
+        let identities = key_tuples_from_cache_header(cache);
+        let count = identities.len();
+        if count > 0 {
+            public_key_identity_tuples
+                .write()
+                .await
+                .set(identities.clone());
+            {
+                let mut names = key_names.write().await;
+                names.clear();
+                for (_, name, vault_item_id) in &identities {
+                    names.insert(vault_item_id.clone(), name.clone());
+                }
+            }
+            if let Err(e) = agent.set_public_identities(identities) {
+                tracing::warn!(
+                    "Failed to load public key identities from local cache: {}",
+                    e
+                );
+            } else {
+                info!(
+                    "Loaded {} public key identity/identities from local key cache",
+                    count
+                );
+            }
+        } else {
+            info!("Local key cache has no key identities.");
         }
     } else if !has_vault_file {
         info!("Agent running with no keys.");
@@ -616,7 +1863,6 @@ async fn run_foreground(
         tokio::sync::mpsc::channel::<sshwarden_agent::ControlRequest>(16);
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
-    #[cfg(windows)]
     {
         let cancel_clone = cancel_token.clone();
         tokio::spawn(async move {
@@ -640,24 +1886,22 @@ async fn run_foreground(
     // Notification hub state
     let mut notification_rx: Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>> = None;
     let mut _notification_client: Option<sshwarden_api::NotificationClient> = None;
+    let notification_state = Arc::new(RwLock::new(NotificationRuntimeState::default()));
 
     // Connect to notification hub if we already have an API session (first login)
     {
         let client_guard = api_client.read().await;
         if let Some(ref client) = *client_guard {
             if let Some(token) = client.access_token() {
-                let notif_url = config.server.notifications_url();
-                info!("Attempting to connect to notification hub: {}", notif_url);
-                match sshwarden_api::NotificationClient::connect(&notif_url, token).await {
-                    Ok((notif_client, rx)) => {
-                        info!("Connected to notification hub");
-                        notification_rx = Some(rx);
-                        _notification_client = Some(notif_client);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to connect to notification hub: {:?}", e);
-                    }
-                }
+                connect_notification_client(
+                    &config,
+                    Some(client),
+                    token,
+                    &mut notification_rx,
+                    &mut _notification_client,
+                    &notification_state,
+                )
+                .await;
 
                 // Save device session for this host
                 save_device_session(client, &config, None).await;
@@ -675,15 +1919,22 @@ async fn run_foreground(
                     &mut agent,
                     &vault_locked,
                     &cached_key_tuples,
+                    &public_key_identity_tuples,
                     &api_client,
                     &pin_encrypted_keys,
                     &vault_file_data,
+                    &local_key_cache_data,
+                    &local_cache_key_state,
+                    &key_material_fingerprints,
                     &key_names,
                     &config,
                     auto_unlock,
                     &ui_request_tx,
                     &mut notification_rx,
                     &mut _notification_client,
+                    &pending_sync,
+                    &notification_state,
+                    &authorization_memory,
                 ).await;
                 let _ = ctrl_req.reply.send(response);
             }
@@ -699,6 +1950,8 @@ async fn run_foreground(
                 let key_names_clone = key_names.clone();
                 let pin_encrypted_clone = pin_encrypted_keys.clone();
                 let vault_file_clone = vault_file_data.clone();
+                let runtime_event_tx_clone = runtime_event_tx.clone();
+                let authorization_memory_clone = authorization_memory.clone();
 
                 let ui_tx_clone = ui_request_tx.clone();
 
@@ -715,8 +1968,66 @@ async fn run_foreground(
                         prompt_behavior,
                         auto_unlock,
                         ui_tx_clone,
+                        runtime_event_tx_clone,
+                        authorization_memory_clone,
                     ).await;
                 });
+            }
+            // Runtime events from spawned SSH request handlers
+            Some(event) = runtime_event_rx.recv() => {
+                match event {
+                    RuntimeEvent::AutoUnlockedWindowsHello => {
+                        try_restore_api_session_hello(
+                            &api_client,
+                            &config,
+                            &mut notification_rx,
+                            &mut _notification_client,
+                            &notification_state,
+                        )
+                        .await;
+                        resolve_pending_sync(
+                            &pending_sync,
+                            &api_client,
+                            &cached_key_tuples,
+                            &public_key_identity_tuples,
+                            &local_key_cache_data,
+                            &local_cache_key_state,
+                            &authorization_memory,
+                            &key_material_fingerprints,
+                            &vault_locked,
+                            &mut agent,
+                            &key_names,
+                            &notification_state,
+                        )
+                        .await;
+                    }
+                    RuntimeEvent::AutoUnlockedPin { pin } => {
+                        try_restore_api_session(
+                            &api_client,
+                            &config,
+                            &pin,
+                            &mut notification_rx,
+                            &mut _notification_client,
+                            &notification_state,
+                        )
+                        .await;
+                        resolve_pending_sync(
+                            &pending_sync,
+                            &api_client,
+                            &cached_key_tuples,
+                            &public_key_identity_tuples,
+                            &local_key_cache_data,
+                            &local_cache_key_state,
+                            &authorization_memory,
+                            &key_material_fingerprints,
+                            &vault_locked,
+                            &mut agent,
+                            &key_names,
+                            &notification_state,
+                        )
+                        .await;
+                    }
+                }
             }
             // Notification hub events
             Some(event) = async {
@@ -727,15 +2038,47 @@ async fn run_foreground(
             } => {
                 match event {
                     sshwarden_api::SyncEvent::CipherChanged => {
-                        info!("Notification: cipher changed, syncing...");
-                        match do_sync(&api_client, &cached_key_tuples, &vault_locked, &mut agent, &key_names).await {
-                            Ok(count) => info!("Auto-synced: {} SSH keys", count),
-                            Err(e) => tracing::warn!("Auto-sync failed: {}", e),
+                        if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+                            pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                            info!("Notification: cipher changed while locked; sync pending until unlock");
+                        } else {
+                            info!("Notification: cipher changed, syncing...");
+                            match do_sync(&api_client, &cached_key_tuples, &public_key_identity_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
+                                Ok(count) => {
+                                    notification_state.write().await.last_event_at = Some(std::time::Instant::now());
+                                    info!("Auto-synced: {} SSH keys", count)
+                                },
+                                Err(e) => {
+                                    pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!("Auto-sync failed: {}; sync remains pending", e);
+                                }
+                            }
                         }
                     }
                     sshwarden_api::SyncEvent::LogOut => {
+                        notification_state.write().await.last_event_at = Some(std::time::Instant::now());
                         info!("Notification: remote logout");
-                        let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, &key_names).await;
+                        let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, Some(&local_cache_key_state), Some(&authorization_memory)).await;
+                    }
+                    sshwarden_api::SyncEvent::FallbackSyncDue => {
+                        if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+                            pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                            info!("Notification degraded while locked; sync pending until unlock");
+                        } else {
+                            info!("Notification degraded, running fallback sync...");
+                            match do_sync(&api_client, &cached_key_tuples, &public_key_identity_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
+                                Ok(count) => {
+                                    let mut state = notification_state.write().await;
+                                    state.last_event_at = Some(std::time::Instant::now());
+                                    state.last_fallback_sync_at = Some(std::time::Instant::now());
+                                    info!("Fallback-synced: {} SSH keys", count)
+                                },
+                                Err(e) => {
+                                    pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!("Fallback sync failed: {}; sync remains pending", e);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -749,6 +2092,16 @@ async fn run_foreground(
                                 info!("Access token refreshed");
                                 // Update session file with new refresh token
                                 save_device_session(client, &config, None).await;
+                                if let Some(token) = client.access_token().map(str::to_string) {
+                                    connect_notification_client(
+                                        &config,
+                                        Some(&*client),
+                                        &token,
+                                        &mut notification_rx,
+                                        &mut _notification_client,
+                                        &notification_state,
+                                    ).await;
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("Token refresh failed: {}", e);
@@ -764,7 +2117,7 @@ async fn run_foreground(
                     && last_activity.elapsed().as_secs() >= lock_timeout
                 {
                     info!("Auto-locking vault due to inactivity ({} seconds)", lock_timeout);
-                    let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, &key_names).await;
+                    let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, Some(&local_cache_key_state), Some(&authorization_memory)).await;
                 }
             }
             // Shutdown signal
@@ -776,24 +2129,102 @@ async fn run_foreground(
     }
 
     cancel_token.cancel();
+    notification_state.write().await.state = NotificationConnectionState::Stopped;
     agent.stop();
     info!("SSHWarden stopped.");
     Ok(())
 }
 
-/// Lock the vault: clear agent keys, cached key tuples, and key names.
-/// Centralizes all lock-related cleanup to prevent data leakage.
+/// Lock the vault: clear private key tuples while retaining public key identities
+/// in the SSH agent so locked remembered devices remain listable.
 async fn lock_vault(
     agent: &mut sshwarden_agent::SshWardenAgent,
     vault_locked: &Arc<std::sync::atomic::AtomicBool>,
     cached_key_tuples: &CachedKeyTuples,
-    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+    local_cache_key_state: Option<&LocalCacheKeyHandle>,
+    authorization_memory: Option<&AuthorizationMemorySet>,
 ) -> Result<(), anyhow::Error> {
     agent.lock()?;
     vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
     cached_key_tuples.write().await.clear();
-    key_names.write().await.clear();
+    if let Some(state) = local_cache_key_state {
+        state.write().await.clear();
+    }
+    if let Some(memory) = authorization_memory {
+        memory.write().await.clear();
+    }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_status_response(
+    json: bool,
+    agent: &sshwarden_agent::SshWardenAgent,
+    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
+    pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
+    vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
+    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
+    pending_sync: &Arc<std::sync::atomic::AtomicBool>,
+    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
+    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+) -> sshwarden_agent::ControlResponse {
+    let locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
+    let count = agent.key_count();
+    let has_pin = pin_encrypted_keys.read().await.is_some();
+    let has_vault = vault_file_data.read().await.is_some();
+    let has_local_key_cache = local_key_cache_data.read().await.is_some();
+    let authenticated = api_client.read().await.is_some();
+    let pending = pending_sync.load(std::sync::atomic::Ordering::Relaxed);
+    let notification = notification_state.read().await.clone();
+
+    let details = serde_json::json!({
+        "locked": locked,
+        "key_count": count,
+        "has_pin": has_pin,
+        "has_vault_file": has_vault,
+        "has_local_key_cache": has_local_key_cache,
+        "legacy_migration_available": has_vault && !has_local_key_cache,
+        "authenticated": authenticated,
+        "pending_sync": pending,
+        "notification": notification.to_json(),
+    });
+
+    let mut resp = sshwarden_agent::ControlResponse::status(locked, count).with_details(details);
+    let mut extras = Vec::new();
+    if has_pin {
+        extras.push("PIN configured");
+    }
+    if has_vault {
+        extras.push("vault.enc present");
+    }
+    if has_local_key_cache {
+        extras.push("local key cache present");
+    }
+    if has_vault && !has_local_key_cache {
+        extras.push("legacy migration available");
+    }
+    if authenticated {
+        extras.push("API session restored");
+    }
+    if pending {
+        extras.push("pending sync");
+    }
+    if notification.stale_cache {
+        extras.push("stale cache");
+    }
+    extras.push(notification.state_name());
+
+    if json {
+        resp.message = None;
+    } else if !extras.is_empty() {
+        resp.message = Some(format!(
+            "{} ({})",
+            resp.message.unwrap_or_default(),
+            extras.join(", ")
+        ));
+    }
+
+    resp
 }
 
 /// Handle a control command from the IPC channel.
@@ -803,15 +2234,22 @@ async fn handle_control_command(
     agent: &mut sshwarden_agent::SshWardenAgent,
     vault_locked: &Arc<std::sync::atomic::AtomicBool>,
     cached_key_tuples: &CachedKeyTuples,
+    public_key_identity_tuples: &CachedKeyTuples,
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
     pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
     vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
+    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    local_cache_key_state: &LocalCacheKeyHandle,
+    key_material_fingerprints: &KeyMaterialFingerprints,
     key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
     config: &Arc<sshwarden_config::Config>,
     auto_unlock: bool,
     ui_request_tx: &UIRequestTx,
     notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
     notification_client: &mut Option<sshwarden_api::NotificationClient>,
+    pending_sync: &Arc<std::sync::atomic::AtomicBool>,
+    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
+    authorization_memory: &AuthorizationMemorySet,
 ) -> sshwarden_agent::ControlResponse {
     use sshwarden_agent::ControlAction;
 
@@ -820,7 +2258,15 @@ async fn handle_control_command(
             if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
                 sshwarden_agent::ControlResponse::ok("Vault is already locked")
             } else {
-                match lock_vault(agent, vault_locked, cached_key_tuples, key_names).await {
+                match lock_vault(
+                    agent,
+                    vault_locked,
+                    cached_key_tuples,
+                    Some(local_cache_key_state),
+                    Some(authorization_memory),
+                )
+                .await
+                {
                     Ok(()) => {
                         info!("Vault locked via control command");
                         sshwarden_agent::ControlResponse::ok("Vault locked")
@@ -836,7 +2282,87 @@ async fn handle_control_command(
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
 
-            // Try Hello sign-path first (if hello_challenge available)
+            // Try platform-native Local Key Cache first, then Windows Hello/legacy Hello.
+            #[cfg(not(windows))]
+            if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
+                let resp = finish_native_unlock_response(
+                    cache,
+                    agent,
+                    vault_locked,
+                    cached_key_tuples,
+                    key_names,
+                    local_cache_key_state,
+                    "Vault unlocked via platform-native local key cache",
+                )
+                .await;
+                if resp.ok {
+                    resolve_pending_sync(
+                        pending_sync,
+                        api_client,
+                        cached_key_tuples,
+                        public_key_identity_tuples,
+                        local_key_cache_data,
+                        local_cache_key_state,
+                        authorization_memory,
+                        key_material_fingerprints,
+                        vault_locked,
+                        agent,
+                        key_names,
+                        notification_state,
+                    )
+                    .await;
+                    return resp;
+                }
+                tracing::warn!("Platform-native local key cache unlock failed");
+            }
+
+            // Try envelope Local Key Cache Windows Hello first, then legacy Hello.
+            #[cfg(windows)]
+            if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
+                match decrypt_envelope_local_key_cache_with_hello(&cache) {
+                    Ok((keys_json, local_cache_key)) => {
+                        local_cache_key_state.write().await.set(local_cache_key);
+                        let resp = finish_unlock_with_json(
+                            &keys_json,
+                            agent,
+                            vault_locked,
+                            cached_key_tuples,
+                            key_names,
+                            "Vault unlocked via Windows Hello local key cache",
+                        )
+                        .await;
+                        if resp.ok {
+                            try_restore_api_session_hello(
+                                api_client,
+                                config,
+                                notification_rx,
+                                notification_client,
+                                notification_state,
+                            )
+                            .await;
+                            resolve_pending_sync(
+                                pending_sync,
+                                api_client,
+                                cached_key_tuples,
+                                public_key_identity_tuples,
+                                local_key_cache_data,
+                                local_cache_key_state,
+                                authorization_memory,
+                                key_material_fingerprints,
+                                vault_locked,
+                                agent,
+                                key_names,
+                                notification_state,
+                            )
+                            .await;
+                        }
+                        return resp;
+                    }
+                    Err(e) => tracing::warn!("Windows Hello local key cache unlock failed: {}", e),
+                }
+            }
+
+            // Try legacy Hello sign-path (if hello_challenge available).
             #[cfg(windows)]
             {
                 let hello_info = {
@@ -879,6 +2405,22 @@ async fn handle_control_command(
                                         config,
                                         notification_rx,
                                         notification_client,
+                                        notification_state,
+                                    )
+                                    .await;
+                                    resolve_pending_sync(
+                                        pending_sync,
+                                        api_client,
+                                        cached_key_tuples,
+                                        public_key_identity_tuples,
+                                        local_key_cache_data,
+                                        local_cache_key_state,
+                                        authorization_memory,
+                                        key_material_fingerprints,
+                                        vault_locked,
+                                        agent,
+                                        key_names,
+                                        notification_state,
                                     )
                                     .await;
                                 }
@@ -902,8 +2444,7 @@ async fn handle_control_command(
                         sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator).await;
 
                     if let Some(ref entered_pin) = pin_result {
-                        let keys_json =
-                            decrypted_cache.lock().unwrap().take().unwrap();
+                        let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
                         let resp = finish_unlock_with_json(
                             &keys_json,
                             agent,
@@ -921,6 +2462,22 @@ async fn handle_control_command(
                                 entered_pin,
                                 notification_rx,
                                 notification_client,
+                                notification_state,
+                            )
+                            .await;
+                            resolve_pending_sync(
+                                pending_sync,
+                                api_client,
+                                cached_key_tuples,
+                                public_key_identity_tuples,
+                                local_key_cache_data,
+                                local_cache_key_state,
+                                authorization_memory,
+                                key_material_fingerprints,
+                                vault_locked,
+                                agent,
+                                key_names,
+                                notification_state,
                             )
                             .await;
                         }
@@ -937,6 +2494,47 @@ async fn handle_control_command(
                 "Auto-unlock is disabled. Use: unlock --pin or unlock --password",
             )
         }
+        ControlAction::UnlockNative => {
+            if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+                return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
+            }
+
+            let cache = match local_key_cache_data.read().await.as_ref().cloned() {
+                Some(cache) => cache,
+                None => return sshwarden_agent::ControlResponse::err("No Local Key Cache found"),
+            };
+
+            let resp = finish_native_unlock_response(
+                cache,
+                agent,
+                vault_locked,
+                cached_key_tuples,
+                key_names,
+                local_cache_key_state,
+                "Vault unlocked via platform-native local key cache",
+            )
+            .await;
+
+            if resp.ok {
+                resolve_pending_sync(
+                    pending_sync,
+                    api_client,
+                    cached_key_tuples,
+                    public_key_identity_tuples,
+                    local_key_cache_data,
+                    local_cache_key_state,
+                    authorization_memory,
+                    key_material_fingerprints,
+                    vault_locked,
+                    agent,
+                    key_names,
+                    notification_state,
+                )
+                .await;
+            }
+
+            resp
+        }
         ControlAction::UnlockHello => {
             if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
@@ -944,6 +2542,52 @@ async fn handle_control_command(
 
             #[cfg(windows)]
             {
+                if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
+                    match decrypt_envelope_local_key_cache_with_hello(&cache) {
+                        Ok((keys_json, local_cache_key)) => {
+                            local_cache_key_state.write().await.set(local_cache_key);
+                            let resp = finish_unlock_with_json(
+                                &keys_json,
+                                agent,
+                                vault_locked,
+                                cached_key_tuples,
+                                key_names,
+                                "Vault unlocked via Windows Hello local key cache",
+                            )
+                            .await;
+                            if resp.ok {
+                                try_restore_api_session_hello(
+                                    api_client,
+                                    config,
+                                    notification_rx,
+                                    notification_client,
+                                    notification_state,
+                                )
+                                .await;
+                                resolve_pending_sync(
+                                    pending_sync,
+                                    api_client,
+                                    cached_key_tuples,
+                                    public_key_identity_tuples,
+                                    local_key_cache_data,
+                                    local_cache_key_state,
+                                    authorization_memory,
+                                    key_material_fingerprints,
+                                    vault_locked,
+                                    agent,
+                                    key_names,
+                                    notification_state,
+                                )
+                                .await;
+                            }
+                            return resp;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Windows Hello local key cache unlock failed: {}", e)
+                        }
+                    }
+                }
+
                 let vf = vault_file_data.read().await;
                 let (challenge_b64, hello_encrypted) = match *vf {
                     Some(ref v) => (v.hello_challenge.clone(), v.hello_encrypted.clone()),
@@ -992,7 +2636,7 @@ async fn handle_control_command(
 
                 match hello_result {
                     Ok(Ok(keys_json)) => {
-                        finish_unlock_with_json(
+                        let resp = finish_unlock_with_json(
                             &keys_json,
                             agent,
                             vault_locked,
@@ -1000,7 +2644,33 @@ async fn handle_control_command(
                             key_names,
                             "Vault unlocked via Windows Hello",
                         )
-                        .await
+                        .await;
+                        if resp.ok {
+                            try_restore_api_session_hello(
+                                api_client,
+                                config,
+                                notification_rx,
+                                notification_client,
+                                notification_state,
+                            )
+                            .await;
+                            resolve_pending_sync(
+                                pending_sync,
+                                api_client,
+                                cached_key_tuples,
+                                public_key_identity_tuples,
+                                local_key_cache_data,
+                                local_cache_key_state,
+                                authorization_memory,
+                                key_material_fingerprints,
+                                vault_locked,
+                                agent,
+                                key_names,
+                                notification_state,
+                            )
+                            .await;
+                        }
+                        resp
                     }
                     Ok(Err(e)) => sshwarden_agent::ControlResponse::err(&format!(
                         "Hello unlock failed: {}",
@@ -1016,27 +2686,19 @@ async fn handle_control_command(
             #[cfg(not(windows))]
             sshwarden_agent::ControlResponse::err("Windows Hello is only supported on Windows")
         }
-        ControlAction::Status => {
-            let locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
-            let count = agent.key_count();
-            let has_pin = pin_encrypted_keys.read().await.is_some();
-            let has_vault = vault_file_data.read().await.is_some();
-            let mut resp = sshwarden_agent::ControlResponse::status(locked, count);
-            let mut extras = Vec::new();
-            if has_pin {
-                extras.push("PIN configured");
-            }
-            if has_vault {
-                extras.push("vault.enc present");
-            }
-            if !extras.is_empty() {
-                resp.message = Some(format!(
-                    "{} ({})",
-                    resp.message.unwrap_or_default(),
-                    extras.join(", ")
-                ));
-            }
-            resp
+        ControlAction::Status { json } => {
+            build_status_response(
+                json,
+                agent,
+                vault_locked,
+                pin_encrypted_keys,
+                vault_file_data,
+                api_client,
+                pending_sync,
+                notification_state,
+                local_key_cache_data,
+            )
+            .await
         }
         ControlAction::UnlockPin { pin } => {
             let pin = zeroize::Zeroizing::new(pin);
@@ -1044,7 +2706,56 @@ async fn handle_control_command(
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
 
-            // Try in-memory first, then vault file
+            if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
+                match decrypt_envelope_local_key_cache_with_pin(&cache, &pin) {
+                    Ok((keys_json, local_cache_key)) => {
+                        local_cache_key_state.write().await.set(local_cache_key);
+                        let resp = finish_unlock_with_json(
+                            &keys_json,
+                            agent,
+                            vault_locked,
+                            cached_key_tuples,
+                            key_names,
+                            "Vault unlocked via PIN local key cache",
+                        )
+                        .await;
+
+                        if resp.ok {
+                            try_restore_api_session(
+                                api_client,
+                                config,
+                                &pin,
+                                notification_rx,
+                                notification_client,
+                                notification_state,
+                            )
+                            .await;
+                            resolve_pending_sync(
+                                pending_sync,
+                                api_client,
+                                cached_key_tuples,
+                                public_key_identity_tuples,
+                                local_key_cache_data,
+                                local_cache_key_state,
+                                authorization_memory,
+                                key_material_fingerprints,
+                                vault_locked,
+                                agent,
+                                key_names,
+                                notification_state,
+                            )
+                            .await;
+                        }
+
+                        return resp;
+                    }
+                    Err(e) => {
+                        tracing::warn!("PIN unlock from local key cache failed: {}", e);
+                    }
+                }
+            }
+
+            // Fall back to legacy in-memory/vault.enc cache.
             let encrypted = {
                 let mem = pin_encrypted_keys.read().await.clone();
                 if mem.is_some() {
@@ -1061,6 +2772,33 @@ async fn handle_control_command(
             match encrypted {
                 Some(enc_data) => match sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
                     Ok(keys_json) => {
+                        if local_key_cache_data.read().await.is_none() {
+                            let keys_for_migration: Result<Vec<(String, String, String)>, _> =
+                                serde_json::from_str(&keys_json);
+                            if let Ok(keys_for_migration) = keys_for_migration {
+                                match write_envelope_local_key_cache(
+                                    &keys_for_migration,
+                                    &config.auth.email,
+                                    &config.server.base_url,
+                                    &pin,
+                                ) {
+                                    Ok((cache, local_cache_key)) => {
+                                        *local_key_cache_data.write().await = Some(cache);
+                                        local_cache_key_state.write().await.set(local_cache_key);
+                                        *pin_encrypted_keys.write().await = None;
+                                        *vault_file_data.write().await = None;
+                                        if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
+                                            tracing::warn!("Failed to delete legacy vault file after migration: {}", e);
+                                        }
+                                        info!("Migrated legacy vault.enc to envelope local key cache");
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "Failed to migrate legacy vault.enc to envelope local key cache: {}",
+                                        e
+                                    ),
+                                }
+                            }
+                        }
                         let resp = finish_unlock_with_json(
                             &keys_json,
                             agent,
@@ -1079,6 +2817,22 @@ async fn handle_control_command(
                                 &pin,
                                 notification_rx,
                                 notification_client,
+                                notification_state,
+                            )
+                            .await;
+                            resolve_pending_sync(
+                                pending_sync,
+                                api_client,
+                                cached_key_tuples,
+                                public_key_identity_tuples,
+                                local_key_cache_data,
+                                local_cache_key_state,
+                                authorization_memory,
+                                key_material_fingerprints,
+                                vault_locked,
+                                agent,
+                                key_names,
+                                notification_state,
                             )
                             .await;
                         }
@@ -1133,6 +2887,13 @@ async fn handle_control_command(
                         })
                         .collect();
                     let count = key_tuples.len();
+                    if let Err(e) = write_key_selector_files(&keys) {
+                        tracing::warn!("Failed to write key selector files: {}", e);
+                    }
+                    public_key_identity_tuples
+                        .write()
+                        .await
+                        .set(key_tuples.clone());
                     cached_key_tuples.write().await.set(key_tuples.clone());
 
                     // Update key_names
@@ -1156,21 +2917,33 @@ async fn handle_control_command(
                     save_device_session(&client, config, None).await;
 
                     if let Some(token) = client.access_token() {
-                        let notif_url = config.server.notifications_url();
-                        info!("Attempting to connect to notification hub: {}", notif_url);
-                        match sshwarden_api::NotificationClient::connect(&notif_url, token).await {
-                            Ok((notif_client, rx)) => {
-                                info!("Connected to notification hub");
-                                *notification_rx = Some(rx);
-                                *notification_client = Some(notif_client);
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to connect to notification hub: {:?}", e);
-                            }
-                        }
+                        connect_notification_client(
+                            config,
+                            Some(&client),
+                            token,
+                            notification_rx,
+                            notification_client,
+                            notification_state,
+                        )
+                        .await;
                     }
 
                     *api_client.write().await = Some(client);
+                    resolve_pending_sync(
+                        pending_sync,
+                        api_client,
+                        cached_key_tuples,
+                        public_key_identity_tuples,
+                        local_key_cache_data,
+                        local_cache_key_state,
+                        authorization_memory,
+                        key_material_fingerprints,
+                        vault_locked,
+                        agent,
+                        key_names,
+                        notification_state,
+                    )
+                    .await;
 
                     info!("Vault unlocked via master password, {} keys loaded", count);
                     sshwarden_agent::ControlResponse::ok(&format!(
@@ -1185,12 +2958,73 @@ async fn handle_control_command(
             }
         }
         ControlAction::Sync => {
-            match do_sync(api_client, cached_key_tuples, vault_locked, agent, key_names).await {
+            match do_sync(
+                api_client,
+                cached_key_tuples,
+                public_key_identity_tuples,
+                local_key_cache_data,
+                local_cache_key_state,
+                authorization_memory,
+                key_material_fingerprints,
+                vault_locked,
+                agent,
+                key_names,
+                notification_state,
+            )
+            .await
+            {
                 Ok(count) => {
                     sshwarden_agent::ControlResponse::ok(&format!("Synced {} SSH keys", count))
                 }
                 Err(e) => sshwarden_agent::ControlResponse::err(&e),
             }
+        }
+        ControlAction::Forget => {
+            if let Err(e) = sshwarden_config::cache::LocalKeyCacheFile::delete() {
+                tracing::warn!("Failed to delete local key cache: {}", e);
+            }
+            if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
+                tracing::warn!("Failed to delete legacy vault file: {}", e);
+            }
+            let native_slot = local_key_cache_data
+                .read()
+                .await
+                .as_ref()
+                .and_then(|cache| cache.local_cache_key.native_encrypted.clone());
+            if let Err(e) =
+                sshwarden_ui::unlock::native::native_delete_local_cache_key(native_slot.as_deref())
+            {
+                tracing::warn!("Failed to delete native unlock material: {}", e);
+            }
+            if let Err(e) = sshwarden_config::session::SessionFile::delete() {
+                tracing::warn!("Failed to delete device session file: {}", e);
+            }
+
+            *local_key_cache_data.write().await = None;
+            *vault_file_data.write().await = None;
+            *pin_encrypted_keys.write().await = None;
+            local_cache_key_state.write().await.clear();
+            authorization_memory.write().await.clear();
+            cached_key_tuples.write().await.clear();
+            public_key_identity_tuples.write().await.clear();
+            key_names.write().await.clear();
+            *api_client.write().await = None;
+            pending_sync.store(false, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut state = notification_state.write().await;
+                state.stale_cache = false;
+                state.stale_cache_error = None;
+            }
+            if let Some(client) = notification_client.take() {
+                client.stop();
+            }
+            *notification_rx = None;
+            let _ = agent.clear_keys();
+            vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            sshwarden_agent::ControlResponse::ok(
+                "Forgot local key cache, legacy vault file, and device session material",
+            )
         }
         ControlAction::SetPin { pin } => {
             let pin = zeroize::Zeroizing::new(pin);
@@ -1203,84 +3037,22 @@ async fn handle_control_command(
                 return sshwarden_agent::ControlResponse::err("No keys loaded. Login first.");
             }
 
-            // Serialize key tuples and encrypt with PIN
-            let keys_json = match serde_json::to_string(&keys) {
-                Ok(j) => j,
-                Err(e) => {
-                    return sshwarden_agent::ControlResponse::err(&format!(
-                        "Failed to serialize keys: {}",
-                        e
-                    ))
-                }
-            };
+            let email = config.auth.email.clone();
+            let server_url = config.server.base_url.clone();
 
-            match sshwarden_api::crypto::pin_encrypt(&keys_json, &pin) {
-                Ok(encrypted) => {
-                    // Store in memory
-                    *pin_encrypted_keys.write().await = Some(encrypted.clone());
-
-                    // Persist to vault.enc
-                    let email = config.auth.email.clone();
-                    let server_url = config.server.base_url.clone();
-
-                    #[allow(unused_mut)]
-                    let mut vault = sshwarden_config::vault::VaultFile {
-                        version: 1,
-                        pin_encrypted: encrypted,
-                        hello_challenge: None,
-                        hello_encrypted: None,
-                        email,
-                        server_url,
-                    };
-
-                    // Try to register Windows Hello sign-path
-                    #[cfg(windows)]
-                    {
-                        if sshwarden_ui::unlock::hello_crypto::hello_available() {
-                            info!("Windows Hello available, attempting to register sign-path");
-                            let challenge: [u8; 16] = rand::random();
-                            let keys_json_clone = keys_json.clone();
-                            let challenge_clone = challenge;
-
-                            let hello_result = tokio::task::spawn_blocking(move || {
-                                sshwarden_ui::unlock::hello_crypto::hello_encrypt_keys(
-                                    &keys_json_clone,
-                                    &challenge_clone,
-                                )
-                            })
-                            .await;
-
-                            match hello_result {
-                                Ok(Ok(hello_enc)) => {
-                                    vault.hello_encrypted = Some(hello_enc);
-                                    vault.hello_challenge = Some(
-                                        base64::engine::general_purpose::STANDARD.encode(challenge),
-                                    );
-                                    info!("Windows Hello sign-path registered");
-                                }
-                                Ok(Err(e)) => {
-                                    tracing::warn!("Hello encrypt failed: {}", e);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Hello encrypt task failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-
-                    if let Err(e) = vault.save() {
-                        tracing::warn!("Failed to save vault file: {}", e);
-                        // Still return success since in-memory encryption worked
-                    } else {
-                        info!(
-                            "Vault file saved to {}",
-                            sshwarden_config::vault::VaultFile::path()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|_| "unknown".to_string())
+            match write_envelope_local_key_cache(&keys, &email, &server_url, &pin) {
+                Ok((cache, local_cache_key)) => {
+                    *local_key_cache_data.write().await = Some(cache);
+                    local_cache_key_state.write().await.set(local_cache_key);
+                    *pin_encrypted_keys.write().await = None;
+                    *vault_file_data.write().await = None;
+                    if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
+                        tracing::warn!(
+                            "Failed to delete legacy vault file after envelope cache write: {}",
+                            e
                         );
                     }
-
-                    *vault_file_data.write().await = Some(vault);
+                    info!("Envelope local key cache saved");
 
                     // Save device session with PIN-encrypted refresh token
                     {
@@ -1290,13 +3062,12 @@ async fn handle_control_command(
                         }
                     }
 
-                    info!("PIN set successfully, keys encrypted with PIN");
                     sshwarden_agent::ControlResponse::ok(
-                        "PIN set successfully (persisted to vault.enc)",
+                        "PIN set successfully (persisted to local key cache)",
                     )
                 }
                 Err(e) => sshwarden_agent::ControlResponse::err(&format!(
-                    "Failed to encrypt with PIN: {}",
+                    "Failed to save envelope local key cache: {}",
                     e
                 )),
             }
@@ -1309,6 +3080,93 @@ async fn handle_control_command(
 #[cfg(windows)]
 fn try_hello_unlock(challenge: &[u8; 16], hello_encrypted: &str) -> anyhow::Result<String> {
     sshwarden_ui::unlock::hello_crypto::hello_decrypt_keys(hello_encrypted, challenge)
+}
+
+#[cfg(windows)]
+fn try_hello_encrypt(plaintext: &str, challenge: &[u8; 16]) -> anyhow::Result<String> {
+    sshwarden_ui::unlock::hello_crypto::hello_encrypt_keys(plaintext, challenge)
+}
+
+fn notification_options(config: &sshwarden_config::Config) -> sshwarden_api::NotificationOptions {
+    sshwarden_api::NotificationOptions {
+        keepalive_interval: std::time::Duration::from_secs(
+            config.agent.notification_keepalive_interval.max(1),
+        ),
+        idle_timeout: std::time::Duration::from_secs(config.agent.notification_idle_timeout.max(1)),
+        reconnect_attempts_before_fallback: config
+            .agent
+            .notification_reconnect_attempts_before_fallback,
+        reconnect_max_backoff: std::time::Duration::from_secs(
+            config.agent.notification_reconnect_max_backoff.max(1),
+        ),
+        fallback_sync_interval: std::time::Duration::from_secs(config.agent.sync_interval),
+    }
+}
+
+async fn connect_notification_client(
+    config: &sshwarden_config::Config,
+    api_client: Option<&sshwarden_api::BitwardenClient>,
+    access_token: &str,
+    notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
+    notification_client: &mut Option<sshwarden_api::NotificationClient>,
+    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
+) {
+    if let Some(client) = notification_client.take() {
+        client.stop();
+    }
+    *notification_rx = None;
+
+    let notif_url = resolve_notifications_url(config, api_client).await;
+    {
+        let mut state = notification_state.write().await;
+        state.state = NotificationConnectionState::Starting;
+        state.url = Some(notif_url.clone());
+        state.last_error = None;
+    }
+    info!("Attempting to connect to notification hub: {}", notif_url);
+    match sshwarden_api::NotificationClient::connect_with_options(
+        &notif_url,
+        access_token,
+        notification_options(config),
+    )
+    .await
+    {
+        Ok((notif_client, rx)) => {
+            *notification_rx = Some(rx);
+            *notification_client = Some(notif_client);
+            let mut state = notification_state.write().await;
+            state.state = NotificationConnectionState::Running;
+            state.reconnect_attempts = 0;
+            state.last_connected_at = Some(std::time::Instant::now());
+            state.last_error = None;
+        }
+        Err(e) => {
+            tracing::warn!("Failed to start notification client: {}", e);
+            let mut state = notification_state.write().await;
+            state.state = NotificationConnectionState::Failed;
+            state.reconnect_attempts = state.reconnect_attempts.saturating_add(1);
+            state.last_error = Some(e.to_string());
+        }
+    }
+}
+
+async fn resolve_notifications_url(
+    config: &sshwarden_config::Config,
+    api_client: Option<&sshwarden_api::BitwardenClient>,
+) -> String {
+    if let Some(explicit) = config.server.notifications_url.as_deref() {
+        return explicit.to_string();
+    }
+
+    if let Some(client) = api_client {
+        match client.discover_notifications_url().await {
+            Ok(Some(url)) => return url,
+            Ok(None) => tracing::debug!("Server config discovery omitted notifications URL"),
+            Err(e) => tracing::debug!("Server config discovery failed: {}", e),
+        }
+    }
+
+    config.server.notifications_url()
 }
 
 /// Read PIN-encrypted data from in-memory cache or vault file.
@@ -1360,6 +3218,7 @@ async fn try_restore_api_session_hello(
     config: &Arc<sshwarden_config::Config>,
     notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
     notification_client: &mut Option<sshwarden_api::NotificationClient>,
+    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
 ) {
     if api_client.read().await.is_some() {
         return;
@@ -1428,17 +3287,15 @@ async fn try_restore_api_session_hello(
             info!("Restored API session from device session file (Hello)");
 
             if let Some(token) = client.access_token() {
-                let notif_url = config.server.notifications_url();
-                match sshwarden_api::NotificationClient::connect(&notif_url, token).await {
-                    Ok((notif_client, rx)) => {
-                        info!("Connected to notification hub");
-                        *notification_rx = Some(rx);
-                        *notification_client = Some(notif_client);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to connect to notification hub: {}", e);
-                    }
-                }
+                connect_notification_client(
+                    config,
+                    Some(&client),
+                    token,
+                    notification_rx,
+                    notification_client,
+                    notification_state,
+                )
+                .await;
             }
 
             *api_client.write().await = Some(client);
@@ -1453,16 +3310,20 @@ async fn try_restore_api_session_hello(
 async fn do_sync(
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
     cached_key_tuples: &CachedKeyTuples,
+    public_key_identity_tuples: &CachedKeyTuples,
+    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    local_cache_key_state: &LocalCacheKeyHandle,
+    authorization_memory: &AuthorizationMemorySet,
+    key_material_fingerprints: &KeyMaterialFingerprints,
     vault_locked: &Arc<std::sync::atomic::AtomicBool>,
     agent: &mut sshwarden_agent::SshWardenAgent,
     key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
 ) -> Result<usize, String> {
     let client_guard = api_client.read().await;
     let client = match *client_guard {
         Some(ref c) => c,
-        None => {
-            return Err("Not authenticated. Use 'unlock --password' to login.".to_string())
-        }
+        None => return Err("Not authenticated. Use 'unlock --password' to login.".to_string()),
     };
 
     let keys = client
@@ -1481,7 +3342,53 @@ async fn do_sync(
         })
         .collect();
     let count = key_tuples.len();
+    if let Err(e) = write_key_selector_files(&keys) {
+        tracing::warn!("Failed to write key selector files: {}", e);
+    }
+    let old_fingerprints = key_material_fingerprints.read().await.clone();
+    let (cleared_memory, new_fingerprints) = clear_authorization_memory_for_changed_keys_async(
+        &old_fingerprints,
+        &key_tuples,
+        authorization_memory,
+    )
+    .await;
+    if cleared_memory > 0 {
+        tracing::info!(
+            count = cleared_memory,
+            "Cleared authorization memory after key material change"
+        );
+    }
+
+    public_key_identity_tuples
+        .write()
+        .await
+        .set(key_tuples.clone());
     cached_key_tuples.write().await.set(key_tuples.clone());
+    *key_material_fingerprints.write().await = new_fingerprints;
+
+    if let (Some(existing_cache), Some(local_cache_key)) = (
+        local_key_cache_data.read().await.as_ref().cloned(),
+        local_cache_key_state.read().await.clone_key(),
+    ) {
+        match refresh_envelope_local_key_cache(&key_tuples, &existing_cache, &local_cache_key) {
+            Ok(cache) => {
+                *local_key_cache_data.write().await = Some(cache);
+                tracing::info!("Local key cache refreshed after sync");
+            }
+            Err(e) => {
+                let error = e.to_string();
+                {
+                    let mut state = notification_state.write().await;
+                    state.stale_cache = true;
+                    state.stale_cache_error = Some(error.clone());
+                }
+                tracing::warn!(
+                    "Sync succeeded but local key cache refresh failed: {}",
+                    error
+                );
+            }
+        }
+    }
 
     // Update key_names
     {
@@ -1503,6 +3410,52 @@ async fn do_sync(
     Ok(count)
 }
 
+async fn resolve_pending_sync(
+    pending_sync: &Arc<std::sync::atomic::AtomicBool>,
+    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
+    cached_key_tuples: &CachedKeyTuples,
+    public_key_identity_tuples: &CachedKeyTuples,
+    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    local_cache_key_state: &LocalCacheKeyHandle,
+    authorization_memory: &AuthorizationMemorySet,
+    key_material_fingerprints: &KeyMaterialFingerprints,
+    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
+    agent: &mut sshwarden_agent::SshWardenAgent,
+    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
+) -> bool {
+    if !pending_sync.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+
+    info!("Resolving pending sync after unlock...");
+    match do_sync(
+        api_client,
+        cached_key_tuples,
+        public_key_identity_tuples,
+        local_key_cache_data,
+        local_cache_key_state,
+        authorization_memory,
+        key_material_fingerprints,
+        vault_locked,
+        agent,
+        key_names,
+        notification_state,
+    )
+    .await
+    {
+        Ok(count) => {
+            info!("Pending sync resolved: {} SSH keys", count);
+            true
+        }
+        Err(e) => {
+            pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("Pending sync failed: {}; sync remains pending", e);
+            false
+        }
+    }
+}
+
 /// Try to restore an API session from the device session file after PIN unlock.
 ///
 /// Decrypts the stored refresh_token using the PIN, refreshes the access token,
@@ -1513,6 +3466,7 @@ async fn try_restore_api_session(
     pin: &str,
     notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
     notification_client: &mut Option<sshwarden_api::NotificationClient>,
+    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
 ) {
     // Only restore if we don't already have an API client
     if api_client.read().await.is_some() {
@@ -1563,17 +3517,15 @@ async fn try_restore_api_session(
 
             // Connect to notification hub
             if let Some(token) = client.access_token() {
-                let notif_url = config.server.notifications_url();
-                match sshwarden_api::NotificationClient::connect(&notif_url, token).await {
-                    Ok((notif_client, rx)) => {
-                        info!("Connected to notification hub");
-                        *notification_rx = Some(rx);
-                        *notification_client = Some(notif_client);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to connect to notification hub: {}", e);
-                    }
-                }
+                connect_notification_client(
+                    config,
+                    Some(&client),
+                    token,
+                    notification_rx,
+                    notification_client,
+                    notification_state,
+                )
+                .await;
             }
 
             // Update session file with new refresh token
@@ -1616,18 +3568,25 @@ async fn save_device_session(
             Err(e) => {
                 tracing::warn!("Failed to encrypt refresh token with PIN: {}", e);
                 // Fall back to existing
-                existing.as_ref().and_then(|s| s.pin_encrypted_token.clone())
+                existing
+                    .as_ref()
+                    .and_then(|s| s.pin_encrypted_token.clone())
             }
         }
     } else {
         // Re-encrypt with existing PIN is not possible without the PIN.
         // Keep existing encrypted token if available.
-        existing.as_ref().and_then(|s| s.pin_encrypted_token.clone())
+        existing
+            .as_ref()
+            .and_then(|s| s.pin_encrypted_token.clone())
     };
 
-    let hello_encrypted_token = existing
-        .as_ref()
-        .and_then(|s| s.hello_encrypted_token.clone());
+    let hello_encrypted_token = create_or_preserve_hello_encrypted_token(
+        &refresh_token,
+        existing
+            .as_ref()
+            .and_then(|s| s.hello_encrypted_token.clone()),
+    );
 
     let session = sshwarden_config::session::SessionFile {
         version: 1,
@@ -1646,6 +3605,46 @@ async fn save_device_session(
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "unknown".to_string())
         );
+    }
+}
+
+fn create_or_preserve_hello_encrypted_token(
+    refresh_token: &str,
+    existing: Option<String>,
+) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let vault = match sshwarden_config::vault::VaultFile::load() {
+            Ok(Some(v)) => v,
+            _ => return existing,
+        };
+        let challenge_b64 = match vault.hello_challenge {
+            Some(challenge) => challenge,
+            None => return existing,
+        };
+        let challenge_bytes = match base64::engine::general_purpose::STANDARD.decode(&challenge_b64)
+        {
+            Ok(bytes) if bytes.len() == 16 => {
+                let mut challenge = [0u8; 16];
+                challenge.copy_from_slice(&bytes);
+                challenge
+            }
+            _ => return existing,
+        };
+
+        match try_hello_encrypt(refresh_token, &challenge_bytes) {
+            Ok(encrypted) => Some(encrypted),
+            Err(e) => {
+                tracing::warn!("Failed to encrypt refresh token with Windows Hello: {}", e);
+                existing
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = refresh_token;
+        existing
     }
 }
 
@@ -1701,100 +3700,16 @@ async fn handle_ui_request(
     prompt_behavior: sshwarden_config::PromptBehavior,
     auto_unlock: bool,
     ui_request_tx: UIRequestTx,
+    runtime_event_tx: tokio::sync::mpsc::Sender<RuntimeEvent>,
+    authorization_memory: AuthorizationMemorySet,
 ) {
     if request.is_list {
-        // If vault is locked, try to auto-unlock before listing keys
-        if vault_locked.load(std::sync::atomic::Ordering::Relaxed) && auto_unlock {
+        if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
             info!(
                 request_id = request.request_id,
                 process = %request.process_name,
-                "Key list request while vault locked, attempting auto-unlock"
+                "Key list request while vault locked - listing public identities without unlock"
             );
-
-            let mut unlocked = false;
-
-            // Try Hello sign-path first
-            #[cfg(windows)]
-            if !unlocked {
-                let hello_info = {
-                    let vf = vault_file_data.read().await;
-                    vf.as_ref().and_then(|v| {
-                        let challenge = v.hello_challenge.as_ref()?;
-                        let encrypted = v.hello_encrypted.as_ref()?;
-                        Some((challenge.clone(), encrypted.clone()))
-                    })
-                };
-
-                if let Some((challenge_b64, hello_encrypted)) = hello_info {
-                    if let Ok(challenge_bytes) =
-                        base64::engine::general_purpose::STANDARD.decode(&challenge_b64)
-                    {
-                        if challenge_bytes.len() == 16 {
-                            let mut challenge = [0u8; 16];
-                            challenge.copy_from_slice(&challenge_bytes);
-
-                            let hello_result = tokio::task::spawn_blocking(move || {
-                                try_hello_unlock(&challenge, &hello_encrypted)
-                            })
-                            .await;
-
-                            if let Ok(Ok(keys_json)) = hello_result {
-                                let finish = finish_unlock_with_json(
-                                    &keys_json,
-                                    &mut agent.clone(),
-                                    &vault_locked,
-                                    &cached_key_tuples,
-                                    &key_names,
-                                    "Auto-unlocked via Windows Hello sign-path (list request)",
-                                )
-                                .await;
-                                if finish.ok {
-                                    unlocked = true;
-                                }
-                            } else {
-                                info!("Hello sign-path failed for list unlock, trying UV fallback");
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Fall back to PIN dialog
-            if !unlocked {
-                info!("Hello sign-path failed for list unlock, trying PIN dialog fallback");
-                let enc_data = get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await;
-
-                if let Some(enc_data) = enc_data {
-                    let (validator, decrypted_cache) = make_pin_validator(enc_data);
-                    let pin_result =
-                        sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx, validator).await;
-
-                    if pin_result.is_some() {
-                        let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
-                        let finish = finish_unlock_with_json(
-                            &keys_json,
-                            &mut agent.clone(),
-                            &vault_locked,
-                            &cached_key_tuples,
-                            &key_names,
-                            "Auto-unlocked via PIN dialog (list request)",
-                        )
-                        .await;
-                        if finish.ok {
-                            unlocked = true;
-                        }
-                    }
-                }
-            }
-
-            if !unlocked {
-                info!(
-                    request_id = request.request_id,
-                    "Vault still locked, denying list request"
-                );
-                let _ = response_tx.send((request.request_id, false));
-                return;
-            }
         }
 
         agent.clear_needs_unlock();
@@ -1867,19 +3782,26 @@ async fn handle_ui_request(
                                 if agent_for_unlock.set_keys(keys).is_ok() {
                                     vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
                                     info!("Auto-unlocked via Windows Hello sign-path");
+                                    let _ = runtime_event_tx
+                                        .send(RuntimeEvent::AutoUnlockedWindowsHello)
+                                        .await;
                                 }
 
-                                // Authorization via Slint dialog (async)
-                                let needs_prompt = match prompt_behavior {
-                                    sshwarden_config::PromptBehavior::Always => true,
-                                    sshwarden_config::PromptBehavior::Never => false,
-                                    sshwarden_config::PromptBehavior::RememberUntilLock => true,
-                                };
+                                // Authorization via Slint dialog (async). Agent forwarding
+                                // always requires explicit approval, regardless of prompt_behavior.
+                                let needs_prompt = request.is_forwarding
+                                    || match prompt_behavior {
+                                        sshwarden_config::PromptBehavior::Always => true,
+                                        sshwarden_config::PromptBehavior::Never => false,
+                                        sshwarden_config::PromptBehavior::RememberUntilLock => true,
+                                    };
                                 let approved = if needs_prompt {
                                     let sign_info = sshwarden_ui::SignRequestInfo {
                                         key_name,
                                         process_name: request.process_name.clone(),
                                         namespace: request.namespace.clone(),
+                                        operation_kind: operation_kind_for_request(&request)
+                                            .to_string(),
                                         is_forwarding: request.is_forwarding,
                                     };
                                     sshwarden_ui::notify::request_authorization(
@@ -1909,10 +3831,23 @@ async fn handle_ui_request(
 
             if let Some(enc_data) = enc_data {
                 let (validator, decrypted_cache) = make_pin_validator(enc_data);
-                let pin_result =
-                    sshwarden_ui::unlock::request_pin_dialog(&ui_request_tx, validator).await;
+                let context_key_name = {
+                    let names = key_names.read().await;
+                    request
+                        .cipher_id
+                        .as_ref()
+                        .and_then(|cid| names.get(cid))
+                        .cloned()
+                        .unwrap_or_else(|| "Unknown key".to_string())
+                };
+                let pin_result = sshwarden_ui::unlock::request_pin_dialog_with_context(
+                    &ui_request_tx,
+                    validator,
+                    Some(unlock_context_for_request(&request, context_key_name)),
+                )
+                .await;
 
-                if pin_result.is_some() {
+                if let Some(pin) = pin_result {
                     let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
                     let keys: Result<Vec<(String, String, String)>, _> =
                         serde_json::from_str(&keys_json);
@@ -1939,19 +3874,26 @@ async fn handle_ui_request(
                         if agent_for_unlock.set_keys(keys).is_ok() {
                             vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
                             info!("Auto-unlocked via PIN dialog");
+                            let _ = runtime_event_tx
+                                .send(RuntimeEvent::AutoUnlockedPin { pin })
+                                .await;
 
-                            // Check if we need authorization prompt
-                            let needs_prompt = match prompt_behavior {
-                                sshwarden_config::PromptBehavior::Always => true,
-                                sshwarden_config::PromptBehavior::Never => false,
-                                sshwarden_config::PromptBehavior::RememberUntilLock => true,
-                            };
+                            // Check if we need authorization prompt. Agent forwarding always
+                            // requires explicit approval, regardless of prompt_behavior.
+                            let needs_prompt = request.is_forwarding
+                                || match prompt_behavior {
+                                    sshwarden_config::PromptBehavior::Always => true,
+                                    sshwarden_config::PromptBehavior::Never => false,
+                                    sshwarden_config::PromptBehavior::RememberUntilLock => true,
+                                };
 
                             if needs_prompt {
                                 let sign_info = sshwarden_ui::SignRequestInfo {
                                     key_name,
                                     process_name: request.process_name.clone(),
                                     namespace: request.namespace.clone(),
+                                    operation_kind: operation_kind_for_request(&request)
+                                        .to_string(),
                                     is_forwarding: request.is_forwarding,
                                 };
                                 let approved = sshwarden_ui::notify::request_authorization(
@@ -1978,15 +3920,41 @@ async fn handle_ui_request(
         }
     }
 
-    // Sign request - check prompt behavior
-    let should_prompt = match prompt_behavior {
-        sshwarden_config::PromptBehavior::Always => true,
-        sshwarden_config::PromptBehavior::Never => false,
-        sshwarden_config::PromptBehavior::RememberUntilLock => {
-            // TODO: implement authorization cache, for now always prompt
-            true
-        }
-    };
+    let operation_kind = operation_kind_for_request(&request).to_string();
+    let memory_key = request
+        .cipher_id
+        .as_ref()
+        .map(|vault_item_id| (vault_item_id.clone(), operation_kind.clone()));
+
+    if !request.is_forwarding
+        && matches!(
+            prompt_behavior,
+            sshwarden_config::PromptBehavior::RememberUntilLock
+        )
+        && memory_key.as_ref().is_some_and(|key| {
+            authorization_memory
+                .try_read()
+                .is_ok_and(|memory| memory.contains(key))
+        })
+    {
+        info!(
+            request_id = request.request_id,
+            process = %request.process_name,
+            operation = %operation_kind,
+            "Sign request - auto-approved from authorization memory"
+        );
+        let _ = response_tx.send((request.request_id, true));
+        return;
+    }
+
+    // Sign request - check prompt behavior.
+    // Agent forwarding always requires explicit approval, regardless of prompt_behavior.
+    let should_prompt = request.is_forwarding
+        || match prompt_behavior {
+            sshwarden_config::PromptBehavior::Always => true,
+            sshwarden_config::PromptBehavior::Never => false,
+            sshwarden_config::PromptBehavior::RememberUntilLock => true,
+        };
 
     if !should_prompt {
         info!(
@@ -2013,6 +3981,7 @@ async fn handle_ui_request(
         key_name,
         process_name: request.process_name.clone(),
         namespace: request.namespace.clone(),
+        operation_kind: operation_kind.clone(),
         is_forwarding: request.is_forwarding,
     };
 
@@ -2025,7 +3994,34 @@ async fn handle_ui_request(
 
     let result = sshwarden_ui::notify::request_authorization(&ui_request_tx, &sign_info).await;
     let approved = result == sshwarden_ui::AuthorizationResult::Approved;
+    if approved
+        && !request.is_forwarding
+        && matches!(
+            prompt_behavior,
+            sshwarden_config::PromptBehavior::RememberUntilLock
+        )
+    {
+        if let Some(key) = memory_key {
+            authorization_memory.write().await.insert(key);
+        }
+    }
     let _ = response_tx.send((request.request_id, approved));
+}
+
+fn unlock_context_for_request(
+    request: &sshwarden_agent::SshAgentUIRequest,
+    key_name: String,
+) -> sshwarden_ui::UnlockRequestContext {
+    sshwarden_ui::UnlockRequestContext {
+        key_name,
+        process_name: request.process_name.clone(),
+        operation_kind: operation_kind_for_request(request).to_string(),
+        is_forwarding: request.is_forwarding,
+    }
+}
+
+fn operation_kind_for_request(request: &sshwarden_agent::SshAgentUIRequest) -> &'static str {
+    request.operation_kind.as_str()
 }
 
 /// Login to the vault and fetch SSH keys, returning both keys and the authenticated client.
@@ -2051,6 +4047,8 @@ async fn prompt_setup_pin(
     cached_key_tuples: &CachedKeyTuples,
     pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
     vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
+    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    local_cache_key_state: &LocalCacheKeyHandle,
     config: &sshwarden_config::Config,
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
 ) {
@@ -2086,68 +4084,24 @@ async fn prompt_setup_pin(
     }
 
     let keys = cached_key_tuples.read().await.clone_inner();
-    let keys_json = match serde_json::to_string(&keys) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::warn!("Failed to serialize keys for PIN: {}", e);
-            return;
-        }
-    };
-
-    let encrypted = match sshwarden_api::crypto::pin_encrypt(&keys_json, &pin) {
-        Ok(enc) => enc,
-        Err(e) => {
-            tracing::warn!("Failed to encrypt with PIN: {}", e);
-            return;
-        }
-    };
-
-    *pin_encrypted_keys.write().await = Some(encrypted.clone());
-
-    #[allow(unused_mut)]
-    let mut vault = sshwarden_config::vault::VaultFile {
-        version: 1,
-        pin_encrypted: encrypted,
-        hello_challenge: None,
-        hello_encrypted: None,
-        email: config.auth.email.clone(),
-        server_url: config.server.base_url.clone(),
-    };
-
-    // Try to register Windows Hello sign-path
-    #[cfg(windows)]
-    {
-        if sshwarden_ui::unlock::hello_crypto::hello_available() {
-            info!("Registering Windows Hello for quick unlock...");
-            let challenge: [u8; 16] = rand::random();
-            let keys_json_clone = keys_json.clone();
-            let challenge_clone = challenge;
-
-            let hello_result = tokio::task::spawn_blocking(move || {
-                sshwarden_ui::unlock::hello_crypto::hello_encrypt_keys(
-                    &keys_json_clone,
-                    &challenge_clone,
-                )
-            })
-            .await;
-
-            match hello_result {
-                Ok(Ok(hello_enc)) => {
-                    vault.hello_encrypted = Some(hello_enc);
-                    vault.hello_challenge =
-                        Some(base64::engine::general_purpose::STANDARD.encode(challenge));
-                    info!("Windows Hello registered for unlock");
-                }
-                Ok(Err(e)) => tracing::warn!("Hello registration failed: {}", e),
-                Err(e) => tracing::warn!("Hello registration task failed: {}", e),
+    match write_envelope_local_key_cache(&keys, &config.auth.email, &config.server.base_url, &pin) {
+        Ok((cache, local_cache_key)) => {
+            *local_key_cache_data.write().await = Some(cache);
+            local_cache_key_state.write().await.set(local_cache_key);
+            *pin_encrypted_keys.write().await = None;
+            *vault_file_data.write().await = None;
+            if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
+                tracing::warn!(
+                    "Failed to delete legacy vault file after envelope cache write: {}",
+                    e
+                );
             }
+            info!("PIN set. Envelope local key cache saved.");
         }
-    }
-
-    if let Err(e) = vault.save() {
-        tracing::warn!("Failed to save vault file: {}", e);
-    } else {
-        info!("PIN set. Next time just use 'sshwarden unlock --pin' or Windows Hello.");
+        Err(e) => {
+            tracing::warn!("Failed to save envelope local key cache: {}", e);
+            return;
+        }
     }
 
     // Save device session with PIN-encrypted refresh token
@@ -2157,8 +4111,6 @@ async fn prompt_setup_pin(
             save_device_session(client, config, Some(&pin)).await;
         }
     }
-
-    *vault_file_data.write().await = Some(vault);
 }
 
 /// Get the runtime data directory for SSHWarden (same as exe directory for portability).
@@ -2290,9 +4242,74 @@ async fn cmd_daemon_install() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 async fn cmd_daemon_install() -> anyhow::Result<()> {
-    info!("Startup installation is only supported on Windows currently");
+    let path = linux_autostart_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create autostart directory: {}", parent.display())
+        })?;
+    }
+
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    let content = format!(
+        "[Desktop Entry]\nType=Application\nName=SSHWarden\nComment=SSHWarden SSH Agent Daemon\nExec={} daemon\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        desktop_exec_escape(&exe.display().to_string())
+    );
+    std::fs::write(&path, content)
+        .with_context(|| format!("Failed to write autostart file: {}", path.display()))?;
+    info!(
+        "SSHWarden XDG autostart file created at: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn cmd_daemon_install() -> anyhow::Result<()> {
+    let path = macos_launch_agent_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create LaunchAgents directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    let working_dir = exe.parent().context("Failed to get executable directory")?;
+    let content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>works.earendil.sshwarden</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+        <string>daemon</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{}</string>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#,
+        xml_escape(&exe.display().to_string()),
+        xml_escape(&working_dir.display().to_string())
+    );
+    std::fs::write(&path, content)
+        .with_context(|| format!("Failed to write LaunchAgent: {}", path.display()))?;
+    info!("SSHWarden LaunchAgent created at: {}", path.display());
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
+async fn cmd_daemon_install() -> anyhow::Result<()> {
+    info!("Startup installation is not supported on this platform currently");
     Ok(())
 }
 
@@ -2314,8 +4331,71 @@ async fn cmd_daemon_uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 async fn cmd_daemon_uninstall() -> anyhow::Result<()> {
-    info!("Startup uninstallation is only supported on Windows currently");
+    remove_startup_file(linux_autostart_path()?, "SSHWarden XDG autostart file")
+}
+
+#[cfg(target_os = "macos")]
+async fn cmd_daemon_uninstall() -> anyhow::Result<()> {
+    remove_startup_file(macos_launch_agent_path()?, "SSHWarden LaunchAgent")
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
+async fn cmd_daemon_uninstall() -> anyhow::Result<()> {
+    info!("Startup uninstallation is not supported on this platform currently");
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn remove_startup_file(path: std::path::PathBuf, label: &str) -> anyhow::Result<()> {
+    match std::fs::remove_file(&path) {
+        Ok(()) => info!("{} removed: {}", label, path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("No {} found, nothing to remove", label)
+        }
+        Err(e) => anyhow::bail!("Failed to remove {}: {}", path.display(), e),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_autostart_path() -> anyhow::Result<std::path::PathBuf> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })
+        .context("HOME or XDG_CONFIG_HOME environment variable not set")?;
+    Ok(config_home.join("autostart").join("sshwarden.desktop"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_path() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .context("HOME environment variable not set")?;
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join("works.earendil.sshwarden.plist"))
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_exec_escape(value: &str) -> String {
+    if value.chars().any(|ch| ch.is_whitespace()) {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }

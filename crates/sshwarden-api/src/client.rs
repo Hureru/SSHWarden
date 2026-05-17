@@ -11,6 +11,7 @@ pub struct BitwardenClient {
     http: HttpClient,
     api_url: String,
     identity_url: String,
+    base_url: String,
     access_token: Option<String>,
     refresh_token: Option<String>,
     token_expiry: Option<std::time::Instant>,
@@ -23,17 +24,18 @@ pub struct BitwardenClient {
 #[derive(Debug, Clone)]
 pub struct DecryptedSshKey {
     pub private_key_pem: Zeroizing<String>,
+    pub public_key_openssh: String,
     pub name: String,
     pub cipher_id: String,
 }
 
 impl BitwardenClient {
     pub fn new(base_url: &str, api_url: &str, identity_url: &str) -> Self {
-        let _ = base_url; // Used by callers for URL construction
         Self {
             http: HttpClient::new(),
             api_url: api_url.to_string(),
             identity_url: identity_url.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
             access_token: None,
             refresh_token: None,
             token_expiry: None,
@@ -49,11 +51,11 @@ impl BitwardenClient {
         identity_url: &str,
         device_id: &str,
     ) -> Self {
-        let _ = base_url;
         Self {
             http: HttpClient::new(),
             api_url: api_url.to_string(),
             identity_url: identity_url.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
             access_token: None,
             refresh_token: None,
             token_expiry: None,
@@ -159,10 +161,8 @@ impl BitwardenClient {
 
         self.access_token = Some(token_resp.access_token);
         self.refresh_token = token_resp.refresh_token.clone();
-        self.token_expiry = Some(
-            std::time::Instant::now()
-                + std::time::Duration::from_secs(token_resp.expires_in),
-        );
+        self.token_expiry =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(token_resp.expires_in));
 
         // 2e: Decrypt user symmetric key
         if let Some(ref encrypted_key) = token_resp.key {
@@ -213,7 +213,11 @@ impl BitwardenClient {
         let ssh_ciphers: Vec<&Cipher> = sync
             .ciphers
             .iter()
-            .filter(|c| c.cipher_type == CipherType::SshKey && c.deleted_date.is_none())
+            .filter(|c| {
+                c.cipher_type == CipherType::SshKey
+                    && c.deleted_date.is_none()
+                    && c.archived_date.is_none()
+            })
             .collect();
 
         info!("Found {} SSH key ciphers", ssh_ciphers.len());
@@ -269,6 +273,9 @@ impl BitwardenClient {
         let private_key_pem =
             crypto::decrypt_enc_string_to_string(&ssh_data.private_key, &effective_key)
                 .context("Failed to decrypt SSH private key")?;
+        let public_key_openssh =
+            crypto::decrypt_enc_string_to_string(&ssh_data.public_key, &effective_key)
+                .context("Failed to decrypt SSH public key")?;
 
         let name = match cipher.name {
             Some(ref enc_name) => crypto::decrypt_enc_string_to_string(enc_name, &effective_key)
@@ -278,6 +285,7 @@ impl BitwardenClient {
 
         Ok(DecryptedSshKey {
             private_key_pem: Zeroizing::new(private_key_pem),
+            public_key_openssh,
             name,
             cipher_id: cipher.id.clone(),
         })
@@ -324,6 +332,48 @@ impl BitwardenClient {
     /// Get the identity URL (for session file storage).
     pub fn identity_url(&self) -> &str {
         &self.identity_url
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Discover the server-reported notifications URL from `/api/config`.
+    ///
+    /// Discovery is best-effort: callers should fall back to configured/built-in
+    /// defaults if this request fails or the response omits the notifications URL.
+    pub async fn discover_notifications_url(&self) -> anyhow::Result<Option<String>> {
+        let url = format!("{}/api/config", self.base_url);
+        debug!("Discover server config: GET {}", url);
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("Server config discovery request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Server config discovery failed ({}): {}",
+                status,
+                body
+            ));
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse server config response")?;
+
+        Ok(body
+            .get("environment")
+            .and_then(|env| env.get("notifications"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned))
     }
 
     /// Set the refresh token (e.g., restored from session file).
@@ -391,10 +441,8 @@ impl BitwardenClient {
         if let Some(new_refresh) = token_resp.refresh_token {
             self.refresh_token = Some(new_refresh);
         }
-        self.token_expiry = Some(
-            std::time::Instant::now()
-                + std::time::Duration::from_secs(token_resp.expires_in),
-        );
+        self.token_expiry =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(token_resp.expires_in));
 
         info!("Access token refreshed successfully");
         Ok(())

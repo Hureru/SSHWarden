@@ -111,6 +111,8 @@ pub struct Cipher {
     pub name: Option<String>,
     #[serde(alias = "DeletedDate", alias = "deletedDate")]
     pub deleted_date: Option<String>,
+    #[serde(alias = "ArchivedDate", alias = "archivedDate")]
+    pub archived_date: Option<String>,
     #[serde(alias = "SshKey", alias = "sshKey")]
     pub ssh_key: Option<SshKeyData>,
     #[serde(alias = "OrganizationId", alias = "organizationId")]

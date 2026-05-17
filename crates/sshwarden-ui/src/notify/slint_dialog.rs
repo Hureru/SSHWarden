@@ -151,10 +151,12 @@ pub fn show_auth_dialog(request: AuthDialogRequest) {
         }
     };
 
-    let operation = match request.info.namespace.as_deref() {
-        Some("git") => "Git Signing",
-        Some(ns) => ns,
-        None => "SSH Authentication",
+    let operation = match request.info.operation_kind.as_str() {
+        "git_signing" => "Git Signing",
+        "file_signing" => "File Signing",
+        "ssh_signature" => "SSH Signature",
+        "ssh_authentication" => "SSH Authentication",
+        other => other,
     };
 
     dialog.set_process_name(request.info.process_name.as_str().into());
@@ -207,6 +209,35 @@ pub fn show_auth_dialog(request: AuthDialogRequest) {
                 center_and_focus_dialog(&d);
             }
         });
+    }
+}
+
+/// Request authorization using an already-running Slint event loop.
+///
+/// This is a compatibility/convenience API for small examples. The main daemon
+/// should prefer [`request_authorization`] with its UI request channel.
+pub async fn prompt_authorization(info: &SignRequestInfo) -> AuthorizationResult {
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let request = AuthDialogRequest {
+        info: info.clone(),
+        response_tx,
+    };
+
+    if slint::invoke_from_event_loop(move || show_auth_dialog(request)).is_err() {
+        tracing::error!("Slint event loop is not running, cannot show auth dialog");
+        return AuthorizationResult::Denied;
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            tracing::error!("Auth dialog response channel closed unexpectedly");
+            AuthorizationResult::Denied
+        }
+        Err(_) => {
+            tracing::error!("Authorization dialog timed out after 300s");
+            AuthorizationResult::Timeout
+        }
     }
 }
 
