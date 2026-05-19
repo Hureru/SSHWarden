@@ -1,5 +1,8 @@
+pub mod bind_hosts;
 pub mod notify;
 pub mod unlock;
+
+use std::collections::BTreeMap;
 
 /// Information about an SSH sign request, used to display to the user.
 #[derive(Debug, Clone)]
@@ -26,6 +29,44 @@ pub enum AuthorizationResult {
     Approved,
     Denied,
     Timeout,
+    /// User clicked the "Bind this key…" secondary action. The main loop is
+    /// expected to follow up with a [`UIRequest::BindHostsDialog`] and, on
+    /// successful save, treat the original sign request as approved.
+    BindRequested,
+}
+
+/// One key shown in the host-binding dialog.
+#[derive(Debug, Clone)]
+pub struct BindHostsKeyEntry {
+    pub cipher_id: String,
+    pub name: String,
+    /// Current host patterns bound to this key (may be empty).
+    pub hosts: Vec<String>,
+}
+
+/// Request payload for [`UIRequest::BindHostsDialog`].
+#[derive(Debug, Clone)]
+pub struct BindHostsRequest {
+    /// All vault keys available for binding.
+    pub keys: Vec<BindHostsKeyEntry>,
+    /// Pre-select this `cipher_id` if present (otherwise first entry).
+    pub initial_selection: Option<String>,
+    /// Pre-fill this host pattern in the "Add" field for the initial key.
+    pub prefill_host: Option<String>,
+    /// If true, the primary button reads "Save & Approve" — used when this
+    /// dialog was triggered from an in-flight sign authorization.
+    pub approve_on_save: bool,
+}
+
+/// Result returned by the host-binding dialog.
+#[derive(Debug, Clone)]
+pub enum BindHostsResult {
+    /// User saved. The map contains the final desired state for each key the
+    /// user touched: `cipher_id -> hosts`. An empty vec means clear that key.
+    /// Keys not present in the map were not modified.
+    Saved { bindings: BTreeMap<String, Vec<String>> },
+    /// User cancelled or closed the dialog.
+    Cancelled,
 }
 
 /// Unified UI request type for cross-thread communication.
@@ -43,6 +84,11 @@ pub enum UIRequest {
     AuthDialog {
         info: SignRequestInfo,
         response_tx: tokio::sync::oneshot::Sender<AuthorizationResult>,
+    },
+    /// Request the host-binding management dialog.
+    BindHostsDialog {
+        request: BindHostsRequest,
+        response_tx: tokio::sync::oneshot::Sender<BindHostsResult>,
     },
 }
 

@@ -22,6 +22,9 @@ pub struct SshAgentUIRequest {
     pub request_id: u32,
     pub cipher_id: Option<String>,
     pub process_name: String,
+    /// PID of the calling process (best-effort; 0 if unknown). Used by the
+    /// host application for UX features like host inference.
+    pub pid: u32,
     pub is_list: bool,
     pub namespace: Option<String>,
     pub operation_kind: crate::request_parser::OperationKind,
@@ -104,6 +107,7 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
                 request_id,
                 cipher_id: Some(ssh_key.cipher_uuid.clone()),
                 process_name: info.process_name().to_string(),
+                pid: info.pid(),
                 is_list: false,
                 namespace,
                 operation_kind,
@@ -131,6 +135,7 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
             request_id,
             cipher_id: None,
             process_name: info.process_name().to_string(),
+            pid: info.pid(),
             is_list: true,
             namespace: None,
             operation_kind: crate::request_parser::OperationKind::SshAuthentication,

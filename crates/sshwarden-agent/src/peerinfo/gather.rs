@@ -25,3 +25,22 @@ pub fn get_peer_info(peer_pid: u32) -> Result<PeerInfo, String> {
 
     Err("Failed to get process".to_string())
 }
+
+/// Read the argv of the process with the given PID.
+///
+/// Returns `None` if the process is gone, the OS denies access, or any argv
+/// entry isn't valid UTF-8. Intended for best-effort UX inference (e.g.
+/// extracting the SSH target host) — never for security-relevant decisions.
+pub fn get_peer_cmd(peer_pid: u32) -> Option<Vec<String>> {
+    let mut system = System::new();
+    system.refresh_processes(
+        sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(peer_pid)]),
+        true,
+    );
+    let process = system.process(Pid::from_u32(peer_pid))?;
+    process
+        .cmd()
+        .iter()
+        .map(|s| s.to_str().map(String::from))
+        .collect::<Option<Vec<String>>>()
+}

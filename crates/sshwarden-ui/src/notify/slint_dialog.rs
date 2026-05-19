@@ -8,7 +8,7 @@ slint::slint! {
         icon: @image-url("../../assets/Square44x44Logo.png");
         default-font-family: "Segoe UI";
         width: 380px;
-        height: 195px;
+        height: 230px;
         background: Palette.background;
         always-on-top: true;
 
@@ -19,6 +19,7 @@ slint::slint! {
 
         callback approve();
         callback deny();
+        callback bind();
 
         // Ensure Enter/Esc are handled even when no button has focus.
         forward-focus: key-handler;
@@ -110,6 +111,12 @@ slint::slint! {
                 spacing: 10px;
 
                 Button {
+                    text: "Bind & Approve…";
+                    height: 30px;
+                    clicked => { root.bind(); }
+                }
+
+                Button {
                     text: "Deny";
                     height: 30px;
                     clicked => { root.deny(); }
@@ -183,6 +190,17 @@ pub fn show_auth_dialog(request: AuthDialogRequest) {
     dialog.on_deny(move || {
         if let Some(sender) = tx.borrow_mut().take() {
             let _ = sender.send(AuthorizationResult::Denied);
+        }
+        if let Some(d) = weak.upgrade() {
+            let _ = d.hide();
+        }
+    });
+
+    let weak = dialog.as_weak();
+    let tx = tx_cell.clone();
+    dialog.on_bind(move || {
+        if let Some(sender) = tx.borrow_mut().take() {
+            let _ = sender.send(AuthorizationResult::BindRequested);
         }
         if let Some(d) = weak.upgrade() {
             let _ = d.hide();

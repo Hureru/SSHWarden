@@ -1,3 +1,4 @@
+pub mod bindings;
 pub mod cache;
 pub mod session;
 pub mod vault;
