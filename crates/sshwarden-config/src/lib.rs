@@ -3,9 +3,17 @@ pub mod session;
 pub mod vault;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+
+/// Cached resolution of the data directory, populated on first call to [`config_dir`].
+///
+/// All callers share a single resolution outcome for the lifetime of the process —
+/// this prevents flapping when, for example, a portable probe file is written
+/// after some path has already been computed.
+static RESOLVED_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -269,19 +277,88 @@ impl Config {
 
 /// Get the base directory for persistent SSHWarden configuration/data files.
 ///
-/// Standard storage is the default. Portable storage is opt-in via either:
-/// - `SSHWARDEN_PORTABLE=1`, or
-/// - `SSHWARDEN_HOME=<dir>` for an explicit portable/data directory.
+/// Resolution priority (highest first):
+/// 1. `SSHWARDEN_HOME=<dir>` environment variable (explicit override).
+/// 2. `SSHWARDEN_PORTABLE=1` environment variable (executable's directory).
+/// 3. `<exe>/config.toml` with `[storage] portable = true` (probe-based portable mode).
+///    If `portable_dir` is set and non-empty, uses that path; otherwise uses the
+///    executable's directory.
+/// 4. Platform-standard config directory (e.g. `%APPDATA%\SSHWarden` on Windows).
+///
+/// The resolution is cached in [`RESOLVED_DIR`] on first call, so subsequent calls
+/// from any module return the same path even if the probe file is added or removed
+/// mid-run.
 pub fn config_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = RESOLVED_DIR.get() {
+        return Ok(dir.clone());
+    }
+    let resolved = resolve_data_dir()?;
+    // Ignore the race-loser case where another caller populated the cache first;
+    // both callers would have computed the same value.
+    let _ = RESOLVED_DIR.set(resolved.clone());
+    Ok(resolved)
+}
+
+fn resolve_data_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = env_path("SSHWARDEN_HOME") {
         return Ok(dir);
     }
-
     if env_bool("SSHWARDEN_PORTABLE") {
         return executable_dir();
     }
-
+    if let Some(dir) = probe_portable_from_exe() {
+        return Ok(dir);
+    }
     platform_config_dir()
+}
+
+/// Probe `<exe>/config.toml` for an opt-in portable configuration.
+///
+/// Returns `Some(dir)` only when the file exists, parses successfully, and has
+/// `[storage] portable = true`. Returns `None` otherwise; parse/read errors are
+/// reported via `eprintln!` because tracing is not yet initialised this early in
+/// startup.
+fn probe_portable_from_exe() -> Option<PathBuf> {
+    let exe = executable_dir().ok()?;
+    let probe = exe.join("config.toml");
+    if !probe.exists() {
+        return None;
+    }
+    let content = match std::fs::read_to_string(&probe) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                path = %probe.display(),
+                error = %e,
+                "Failed to read config.toml for portable probe"
+            );
+            return None;
+        }
+    };
+    let cfg: Config = match toml::from_str(&content) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(
+                path = %probe.display(),
+                error = %e,
+                "Failed to parse config.toml for portable probe"
+            );
+            return None;
+        }
+    };
+    if !cfg.storage.portable {
+        return None;
+    }
+    if let Some(dir) = cfg
+        .storage
+        .portable_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(PathBuf::from(dir));
+    }
+    Some(exe)
 }
 
 pub fn config_path() -> anyhow::Result<PathBuf> {
