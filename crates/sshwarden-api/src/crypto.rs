@@ -330,6 +330,7 @@ pub fn pin_decrypt(enc_string: &str, pin: &str) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -520,6 +520,7 @@ fn read_varint(data: &[u8]) -> Option<(usize, usize)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

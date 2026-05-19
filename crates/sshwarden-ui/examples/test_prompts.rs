@@ -1,6 +1,7 @@
-/// Quick test for Windows TaskDialog authorization and Windows Hello unlock prompts.
-///
-/// Run with: cargo run -p sshwarden-ui --example test_prompts
+#![allow(clippy::print_stdout)]
+//! Quick test for Windows TaskDialog authorization and Windows Hello unlock prompts.
+//!
+//! Run with: cargo run -p sshwarden-ui --example test_prompts
 
 #[tokio::main]
 async fn main() {
