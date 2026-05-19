@@ -231,9 +231,11 @@ enum Commands {
 type UIRequestTx = Arc<tokio::sync::mpsc::Sender<sshwarden_ui::UIRequest>>;
 
 /// Internal events emitted by spawned SSH request handlers back to the main loop.
+#[allow(clippy::enum_variant_names)]
 enum RuntimeEvent {
     AutoUnlockedWindowsHello,
     AutoUnlockedPin { pin: String },
+    AutoUnlockedNative,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1293,6 +1295,7 @@ fn public_key_openssh_from_pem(pem: &str) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("Failed to encode public key: {e}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_envelope_local_key_cache(
     keys: &[(String, String, String)],
     email: &str,
@@ -1305,7 +1308,7 @@ fn build_envelope_local_key_cache(
 ) -> anyhow::Result<sshwarden_config::cache::LocalKeyCacheFile> {
     let keys_json = serde_json::to_string(keys).context("Failed to serialize cache payload")?;
     let encrypted_payload =
-        sshwarden_api::crypto::encrypt_enc_string(keys_json.as_bytes(), &local_cache_key)?;
+        sshwarden_api::crypto::encrypt_enc_string(keys_json.as_bytes(), local_cache_key)?;
     let cache = sshwarden_config::cache::LocalKeyCacheFile {
         version: 2,
         header: sshwarden_config::cache::LocalKeyCacheHeader {
@@ -1950,6 +1953,8 @@ async fn run_foreground(
                 let key_names_clone = key_names.clone();
                 let pin_encrypted_clone = pin_encrypted_keys.clone();
                 let vault_file_clone = vault_file_data.clone();
+                let local_key_cache_clone = local_key_cache_data.clone();
+                let local_cache_key_state_clone = local_cache_key_state.clone();
                 let runtime_event_tx_clone = runtime_event_tx.clone();
                 let authorization_memory_clone = authorization_memory.clone();
 
@@ -1965,6 +1970,8 @@ async fn run_foreground(
                         key_names_clone,
                         pin_encrypted_clone,
                         vault_file_clone,
+                        local_key_cache_clone,
+                        local_cache_key_state_clone,
                         prompt_behavior,
                         auto_unlock,
                         ui_tx_clone,
@@ -2011,6 +2018,27 @@ async fn run_foreground(
                             &notification_state,
                         )
                         .await;
+                        resolve_pending_sync(
+                            &pending_sync,
+                            &api_client,
+                            &cached_key_tuples,
+                            &public_key_identity_tuples,
+                            &local_key_cache_data,
+                            &local_cache_key_state,
+                            &authorization_memory,
+                            &key_material_fingerprints,
+                            &vault_locked,
+                            &mut agent,
+                            &key_names,
+                            &notification_state,
+                        )
+                        .await;
+                    }
+                    RuntimeEvent::AutoUnlockedNative => {
+                        // Native (Keychain / Secret Service / DPAPI) unlock cannot
+                        // currently restore an API session — SessionFile has no
+                        // native_encrypted_token slot — so we only resolve any
+                        // sync that was deferred while the vault was locked.
                         resolve_pending_sync(
                             &pending_sync,
                             &api_client,
@@ -3307,6 +3335,7 @@ async fn try_restore_api_session_hello(
 }
 
 /// Sync SSH keys from the Bitwarden API and reload into the agent.
+#[allow(clippy::too_many_arguments)]
 async fn do_sync(
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
     cached_key_tuples: &CachedKeyTuples,
@@ -3410,6 +3439,7 @@ async fn do_sync(
     Ok(count)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_pending_sync(
     pending_sync: &Arc<std::sync::atomic::AtomicBool>,
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
@@ -3685,6 +3715,67 @@ async fn finish_unlock_with_json(
     sshwarden_agent::ControlResponse::ok(success_msg)
 }
 
+/// Resolve the human-friendly key name for an SSH UI request, given the
+/// freshly-decrypted key list. Falls back to "Unknown key" when no `cipher_id`
+/// match is found.
+fn key_name_for_request(
+    request: &sshwarden_agent::SshAgentUIRequest,
+    keys: &[(String, String, String)],
+) -> String {
+    request
+        .cipher_id
+        .as_ref()
+        .and_then(|cid| keys.iter().find(|(_, _, id)| id == cid))
+        .map(|(_, name, _)| name.clone())
+        .unwrap_or_else(|| "Unknown key".to_string())
+}
+
+/// Apply freshly-decrypted keys to the shared state (key_names map + cached tuples).
+/// Does **not** touch the in-memory agent — that is the caller's responsibility.
+async fn apply_decrypted_keys_state(
+    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+    cached_key_tuples: &CachedKeyTuples,
+    keys: &[(String, String, String)],
+) {
+    {
+        let mut names = key_names.write().await;
+        names.clear();
+        for (_, name, cipher_id) in keys {
+            names.insert(cipher_id.clone(), name.clone());
+        }
+    }
+    cached_key_tuples.write().await.set(keys.to_vec());
+}
+
+/// Run the authorization prompt if required by the request and configured
+/// prompt behaviour. Agent forwarding always forces a prompt regardless of
+/// the global setting.
+async fn run_authorization_prompt(
+    request: &sshwarden_agent::SshAgentUIRequest,
+    key_name: String,
+    prompt_behavior: sshwarden_config::PromptBehavior,
+    ui_request_tx: &UIRequestTx,
+) -> bool {
+    let needs_prompt = request.is_forwarding
+        || match prompt_behavior {
+            sshwarden_config::PromptBehavior::Always => true,
+            sshwarden_config::PromptBehavior::Never => false,
+            sshwarden_config::PromptBehavior::RememberUntilLock => true,
+        };
+    if !needs_prompt {
+        return true;
+    }
+    let sign_info = sshwarden_ui::SignRequestInfo {
+        key_name,
+        process_name: request.process_name.clone(),
+        namespace: request.namespace.clone(),
+        operation_kind: operation_kind_for_request(request).to_string(),
+        is_forwarding: request.is_forwarding,
+    };
+    sshwarden_ui::notify::request_authorization(ui_request_tx, &sign_info).await
+        == sshwarden_ui::AuthorizationResult::Approved
+}
+
 /// Handle a single UI request from the SSH agent (runs in a spawned task).
 #[allow(clippy::too_many_arguments)]
 #[allow(unused_variables)]
@@ -3697,6 +3788,8 @@ async fn handle_ui_request(
     key_names: Arc<RwLock<std::collections::HashMap<String, String>>>,
     pin_encrypted_keys: Arc<RwLock<Option<String>>>,
     vault_file_data: Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
+    local_key_cache_data: Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    local_cache_key_state: LocalCacheKeyHandle,
     prompt_behavior: sshwarden_config::PromptBehavior,
     auto_unlock: bool,
     ui_request_tx: UIRequestTx,
@@ -3729,11 +3822,113 @@ async fn handle_ui_request(
             "Vault is locked, attempting auto-unlock"
         );
 
-        let unlocked = false;
+        // 1. Native envelope unlock (platform Keychain / Secret Service / DPAPI).
+        //    No UI prompt; if the slot is present and unlock succeeds, use it.
+        {
+            let cache_opt = local_key_cache_data.read().await.clone();
+            if let Some(cache) = cache_opt
+                .filter(|c| c.local_cache_key.native_encrypted.is_some())
+            {
+                let cache_for_unlock = cache.clone();
+                let native_result = tokio::task::spawn_blocking(move || {
+                    decrypt_envelope_local_key_cache_with_native(&cache_for_unlock)
+                })
+                .await;
+                match native_result {
+                    Ok(Ok((keys_json, lck))) => {
+                        if let Ok(keys) = serde_json::from_str::<Vec<(String, String, String)>>(
+                            &keys_json,
+                        ) {
+                            let key_name = key_name_for_request(&request, &keys);
+                            apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
+                            let mut agent_for_unlock = agent.clone();
+                            if agent_for_unlock.set_keys(keys).is_ok() {
+                                local_cache_key_state.write().await.set(lck);
+                                vault_locked
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                                info!("Auto-unlocked via native local key cache");
+                                let _ = runtime_event_tx
+                                    .send(RuntimeEvent::AutoUnlockedNative)
+                                    .await;
+                                let approved = run_authorization_prompt(
+                                    &request,
+                                    key_name,
+                                    prompt_behavior,
+                                    &ui_request_tx,
+                                )
+                                .await;
+                                let _ = response_tx.send((request.request_id, approved));
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        info!(
+                            "Native local key cache auto-unlock failed: {}; trying next method",
+                            e
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Native unlock task join failed: {}", e);
+                    }
+                }
+            }
+        }
 
-        // 1. Try Hello sign-path first (if challenge exists)
+        // 2. Windows Hello envelope (preferred) → legacy vault.enc Hello sign-path.
         #[cfg(windows)]
-        if !unlocked {
+        {
+            // 2a. Envelope-based Hello unlock from local-key-cache.json.
+            let cache_opt = local_key_cache_data.read().await.clone();
+            if let Some(cache) = cache_opt
+                .filter(|c| c.local_cache_key.hello_encrypted.is_some())
+            {
+                let cache_for_unlock = cache.clone();
+                let hello_result = tokio::task::spawn_blocking(move || {
+                    decrypt_envelope_local_key_cache_with_hello(&cache_for_unlock)
+                })
+                .await;
+                match hello_result {
+                    Ok(Ok((keys_json, lck))) => {
+                        if let Ok(keys) = serde_json::from_str::<Vec<(String, String, String)>>(
+                            &keys_json,
+                        ) {
+                            let key_name = key_name_for_request(&request, &keys);
+                            apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
+                            let mut agent_for_unlock = agent.clone();
+                            if agent_for_unlock.set_keys(keys).is_ok() {
+                                local_cache_key_state.write().await.set(lck);
+                                vault_locked
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                                info!("Auto-unlocked via Windows Hello envelope");
+                                let _ = runtime_event_tx
+                                    .send(RuntimeEvent::AutoUnlockedWindowsHello)
+                                    .await;
+                                let approved = run_authorization_prompt(
+                                    &request,
+                                    key_name,
+                                    prompt_behavior,
+                                    &ui_request_tx,
+                                )
+                                .await;
+                                let _ = response_tx.send((request.request_id, approved));
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        info!(
+                            "Hello envelope auto-unlock failed: {}; trying legacy sign-path",
+                            e
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Hello envelope task join failed: {}", e);
+                    }
+                }
+            }
+
+            // 2b. Legacy Hello sign-path from vault.enc (backward compatibility).
             let hello_info = {
                 let vf = vault_file_data.read().await;
                 vf.as_ref().and_then(|v| {
@@ -3750,174 +3945,150 @@ async fn handle_ui_request(
                     if challenge_bytes.len() == 16 {
                         let mut challenge = [0u8; 16];
                         challenge.copy_from_slice(&challenge_bytes);
-
-                        // spawn_blocking: Hello unlock only
                         let hello_result = tokio::task::spawn_blocking(move || {
                             try_hello_unlock(&challenge, &hello_encrypted)
                         })
                         .await;
-
                         if let Ok(Ok(keys_json)) = hello_result {
-                            let keys: Result<Vec<(String, String, String)>, _> =
-                                serde_json::from_str(&keys_json);
-                            if let Ok(keys) = keys {
-                                // Extract key name for the authorization prompt
-                                let key_name = request
-                                    .cipher_id
-                                    .as_ref()
-                                    .and_then(|cid| keys.iter().find(|(_, _, id)| id == cid))
-                                    .map(|(_, name, _)| name.clone())
-                                    .unwrap_or_else(|| "Unknown key".to_string());
-
-                                // Update state after successful unlock
-                                {
-                                    let mut names = key_names.write().await;
-                                    names.clear();
-                                    for (_, name, cipher_id) in &keys {
-                                        names.insert(cipher_id.clone(), name.clone());
-                                    }
-                                }
-                                cached_key_tuples.write().await.set(keys.clone());
+                            if let Ok(keys) =
+                                serde_json::from_str::<Vec<(String, String, String)>>(&keys_json)
+                            {
+                                let key_name = key_name_for_request(&request, &keys);
+                                apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys)
+                                    .await;
                                 let mut agent_for_unlock = agent.clone();
                                 if agent_for_unlock.set_keys(keys).is_ok() {
-                                    vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
-                                    info!("Auto-unlocked via Windows Hello sign-path");
+                                    vault_locked
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    info!("Auto-unlocked via Windows Hello sign-path (legacy)");
                                     let _ = runtime_event_tx
                                         .send(RuntimeEvent::AutoUnlockedWindowsHello)
                                         .await;
-                                }
-
-                                // Authorization via Slint dialog (async). Agent forwarding
-                                // always requires explicit approval, regardless of prompt_behavior.
-                                let needs_prompt = request.is_forwarding
-                                    || match prompt_behavior {
-                                        sshwarden_config::PromptBehavior::Always => true,
-                                        sshwarden_config::PromptBehavior::Never => false,
-                                        sshwarden_config::PromptBehavior::RememberUntilLock => true,
-                                    };
-                                let approved = if needs_prompt {
-                                    let sign_info = sshwarden_ui::SignRequestInfo {
+                                    let approved = run_authorization_prompt(
+                                        &request,
                                         key_name,
-                                        process_name: request.process_name.clone(),
-                                        namespace: request.namespace.clone(),
-                                        operation_kind: operation_kind_for_request(&request)
-                                            .to_string(),
-                                        is_forwarding: request.is_forwarding,
-                                    };
-                                    sshwarden_ui::notify::request_authorization(
+                                        prompt_behavior,
                                         &ui_request_tx,
-                                        &sign_info,
                                     )
-                                    .await
-                                        == sshwarden_ui::AuthorizationResult::Approved
-                                } else {
-                                    true
-                                };
-                                let _ = response_tx.send((request.request_id, approved));
-                                return;
+                                    .await;
+                                    let _ =
+                                        response_tx.send((request.request_id, approved));
+                                    return;
+                                }
                             }
                         } else {
-                            info!("Hello sign-path auto-unlock failed, trying PIN dialog fallback");
+                            info!(
+                                "Hello sign-path auto-unlock failed, trying PIN dialog fallback"
+                            );
                         }
                     }
                 }
             }
         }
 
-        // 2. Fall back to PIN dialog
-        if !unlocked {
-            info!("Hello sign-path auto-unlock failed, trying PIN dialog fallback");
-            let enc_data = get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await;
+        // 3. PIN dialog: envelope-first validator with legacy fallback.
+        //    The validator runs synchronously inside the dialog and captures the
+        //    decrypted payload (and SymmetricKey, for envelope) into shared cells.
+        let envelope_cache = {
+            let guard = local_key_cache_data.read().await;
+            guard
+                .as_ref()
+                .filter(|c| c.local_cache_key.pin_encrypted.is_some())
+                .cloned()
+        };
 
-            if let Some(enc_data) = enc_data {
-                let (validator, decrypted_cache) = make_pin_validator(enc_data);
-                let context_key_name = {
-                    let names = key_names.read().await;
-                    request
-                        .cipher_id
-                        .as_ref()
-                        .and_then(|cid| names.get(cid))
-                        .cloned()
-                        .unwrap_or_else(|| "Unknown key".to_string())
-                };
-                let pin_result = sshwarden_ui::unlock::request_pin_dialog_with_context(
-                    &ui_request_tx,
-                    validator,
-                    Some(unlock_context_for_request(&request, context_key_name)),
-                )
-                .await;
-
-                if let Some(pin) = pin_result {
-                    let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
-                    let keys: Result<Vec<(String, String, String)>, _> =
-                        serde_json::from_str(&keys_json);
-                    if let Ok(keys) = keys {
-                        // Update state
-                        {
-                            let mut names = key_names.write().await;
-                            names.clear();
-                            for (_, name, cid) in &keys {
-                                names.insert(cid.clone(), name.clone());
-                            }
+        let (validator, decrypted_cache, lck_holder): (PinValidator, DecryptedCache, _) =
+            if let Some(cache) = envelope_cache {
+                let dc: DecryptedCache = Arc::new(std::sync::Mutex::new(None));
+                let kh: Arc<std::sync::Mutex<Option<sshwarden_api::crypto::SymmetricKey>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let dc_inner = dc.clone();
+                let kh_inner = kh.clone();
+                let v: PinValidator = Arc::new(move |pin: &str| -> bool {
+                    match decrypt_envelope_local_key_cache_with_pin(&cache, pin) {
+                        Ok((keys_json, lck)) => {
+                            *dc_inner.lock().unwrap() = Some(keys_json);
+                            *kh_inner.lock().unwrap() = Some(lck);
+                            true
                         }
-                        cached_key_tuples.write().await.set(keys.clone());
+                        Err(_) => false,
+                    }
+                });
+                (v, dc, Some(kh))
+            } else if let Some(enc_data) =
+                get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await
+            {
+                let (v, dc) = make_pin_validator(enc_data);
+                (v, dc, None)
+            } else {
+                // No PIN credentials of any kind — bail out.
+                info!(
+                    request_id = request.request_id,
+                    "Auto-unlock failed: no PIN credentials available"
+                );
+                let _ = response_tx.send((request.request_id, false));
+                return;
+            };
 
-                        // Get key name for authorization prompt
-                        let key_name = request
-                            .cipher_id
-                            .as_ref()
-                            .and_then(|cid| keys.iter().find(|(_, _, id)| id == cid))
-                            .map(|(_, name, _)| name.clone())
-                            .unwrap_or_else(|| "Unknown key".to_string());
+        let context_key_name = {
+            let names = key_names.read().await;
+            request
+                .cipher_id
+                .as_ref()
+                .and_then(|cid| names.get(cid))
+                .cloned()
+                .unwrap_or_else(|| "Unknown key".to_string())
+        };
+        let pin_result = sshwarden_ui::unlock::request_pin_dialog_with_context(
+            &ui_request_tx,
+            validator,
+            Some(unlock_context_for_request(&request, context_key_name)),
+        )
+        .await;
 
-                        let mut agent_for_unlock = agent.clone();
-                        if agent_for_unlock.set_keys(keys).is_ok() {
-                            vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
-                            info!("Auto-unlocked via PIN dialog");
-                            let _ = runtime_event_tx
-                                .send(RuntimeEvent::AutoUnlockedPin { pin })
-                                .await;
-
-                            // Check if we need authorization prompt. Agent forwarding always
-                            // requires explicit approval, regardless of prompt_behavior.
-                            let needs_prompt = request.is_forwarding
-                                || match prompt_behavior {
-                                    sshwarden_config::PromptBehavior::Always => true,
-                                    sshwarden_config::PromptBehavior::Never => false,
-                                    sshwarden_config::PromptBehavior::RememberUntilLock => true,
-                                };
-
-                            if needs_prompt {
-                                let sign_info = sshwarden_ui::SignRequestInfo {
-                                    key_name,
-                                    process_name: request.process_name.clone(),
-                                    namespace: request.namespace.clone(),
-                                    operation_kind: operation_kind_for_request(&request)
-                                        .to_string(),
-                                    is_forwarding: request.is_forwarding,
-                                };
-                                let approved = sshwarden_ui::notify::request_authorization(
-                                    &ui_request_tx,
-                                    &sign_info,
-                                )
-                                .await
-                                    == sshwarden_ui::AuthorizationResult::Approved;
-                                let _ = response_tx.send((request.request_id, approved));
-                                return;
-                            }
-                            // No prompt needed, approve directly
-                            let _ = response_tx.send((request.request_id, true));
-                            return;
+        if let Some(pin) = pin_result {
+            let keys_json = match decrypted_cache.lock().unwrap().take() {
+                Some(j) => j,
+                None => {
+                    tracing::warn!("PIN validator reported success but cache was empty");
+                    let _ = response_tx.send((request.request_id, false));
+                    return;
+                }
+            };
+            if let Ok(keys) =
+                serde_json::from_str::<Vec<(String, String, String)>>(&keys_json)
+            {
+                let key_name = key_name_for_request(&request, &keys);
+                apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
+                let mut agent_for_unlock = agent.clone();
+                if agent_for_unlock.set_keys(keys).is_ok() {
+                    if let Some(kh) = lck_holder {
+                        let maybe_lck = kh.lock().unwrap().take();
+                        if let Some(lck) = maybe_lck {
+                            local_cache_key_state.write().await.set(lck);
                         }
                     }
+                    vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
+                    info!("Auto-unlocked via PIN dialog");
+                    let _ = runtime_event_tx
+                        .send(RuntimeEvent::AutoUnlockedPin { pin })
+                        .await;
+                    let approved = run_authorization_prompt(
+                        &request,
+                        key_name,
+                        prompt_behavior,
+                        &ui_request_tx,
+                    )
+                    .await;
+                    let _ = response_tx.send((request.request_id, approved));
+                    return;
                 }
             }
         }
 
-        if !unlocked {
-            let _ = response_tx.send((request.request_id, false));
-            return;
-        }
+        // PIN cancelled or every path failed → deny the request.
+        let _ = response_tx.send((request.request_id, false));
+        return;
     }
 
     let operation_kind = operation_kind_for_request(&request).to_string();
