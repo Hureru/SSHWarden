@@ -2643,6 +2643,7 @@ async fn run_foreground(
             Some(event) = runtime_event_rx.recv() => {
                 match event {
                     RuntimeEvent::AutoUnlockedWindowsHello => {
+                        #[cfg(windows)]
                         try_restore_api_session_hello(
                             &api_client,
                             &config,

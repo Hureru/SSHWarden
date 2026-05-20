@@ -474,15 +474,3 @@ fn home_dir() -> anyhow::Result<PathBuf> {
         .map(PathBuf::from)
         .context("HOME environment variable not set")
 }
-
-#[cfg(not(windows))]
-fn user_runtime_suffix() -> String {
-    std::env::var("UID")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "unknown".to_string())
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
-        .collect()
-}
