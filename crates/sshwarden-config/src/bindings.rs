@@ -72,13 +72,24 @@ impl HostBindingsFile {
         std::fs::write(&tmp, content)
             .with_context(|| format!("Failed to write bindings tmp file: {}", tmp.display()))?;
         // Best-effort atomic replace: on Windows `rename` over an existing file
-        // can fail, so fall back to remove+rename.
+        // can fail, so fall back to a rollback-safe backup+promote flow.
         if let Err(e) = std::fs::rename(&tmp, &path) {
             if path.exists() {
-                let _ = std::fs::remove_file(&path);
-                std::fs::rename(&tmp, &path).with_context(|| {
-                    format!("Failed to replace bindings file: {}", path.display())
+                let backup = path.with_extension("json.bak");
+                let _ = std::fs::remove_file(&backup);
+                std::fs::rename(&path, &backup).with_context(|| {
+                    format!(
+                        "Failed to move existing bindings file to backup after rename error: {e}"
+                    )
                 })?;
+                if let Err(promote_err) = std::fs::rename(&tmp, &path) {
+                    let _ = std::fs::rename(&backup, &path);
+                    return Err(anyhow::Error::from(promote_err).context(format!(
+                        "Failed to replace bindings file: {}",
+                        path.display()
+                    )));
+                }
+                let _ = std::fs::remove_file(&backup);
             } else {
                 return Err(anyhow::Error::from(e).context(format!(
                     "Failed to rename bindings tmp file: {}",
@@ -106,7 +117,10 @@ impl HostBindingsFile {
         let mut deduped: Vec<String> = Vec::with_capacity(hosts.len());
         for h in hosts {
             let trimmed = h.trim().to_string();
-            if !deduped.iter().any(|existing| existing.eq_ignore_ascii_case(&trimmed)) {
+            if !deduped
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&trimmed))
+            {
                 deduped.push(trimmed);
             }
         }
@@ -141,8 +155,9 @@ impl HostBindingsFile {
         let Some(entry) = self.bindings.get_mut(cipher_uuid) else {
             return false;
         };
+        let lookup = host.trim();
         let before = entry.hosts.len();
-        entry.hosts.retain(|h| !h.eq_ignore_ascii_case(host));
+        entry.hosts.retain(|h| !h.eq_ignore_ascii_case(lookup));
         let removed = entry.hosts.len() != before;
         if entry.hosts.is_empty() {
             self.bindings.remove(cipher_uuid);
@@ -191,8 +206,13 @@ pub fn validate_host_pattern(pattern: &str) -> anyhow::Result<()> {
     if trimmed.chars().any(|c| c.is_control()) {
         anyhow::bail!("Host pattern must not contain control characters: {pattern:?}");
     }
-    if trimmed.chars().any(|c| matches!(c, '"' | '\'' | '\\' | '#')) {
-        anyhow::bail!("Host pattern contains a character that is unsafe in ssh_config: {pattern:?}");
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, '"' | '\'' | '\\' | '#'))
+    {
+        anyhow::bail!(
+            "Host pattern contains a character that is unsafe in ssh_config: {pattern:?}"
+        );
     }
     Ok(())
 }
@@ -241,7 +261,11 @@ mod tests {
         let mut file = HostBindingsFile::default();
         file.set_hosts(
             "id-1",
-            vec!["GitHub.com".into(), "github.com".into(), "  github.com  ".into()],
+            vec![
+                "GitHub.com".into(),
+                "github.com".into(),
+                "  github.com  ".into(),
+            ],
         )
         .unwrap();
         let entry = file.bindings.get("id-1").unwrap();
@@ -266,7 +290,7 @@ mod tests {
         file.add_host("id-1", "*.example.com").unwrap();
         assert_eq!(file.bindings.get("id-1").unwrap().hosts.len(), 2);
 
-        assert!(file.remove_host("id-1", "GITHUB.COM"));
+        assert!(file.remove_host("id-1", " GITHUB.COM "));
         assert_eq!(file.bindings.get("id-1").unwrap().hosts.len(), 1);
 
         assert!(file.remove_host("id-1", "*.example.com"));

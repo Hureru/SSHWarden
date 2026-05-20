@@ -28,8 +28,8 @@ SSHWarden 的目标不是复刻完整 Bitwarden Desktop，而是提供一个专�
 | 标准平台存储目录 | 待实现；当前代码仍使用 exe 同目录 |
 | 自启动 | Windows 已实现；macOS/Linux 待实现 |
 | Shell integration | 待实现 `sshwarden env` |
-| macOS native unlock | 设计已确认，待实现 |
-| Linux native unlock | 设计已确认，待实现 |
+| macOS native unlock | 已实现（Phase 6，Keychain；仍需平台实机验证） |
+| Linux native unlock | 已实现（Phase 6，Secret Service；仍需平台实机验证） |
 
 设计权威记录见：
 
@@ -138,19 +138,25 @@ sshwarden keys
 sshwarden sync
 ```
 
-### 生成 SSH key selector / SSH config snippet
+### 绑定 Host / 避免 MaxAuthTries
 
-当 Bitwarden 里有多把 SSH Key 时，OpenSSH 可能会因为 `MaxAuthTries` 在尝试完所有 agent key 前断开连接。SSHWarden 支持生成公开 `.pub` selector 文件，并配合 `IdentitiesOnly yes` 限定每个 Host 使用指定 key：
+当 Bitwarden 里有多把 SSH Key 时，OpenSSH 可能会因为 `MaxAuthTries` 在尝试完所有 agent key 前断开连接。SSHWarden 支持把 vault key 绑定到 SSH Host，并生成公开 `.pub` selector 文件与托管 SSH config：
 
 ```bash
-# 打印建议的 Host snippet，同时刷新 selector .pub 文件
-sshwarden ssh-config
+# 一次性安装 ~/.ssh/config 的 SSHWarden Include
+sshwarden ssh-config install
 
-# 写入托管 include 文件并确保 ~/.ssh/config Include 它
-sshwarden ssh-config --write
+# 将 key 绑定到 host，可使用 key 名称或 vault item id
+sshwarden bindings add github-key github.com
+
+# 查看当前状态和生成的配置
+sshwarden ssh-config status
+sshwarden ssh-config show
 ```
 
-selector 文件只包含公钥，默认位于 SSHWarden 配置目录的 `keys/` 子目录。
+也可以通过签名请求里的 **Bind & Approve...** 图形流程完成绑定。详见 [`docs/host-bindings.md`](docs/host-bindings.md)。
+
+兼容旧流程：`sshwarden ssh-config` 仍可打印建议 snippet，`sshwarden ssh-config --write` 仍可写入托管文件。
 
 ### 锁定 / 解锁
 

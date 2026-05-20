@@ -916,14 +916,20 @@ async fn cmd_doctor(
                 ));
             }
 
-            let include_line = format!("Include {}", include_path.display());
             let has_include = std::fs::read_to_string(&config_path)
-                .map(|content| content.lines().any(|line| line.trim() == include_line))
+                .map(|content| {
+                    content.lines().any(|line| {
+                        sshwarden_config::ssh_config::line_matches_sshwarden_include(
+                            line,
+                            &include_path,
+                        )
+                    })
+                })
                 .unwrap_or(false);
 
             if fix && !has_include {
                 if let Some(parent) = include_path.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
+                    if let Err(e) = create_private_dir(parent) {
                         checks.push(DoctorCheck::warn(
                             "doctor.fix.ssh_config_dir",
                             format!(
@@ -935,7 +941,7 @@ async fn cmd_doctor(
                 }
                 if !include_path.exists() {
                     let managed = "# SSHWarden managed key selector snippets\n# Run `sshwarden ssh-config` to print Host-specific examples.\n";
-                    match std::fs::write(&include_path, managed) {
+                    match write_private_file(&include_path, managed) {
                         Ok(()) => checks.push(DoctorCheck::ok(
                             "doctor.fix.include_file",
                             format!(
@@ -968,7 +974,14 @@ async fn cmd_doctor(
             }
 
             let has_include = std::fs::read_to_string(&config_path)
-                .map(|content| content.lines().any(|line| line.trim() == include_line))
+                .map(|content| {
+                    content.lines().any(|line| {
+                        sshwarden_config::ssh_config::line_matches_sshwarden_include(
+                            line,
+                            &include_path,
+                        )
+                    })
+                })
                 .unwrap_or(false);
             if has_include {
                 checks.push(DoctorCheck::ok(
@@ -1128,10 +1141,12 @@ const SSH_VALUE_TAKING_FLAGS: &str = "BbcDEeFIiJLlmOopQRSWw";
 /// positional target can't be confidently located.
 fn infer_ssh_target_from_pid(pid: u32) -> Option<String> {
     if pid == 0 {
+        tracing::debug!("Unable to infer SSH target: peer pid is zero");
         return None;
     }
     let argv = sshwarden_agent::peerinfo::gather::get_peer_cmd(pid)?;
     if argv.is_empty() {
+        tracing::debug!(pid, "Unable to infer SSH target: peer argv is empty");
         return None;
     }
     let basename = std::path::Path::new(&argv[0])
@@ -1143,6 +1158,7 @@ fn infer_ssh_target_from_pid(pid: u32) -> Option<String> {
         basename,
         "ssh" | "scp" | "sftp" | "ssh-keyscan" | "ssh-copy-id"
     ) {
+        tracing::debug!(pid, process = %basename, "Unable to infer SSH target: peer is not a recognized SSH client");
         return None;
     }
 
@@ -1174,6 +1190,7 @@ fn infer_ssh_target_from_pid(pid: u32) -> Option<String> {
         }
         return Some(parse_ssh_target(arg));
     }
+    tracing::debug!(pid, process = %basename, "Unable to infer SSH target: no positional target found");
     None
 }
 
@@ -1291,7 +1308,10 @@ fn ssh_config_snippet_for_keys(keys: &[sshwarden_api::DecryptedSshKey]) -> anyho
         let path = selector_path_for_key(&key.name, &key.cipher_id)?;
         lines.push(format!("# {} ({})", key.name, key.cipher_id));
         lines.push("Host <host>".to_string());
-        lines.push(format!("    IdentityFile {}", path.display()));
+        lines.push(format!(
+            "    IdentityFile {}",
+            sshwarden_config::ssh_config::path_arg(&path)
+        ));
         lines.push("    IdentitiesOnly yes".to_string());
         lines.push("".to_string());
     }
@@ -1323,9 +1343,7 @@ impl ManagedKey {
             .collect()
     }
 
-    fn from_cache_header(
-        keys: &[sshwarden_config::cache::KeyIdentity],
-    ) -> Vec<Self> {
+    fn from_cache_header(keys: &[sshwarden_config::cache::KeyIdentity]) -> Vec<Self> {
         keys.iter()
             .map(|k| Self {
                 name: k.name.clone(),
@@ -1363,7 +1381,10 @@ fn ssh_config_snippet_with_bindings(
             .expect("bound_keys filtered for presence");
         lines.push(format!("# {} ({})", key.name, key.cipher_id));
         lines.push(format!("Host {}", binding.hosts.join(" ")));
-        lines.push(format!("    IdentityFile {}", path.display()));
+        lines.push(format!(
+            "    IdentityFile {}",
+            sshwarden_config::ssh_config::path_arg(&path)
+        ));
         lines.push("    IdentitiesOnly yes".to_string());
         lines.push(String::new());
     }
@@ -1375,7 +1396,10 @@ fn ssh_config_snippet_with_bindings(
             let path = selector_path_for_key(&key.name, &key.cipher_id)?;
             lines.push(format!("# {} ({})", key.name, key.cipher_id));
             lines.push("# Host <host>".to_string());
-            lines.push(format!("#     IdentityFile {}", path.display()));
+            lines.push(format!(
+                "#     IdentityFile {}",
+                sshwarden_config::ssh_config::path_arg(&path)
+            ));
             lines.push("#     IdentitiesOnly yes".to_string());
             lines.push(String::new());
         }
@@ -1420,15 +1444,7 @@ fn sync_managed_ssh_config_inner(keys: &[ManagedKey], force_write: bool) -> anyh
     }
 
     let snippet = ssh_config_snippet_with_bindings(keys, &bindings)?;
-    if let Some(parent) = include_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create SSH config directory: {}",
-                parent.display()
-            )
-        })?;
-    }
-    std::fs::write(&include_path, snippet).with_context(|| {
+    write_private_file(&include_path, snippet).with_context(|| {
         format!(
             "Failed to write managed SSHWarden SSH config: {}",
             include_path.display()
@@ -1453,12 +1469,27 @@ fn user_ssh_config_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home.join(".ssh").join("config"))
 }
 
+fn create_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)?;
+    sshwarden_config::ssh_config::ensure_ssh_dir_permissions(path)?;
+    Ok(())
+}
+
+fn write_private_file(path: &std::path::Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+    std::fs::write(path, content)?;
+    sshwarden_config::ssh_config::ensure_private_file_permissions(path)?;
+    Ok(())
+}
+
 fn write_sshwarden_include_line(
     config_path: &std::path::Path,
     include_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
+        create_private_dir(parent).with_context(|| {
             format!(
                 "Failed to create SSH config directory: {}",
                 parent.display()
@@ -1466,9 +1497,11 @@ fn write_sshwarden_include_line(
         })?;
     }
 
-    let include_line = format!("Include {}", include_path.display());
+    let include_line = sshwarden_config::ssh_config::include_line(include_path);
     let existing = std::fs::read_to_string(config_path).unwrap_or_default();
-    if !existing.lines().any(|line| line.trim() == include_line) {
+    if !existing.lines().any(|line| {
+        sshwarden_config::ssh_config::line_matches_sshwarden_include(line, include_path)
+    }) {
         let mut new_config = existing;
         if !new_config.is_empty() && !new_config.ends_with('\n') {
             new_config.push('\n');
@@ -1476,7 +1509,7 @@ fn write_sshwarden_include_line(
         new_config.push_str("\n# SSHWarden managed key selector snippets\n");
         new_config.push_str(&include_line);
         new_config.push('\n');
-        std::fs::write(config_path, new_config)
+        write_private_file(config_path, &new_config)
             .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
     }
 
@@ -1494,8 +1527,7 @@ fn remove_sshwarden_include_line(
     }
     let existing = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read SSH config: {}", config_path.display()))?;
-    let include_line = format!("Include {}", include_path.display());
-    const MARKER: &str = "# SSHWarden managed key selector snippets";
+    const MARKER: &str = sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER;
 
     let mut kept: Vec<&str> = Vec::with_capacity(existing.lines().count());
     let mut removed_any = false;
@@ -1508,7 +1540,7 @@ fn remove_sshwarden_include_line(
             kept.push(line);
             continue;
         }
-        if trimmed == include_line {
+        if sshwarden_config::ssh_config::line_matches_sshwarden_include(trimmed, include_path) {
             // Drop the include line and retroactively drop the marker if it was the previous kept entry.
             if skip_marker_for_next_include {
                 while let Some(last) = kept.last() {
@@ -1540,22 +1572,14 @@ fn remove_sshwarden_include_line(
     if !new_config.is_empty() && !new_config.ends_with('\n') {
         new_config.push('\n');
     }
-    std::fs::write(config_path, new_config)
+    write_private_file(config_path, &new_config)
         .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
     Ok(true)
 }
 
 fn write_managed_ssh_config(snippet: &str) -> anyhow::Result<()> {
     let include_path = managed_sshwarden_include_path()?;
-    if let Some(parent) = include_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create SSH config directory: {}",
-                parent.display()
-            )
-        })?;
-    }
-    std::fs::write(&include_path, snippet).with_context(|| {
+    write_private_file(&include_path, snippet).with_context(|| {
         format!(
             "Failed to write managed SSHWarden SSH config: {}",
             include_path.display()
@@ -2067,13 +2091,22 @@ async fn cmd_bindings_add(key: &str, hosts: &[String]) -> anyhow::Result<()> {
     let cipher_id = resolve_cipher_id(key)?;
     let mut bindings = sshwarden_config::bindings::HostBindingsFile::load()?;
     for host in hosts {
+        if is_catch_all_host_pattern(host) {
+            tracing::warn!(
+                "Binding a key to '{}' may cause SSH to offer this key for many hosts and can reintroduce MaxAuthTries failures.",
+                host
+            );
+        }
         bindings.add_host(&cipher_id, host)?;
     }
     bindings.save()?;
 
     let keys = load_managed_keys_from_cache().unwrap_or_default();
     if let Err(e) = sync_managed_ssh_config_inner(&keys, true) {
-        tracing::warn!("Bindings saved but managed snippet regeneration failed: {}", e);
+        tracing::warn!(
+            "Bindings saved but managed snippet regeneration failed: {}",
+            e
+        );
     }
 
     #[allow(clippy::print_stdout)]
@@ -2085,6 +2118,10 @@ async fn cmd_bindings_add(key: &str, hosts: &[String]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn is_catch_all_host_pattern(host: &str) -> bool {
+    matches!(host.trim(), "*" | "!*")
 }
 
 async fn cmd_bindings_remove(key: &str, host: Option<&str>, all: bool) -> anyhow::Result<()> {
@@ -2107,7 +2144,10 @@ async fn cmd_bindings_remove(key: &str, host: Option<&str>, all: bool) -> anyhow
 
     let keys = load_managed_keys_from_cache().unwrap_or_default();
     if let Err(e) = sync_managed_ssh_config_inner(&keys, true) {
-        tracing::warn!("Bindings saved but managed snippet regeneration failed: {}", e);
+        tracing::warn!(
+            "Bindings saved but managed snippet regeneration failed: {}",
+            e
+        );
     }
 
     #[allow(clippy::print_stdout)]
@@ -2166,16 +2206,22 @@ async fn cmd_sshcfg_status() -> anyhow::Result<()> {
     let bindings = sshwarden_config::bindings::HostBindingsFile::load().unwrap_or_default();
     let cache = sshwarden_config::cache::LocalKeyCacheFile::load()?;
 
-    let include_line = format!("Include {}", include_path.display());
     let user_config_has_include = std::fs::read_to_string(&config_path)
-        .map(|s| s.lines().any(|l| l.trim() == include_line))
+        .map(|s| {
+            s.lines().any(|l| {
+                sshwarden_config::ssh_config::line_matches_sshwarden_include(l, &include_path)
+            })
+        })
         .unwrap_or(false);
 
     let snippet_size = std::fs::metadata(&include_path).map(|m| m.len()).ok();
 
     #[allow(clippy::print_stdout)]
     {
-        println!("Bindings file:   {}", sshwarden_config::bindings::HostBindingsFile::path()?.display());
+        println!(
+            "Bindings file:   {}",
+            sshwarden_config::bindings::HostBindingsFile::path()?.display()
+        );
         println!("Managed snippet: {}", include_path.display());
         if let Some(size) = snippet_size {
             println!("  → exists ({size} bytes)");
@@ -3716,19 +3762,21 @@ async fn handle_control_command(
                 )),
             }
         }
-        ControlAction::BindHostsDialog => match dispatch_standalone_bind_hosts_dialog(ui_request_tx).await {
-            Ok(saved) => {
-                if saved {
-                    sshwarden_agent::ControlResponse::ok("Bindings updated")
-                } else {
-                    sshwarden_agent::ControlResponse::ok("Dialog cancelled")
+        ControlAction::BindHostsDialog => {
+            match dispatch_standalone_bind_hosts_dialog(ui_request_tx).await {
+                Ok(saved) => {
+                    if saved {
+                        sshwarden_agent::ControlResponse::ok("Bindings updated")
+                    } else {
+                        sshwarden_agent::ControlResponse::ok("Dialog cancelled")
+                    }
                 }
+                Err(e) => sshwarden_agent::ControlResponse::err(&format!(
+                    "Failed to open bind-hosts dialog: {}",
+                    e
+                )),
             }
-            Err(e) => sshwarden_agent::ControlResponse::err(&format!(
-                "Failed to open bind-hosts dialog: {}",
-                e
-            )),
-        },
+        }
     }
 }
 
@@ -4463,8 +4511,7 @@ async fn handle_ui_request(
         //    No UI prompt; if the slot is present and unlock succeeds, use it.
         {
             let cache_opt = local_key_cache_data.read().await.clone();
-            if let Some(cache) = cache_opt
-                .filter(|c| c.local_cache_key.native_encrypted.is_some())
+            if let Some(cache) = cache_opt.filter(|c| c.local_cache_key.native_encrypted.is_some())
             {
                 let cache_for_unlock = cache.clone();
                 let native_result = tokio::task::spawn_blocking(move || {
@@ -4473,16 +4520,15 @@ async fn handle_ui_request(
                 .await;
                 match native_result {
                     Ok(Ok((keys_json, lck))) => {
-                        if let Ok(keys) = serde_json::from_str::<Vec<(String, String, String)>>(
-                            &keys_json,
-                        ) {
+                        if let Ok(keys) =
+                            serde_json::from_str::<Vec<(String, String, String)>>(&keys_json)
+                        {
                             let key_name = key_name_for_request(&request, &keys);
                             apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
                             let mut agent_for_unlock = agent.clone();
                             if agent_for_unlock.set_keys(keys).is_ok() {
                                 local_cache_key_state.write().await.set(lck);
-                                vault_locked
-                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                                vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
                                 info!("Auto-unlocked via native local key cache");
                                 let _ = runtime_event_tx
                                     .send(RuntimeEvent::AutoUnlockedNative)
@@ -4517,9 +4563,7 @@ async fn handle_ui_request(
         {
             // 2a. Envelope-based Hello unlock from local-key-cache.json.
             let cache_opt = local_key_cache_data.read().await.clone();
-            if let Some(cache) = cache_opt
-                .filter(|c| c.local_cache_key.hello_encrypted.is_some())
-            {
+            if let Some(cache) = cache_opt.filter(|c| c.local_cache_key.hello_encrypted.is_some()) {
                 let cache_for_unlock = cache.clone();
                 let hello_result = tokio::task::spawn_blocking(move || {
                     decrypt_envelope_local_key_cache_with_hello(&cache_for_unlock)
@@ -4527,16 +4571,15 @@ async fn handle_ui_request(
                 .await;
                 match hello_result {
                     Ok(Ok((keys_json, lck))) => {
-                        if let Ok(keys) = serde_json::from_str::<Vec<(String, String, String)>>(
-                            &keys_json,
-                        ) {
+                        if let Ok(keys) =
+                            serde_json::from_str::<Vec<(String, String, String)>>(&keys_json)
+                        {
                             let key_name = key_name_for_request(&request, &keys);
                             apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
                             let mut agent_for_unlock = agent.clone();
                             if agent_for_unlock.set_keys(keys).is_ok() {
                                 local_cache_key_state.write().await.set(lck);
-                                vault_locked
-                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                                vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
                                 info!("Auto-unlocked via Windows Hello envelope");
                                 let _ = runtime_event_tx
                                     .send(RuntimeEvent::AutoUnlockedWindowsHello)
@@ -4595,8 +4638,7 @@ async fn handle_ui_request(
                                     .await;
                                 let mut agent_for_unlock = agent.clone();
                                 if agent_for_unlock.set_keys(keys).is_ok() {
-                                    vault_locked
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
                                     info!("Auto-unlocked via Windows Hello sign-path (legacy)");
                                     let _ = runtime_event_tx
                                         .send(RuntimeEvent::AutoUnlockedWindowsHello)
@@ -4608,15 +4650,12 @@ async fn handle_ui_request(
                                         &ui_request_tx,
                                     )
                                     .await;
-                                    let _ =
-                                        response_tx.send((request.request_id, approved));
+                                    let _ = response_tx.send((request.request_id, approved));
                                     return;
                                 }
                             }
                         } else {
-                            info!(
-                                "Hello sign-path auto-unlock failed, trying PIN dialog fallback"
-                            );
+                            info!("Hello sign-path auto-unlock failed, trying PIN dialog fallback");
                         }
                     }
                 }
@@ -4692,9 +4731,7 @@ async fn handle_ui_request(
                     return;
                 }
             };
-            if let Ok(keys) =
-                serde_json::from_str::<Vec<(String, String, String)>>(&keys_json)
-            {
+            if let Ok(keys) = serde_json::from_str::<Vec<(String, String, String)>>(&keys_json) {
                 let key_name = key_name_for_request(&request, &keys);
                 apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
                 let mut agent_for_unlock = agent.clone();
@@ -4850,8 +4887,9 @@ async fn prompt_authorization_with_bind_flow(
 ) -> bool {
     match sshwarden_ui::notify::request_authorization(ui_request_tx, &sign_info).await {
         sshwarden_ui::AuthorizationResult::Approved => true,
-        sshwarden_ui::AuthorizationResult::Denied
-        | sshwarden_ui::AuthorizationResult::Timeout => false,
+        sshwarden_ui::AuthorizationResult::Denied | sshwarden_ui::AuthorizationResult::Timeout => {
+            false
+        }
         sshwarden_ui::AuthorizationResult::BindRequested => {
             run_bind_hosts_flow(ui_request_tx, pid, cipher_id).await
         }
@@ -4915,22 +4953,18 @@ async fn run_bind_hosts_flow(
         return false;
     }
 
-    let bind_result = match tokio::time::timeout(
-        std::time::Duration::from_secs(600),
-        response_rx,
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(_)) => {
-            tracing::error!("Bind dialog response channel closed unexpectedly");
-            return false;
-        }
-        Err(_) => {
-            tracing::warn!("Bind dialog timed out after 600s");
-            return false;
-        }
-    };
+    let bind_result =
+        match tokio::time::timeout(std::time::Duration::from_secs(600), response_rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => {
+                tracing::error!("Bind dialog response channel closed unexpectedly");
+                return false;
+            }
+            Err(_) => {
+                tracing::warn!("Bind dialog timed out after 600s");
+                return false;
+            }
+        };
 
     match bind_result {
         sshwarden_ui::BindHostsResult::Cancelled => false,
@@ -5468,8 +5502,17 @@ mod tests {
     fn skips_value_taking_flags_with_separate_value() {
         // -p 2222 -i ~/.ssh/id -l user host
         assert_eq!(
-            infer_from_argv(&["ssh", "-p", "2222", "-i", "/tmp/id", "-l", "user", "bastion.example.com"])
-                .as_deref(),
+            infer_from_argv(&[
+                "ssh",
+                "-p",
+                "2222",
+                "-i",
+                "/tmp/id",
+                "-l",
+                "user",
+                "bastion.example.com"
+            ])
+            .as_deref(),
             Some("bastion.example.com")
         );
     }

@@ -79,11 +79,14 @@ fn get_default_socket_path() -> Result<PathBuf, anyhow::Error> {
 
 fn set_user_permissions(path: &PathBuf) -> Result<(), anyhow::Error> {
     if let Some(parent) = path.parent() {
+        let parent_existed = parent.exists();
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Could not create socket directory {parent:?}"))?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| {
-            anyhow!("Could not set socket directory permissions for {parent:?}: {e}")
-        })?;
+        if !parent_existed {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                anyhow!("Could not set socket directory permissions for {parent:?}: {e}")
+            })?;
+        }
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|e| anyhow!("Could not set socket permissions for {path:?}: {e}"))

@@ -16,10 +16,7 @@ This roadmap tracks implementation work needed to align the codebase with the cu
   - accept both text and binary SignalR initial responses,
   - send SignalR MessagePack ping every 30 seconds and treat 90 seconds of inactivity as stale,
   - use reconnect-first fallback sync after notification failures instead of blind polling while WebSocket is healthy.
-- Address SSH authentication failures when many keys are loaded:
-  - document OpenSSH key-offer behavior and `MaxAuthTries`,
-  - add key selection workflow based on public-key selector files and SSH config snippets,
-  - implement a P0 command for writing public key selector files from current SSHWarden keys.
+- Address SSH authentication failures when many keys are loaded: completed through local host bindings, public Key Selector Files, and managed OpenSSH config. See `docs/host-bindings.md` and ADR 0023.
 
 ## P1 — Cross-platform baseline infrastructure
 

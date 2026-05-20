@@ -56,6 +56,14 @@ _Avoid_: duplicate key, stale key, private key copy
 A suggested SSH client configuration block that uses a key selector file to choose one SSHWarden key.
 _Avoid_: automatic agent filtering, private key export
 
+**Host Binding**:
+A local mapping from a **Vault Item Id** to one or more OpenSSH `Host` patterns, used to generate managed SSH client configuration.
+_Avoid_: Bitwarden vault metadata, server-side key policy, agent-side filtering
+
+**Managed SSH Config**:
+The SSHWarden-generated OpenSSH config file included from `~/.ssh/config` that contains Host Binding-derived `IdentityFile` and `IdentitiesOnly yes` rules.
+_Avoid_: exported private key, user-authored SSH config, Bitwarden-synced state
+
 **Startup Integration**:
 The user-facing setup that starts SSHWarden automatically in a supported platform's desktop login session.
 _Avoid_: shell integration, environment export, service daemon
@@ -223,6 +231,8 @@ _Avoid_: login method, authentication method
 - A **Key Selector File** lives under the user's SSHWarden configuration storage and helps an **SSH Client Application** choose a specific **Key Identity** and avoid trying every agent key.
 - A **Key Selector Alias** continues to select the same **Vault Item Id** after a key rename.
 - An **SSH Config Snippet** is printed by default and only written to SSH configuration when the user explicitly asks.
+- A **Host Binding** maps one **Vault Item Id** to OpenSSH host patterns on the local device.
+- **Managed SSH Config** is generated from **Host Bindings** and **Key Selector Files** so OpenSSH offers only the intended key for a host.
 - **Shell Integration** enables **Agent Takeover** for **SSH Client Applications** launched from that shell.
 - During **Agent Takeover**, an **SSH Client Application** sends requests to **SSHWarden** through an **Agent Endpoint** rather than to another local SSH agent.
 - A **Control Command** uses the **Control Channel**, not the SSH agent socket.

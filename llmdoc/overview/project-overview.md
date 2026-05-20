@@ -18,7 +18,7 @@ SSHWarden 是一个 Rust CLI 程序，以守护进程模式运行于 Windows Nam
 | Bitwarden API | `sshwarden-api` + reqwest + tokio-tungstenite + rmpv | Bitwarden 登录、sync、密钥解密、SignalR 实时通知（WebSocket + MessagePack）、token 刷新 |
 | Crypto | `sshwarden-api::crypto` + `zeroize` | AES-256-CBC+HMAC、Argon2id PIN 派生、敏感数据自动擦零（Zeroizing/ZeroizeOnDrop） |
 | UI / Unlock | `sshwarden-ui` + Slint + winit (via WinitWindowAccessor) | Windows Hello UV、Hello 签名路径、PIN 输入对话框（Slint 跨平台暗色窗口）、SSH 签名授权对话框（Slint 跨平台）、窗口居中+聚焦（slint_center_win + winit focus_window）、Credential Manager |
-| Config & Vault | `sshwarden-config` + TOML + JSON | 配置文件管理、vault.enc 持久化存储、session 文件（设备独立会话恢复）（全部在 exe 同目录） |
+| Config & Vault | `sshwarden-config` + TOML + JSON | 配置文件管理、Local Key Cache、session 文件（设备独立会话恢复）；当前以平台标准存储为默认，portable/exe-relative 为显式 opt-in |
 | IPC Control | `sshwarden-agent::control` | Named Pipe JSON 协议控制通道 |
 
 ## 4. Crate 结构
@@ -29,7 +29,7 @@ SSHWarden 是一个 Rust CLI 程序，以守护进程模式运行于 Windows Nam
 | `sshwarden-agent` | `crates/sshwarden-agent/` | SSH Agent 核心、IPC control server |
 | `sshwarden-api` | `crates/sshwarden-api/` | Bitwarden API 客户端、加解密（含 zeroize 自动擦零）、SignalR 通知客户端、token 刷新 |
 | `sshwarden-ui` | `crates/sshwarden-ui/` | SSH 签名授权对话框（Slint 跨平台）、Windows Hello 解锁（签名路径）、PIN 输入对话框（Slint 跨平台）、Credential Manager |
-| `sshwarden-config` | `crates/sshwarden-config/` | TOML 配置管理、vault.enc 持久化文件、session 文件（设备独立会话）、便携路径解析（exe 同目录） |
+| `sshwarden-config` | `crates/sshwarden-config/` | TOML 配置管理、Local Key Cache、session 文件（设备独立会话）、标准平台存储与 opt-in portable 路径解析 |
 
 ## 5. 实现阶段
 
@@ -44,7 +44,7 @@ SSHWarden 是一个 Rust CLI 程序，以守护进程模式运行于 Windows Nam
 
 ## 6. Key Design Decisions
 
-- **完全便携模式**: 所有数据文件（config.toml、vault.enc、session-{hostname}.enc、sshwarden.log、sshwarden.pid）都存放在 exe 同目录下，`config_dir()` 使用 `std::env::current_exe().parent()`，无需 `%APPDATA%` 或 `%LOCALAPPDATA%`。整个程序可随 exe 移动，无外部依赖路径。
+- **存储模型**: 当前权威模型是标准平台存储默认启用（Windows `%APPDATA%/SSHWarden`、Linux `$XDG_CONFIG_HOME/sshwarden` 或 `~/.config/sshwarden`、macOS `~/Library/Application Support/SSHWarden`），portable/exe-relative 存储仅在 `SSHWARDEN_PORTABLE=1` 或 `[storage] portable = true` 时启用。
 - **独立 CLI**: 不依赖 Electron/Node.js，纯 Rust 二进制文件，轻量运行。
 - **Toast 通知授权**: ~~使用 WinRT ToastNotification API 弹出系统通知，替代 GUI 窗口~~ 已替换为 Slint 跨平台授权对话框（Approve/Deny 按钮）。
 - **IPC 控制通道**: Named Pipe JSON 协议，允许 CLI 子命令与守护进程通信。
@@ -54,7 +54,7 @@ SSHWarden 是一个 Rust CLI 程序，以守护进程模式运行于 Windows Nam
 - **跨平台窗口居中+聚焦**: Slint 启用 `unstable-winit-030` feature，通过 `WinitWindowAccessor` 获取底层 winit 窗口，调用 `focus_window()` 确保对话框前置激活。居中使用 `slint_center_win` crate。两者均为跨平台实现，无 `#[cfg]` 条件编译。
 - **Windows Hello 签名路径 + Slint PIN 对话框降级**: KeyCredentialManager 签名路径作为主要自动解锁方式（持久化加密密钥，跨重启可用）。Hello 不可用或失败时，弹出 Slint 跨平台 PIN 对话框（暗色主题、always-on-top）作为降级方案。PIN 对话框采用 validator 注入模式：验证逻辑通过闭包注入对话框内部，在后台线程执行 Argon2id 验证；错误 PIN 时对话框保持打开（抖动+红色提示），成功时缓存解密结果并关闭。UV（UserConsentVerifier）路径已从自动解锁流程中移除。
 - **自动锁定**: 配置化的 `lock_timeout`（默认 3600 秒），60 秒检查间隔。
-- **启动文件夹自启动**: `daemon --install` 在用户启动文件夹创建快捷方式（而非 Task Scheduler），确保守护进程在交互式桌面会话中运行，支持 Toast 通知和 Windows Hello 等所有 UI 交互。
+- **启动文件夹自启动**: `daemon --install` 在用户启动文件夹创建快捷方式（而非 Task Scheduler），确保守护进程在交互式桌面会话中运行，支持 Slint 授权/解锁对话框和 Windows Hello 等 UI 交互。
 - **SignalR 实时推送通知**: 通过 WebSocket 连接 Bitwarden/Vaultwarden SignalR 通知服务（`wss://{notifications_url}/hub`），使用 MessagePack 编码 + VarInt 长度前缀。监听 `CipherChanged`（UpdateType 0/1/2/4/5/6 触发自动 sync）和 `LogOut`（Type 11 触发远程锁定）。指数退避重连（1s → 60s）。
 - **设备独立 Session 文件**: `session-{hostname}.enc` 存储 PIN/Hello 加密的 refresh_token 和持久化 device_id。PIN/Hello 解锁后可恢复 Bitwarden API 会话而无需主密码。hostname 隔离确保多设备通过 OneDrive 共享 exe 目录时互不干扰。
 - **Token 自动刷新**: 主循环每 30 分钟检查 access_token 是否距过期 <5 分钟，自动使用 refresh_token 刷新。登录时使用持久化 device_id（而非每次随机生成），确保 session 一致性。

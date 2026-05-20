@@ -64,7 +64,9 @@ pub enum BindHostsResult {
     /// User saved. The map contains the final desired state for each key the
     /// user touched: `cipher_id -> hosts`. An empty vec means clear that key.
     /// Keys not present in the map were not modified.
-    Saved { bindings: BTreeMap<String, Vec<String>> },
+    Saved {
+        bindings: BTreeMap<String, Vec<String>>,
+    },
     /// User cancelled or closed the dialog.
     Cancelled,
 }

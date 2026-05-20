@@ -1,74 +1,38 @@
-use anyhow::{anyhow, Result};
+#[cfg(not(target_os = "macos"))]
+use anyhow::anyhow;
+use anyhow::Result;
 
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
 
+    const SERVICE: &str = "works.earendil.sshwarden.local-cache-key";
+    const ACCOUNT: &str = "SSHWarden";
+
     pub fn native_available() -> bool {
-        which_security().is_some()
+        true
     }
 
     pub fn native_encrypt_local_cache_key(encoded_local_cache_key: &str) -> Result<String> {
-        let security =
-            which_security().ok_or_else(|| anyhow!("macOS security command not found"))?;
-        let status = std::process::Command::new(&security)
-            .args([
-                "add-generic-password",
-                "-a",
-                "SSHWarden",
-                "-s",
-                "works.earendil.sshwarden.local-cache-key",
-                "-w",
-                encoded_local_cache_key,
-                "-U",
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!("security add-generic-password failed"));
-        }
-        Ok("keychain:works.earendil.sshwarden.local-cache-key".to_string())
+        security_framework::passwords::set_generic_password(
+            SERVICE,
+            ACCOUNT,
+            encoded_local_cache_key.as_bytes(),
+        )?;
+        Ok(format!("keychain:{SERVICE}"))
     }
 
     pub fn native_decrypt_local_cache_key(_slot: &str) -> Result<String> {
-        let security =
-            which_security().ok_or_else(|| anyhow!("macOS security command not found"))?;
-        let output = std::process::Command::new(&security)
-            .args([
-                "find-generic-password",
-                "-a",
-                "SSHWarden",
-                "-s",
-                "works.earendil.sshwarden.local-cache-key",
-                "-w",
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(anyhow!("security find-generic-password failed"));
-        }
-        Ok(String::from_utf8(output.stdout)?.trim_end().to_string())
+        let bytes = security_framework::passwords::get_generic_password(SERVICE, ACCOUNT)?;
+        Ok(String::from_utf8(bytes)?.trim_end().to_string())
     }
 
     pub fn native_delete_local_cache_key(_slot: Option<&str>) -> Result<()> {
-        let Some(security) = which_security() else {
-            return Ok(());
-        };
-        let _ = std::process::Command::new(&security)
-            .args([
-                "delete-generic-password",
-                "-a",
-                "SSHWarden",
-                "-s",
-                "works.earendil.sshwarden.local-cache-key",
-            ])
-            .status();
-        Ok(())
-    }
-
-    fn which_security() -> Option<String> {
-        ["/usr/bin/security", "security"]
-            .into_iter()
-            .find(|cmd| std::process::Command::new(cmd).arg("-h").output().is_ok())
-            .map(ToOwned::to_owned)
+        match security_framework::passwords::delete_generic_password(SERVICE, ACCOUNT) {
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == -25300 => Ok(()), // errSecItemNotFound
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

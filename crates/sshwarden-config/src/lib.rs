@@ -1,6 +1,7 @@
 pub mod bindings;
 pub mod cache;
 pub mod session;
+pub mod ssh_config;
 pub mod vault;
 
 use std::path::PathBuf;
@@ -381,17 +382,17 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
         if let Some(dir) = env_path("XDG_RUNTIME_DIR") {
             return Ok(dir.join("sshwarden"));
         }
-        Ok(std::env::temp_dir().join(format!("sshwarden-{}", user_runtime_suffix())))
+        Ok(config_dir()?.join("run"))
     }
 
     #[cfg(target_os = "macos")]
     {
-        Ok(std::env::temp_dir().join(format!("sshwarden-{}", user_runtime_suffix())))
+        Ok(config_dir()?.join("run"))
     }
 
     #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
     {
-        Ok(std::env::temp_dir().join(format!("sshwarden-{}", user_runtime_suffix())))
+        Ok(config_dir()?.join("run"))
     }
 }
 

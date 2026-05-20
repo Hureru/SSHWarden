@@ -77,13 +77,21 @@ pub struct ControlRequest {
 pub enum ControlAction {
     Lock,
     Unlock,
-    UnlockPin { pin: String },
+    UnlockPin {
+        pin: String,
+    },
     UnlockHello,
     UnlockNative,
-    UnlockPassword { password: String },
-    Status { json: bool },
+    UnlockPassword {
+        password: String,
+    },
+    Status {
+        json: bool,
+    },
     Sync,
-    SetPin { pin: String },
+    SetPin {
+        pin: String,
+    },
     Forget,
     /// Open the host-binding management dialog. The daemon dispatches a
     /// `UIRequest::BindHostsDialog` and responds once the dialog closes.
@@ -251,13 +259,17 @@ pub async fn start_control_server(
     };
 
     if let Some(parent) = path.parent() {
+        let parent_existed = parent.exists();
         if let Err(e) = std::fs::create_dir_all(parent) {
             error!(error = %e, ?parent, "Failed to create control socket directory");
             return;
         }
-        if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
-            error!(error = %e, ?parent, "Failed to set control socket directory permissions");
-            return;
+        if !parent_existed {
+            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            {
+                error!(error = %e, ?parent, "Failed to set control socket directory permissions");
+                return;
+            }
         }
     }
 

@@ -270,15 +270,6 @@ async fn run_message_loop(
             }
         }
 
-        failed_reconnect_attempts = failed_reconnect_attempts.saturating_add(1);
-        maybe_emit_fallback_sync(
-            failed_reconnect_attempts,
-            &mut last_fallback_sent,
-            &options,
-            &event_tx,
-        )
-        .await;
-
         info!(
             "Reconnecting to notification hub in {}s...",
             backoff.as_secs()
@@ -289,9 +280,13 @@ async fn run_message_loop(
 }
 
 async fn connect_and_initialize(ws_url: &str) -> anyhow::Result<(WsWrite, WsRead)> {
-    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url)
-        .await
-        .context("Failed to connect to notification hub")?;
+    let (ws_stream, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(ws_url),
+    )
+    .await
+    .context("Notification hub connect timeout")?
+    .context("Failed to connect to notification hub")?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
     send_initial_message(&mut ws_write).await?;
 
@@ -395,7 +390,7 @@ fn is_handshake_response(message: &Message) -> bool {
 
 fn is_handshake_bytes(bytes: &[u8]) -> bool {
     let bytes = bytes.strip_suffix(&[RECORD_SEP]).unwrap_or(bytes);
-    bytes == b"{}"
+    bytes.starts_with(b"{}")
 }
 
 /// Create a SignalR MessagePack ping frame: VarInt length prefix + `[6]`.
@@ -546,6 +541,13 @@ mod tests {
     fn handshake_response_accepts_binary() {
         assert!(is_handshake_response(&Message::Binary(
             Vec::from(b"{}\x1e".as_slice()).into()
+        )));
+    }
+
+    #[test]
+    fn handshake_response_accepts_trailing_frame_data() {
+        assert!(is_handshake_response(&Message::Binary(
+            Vec::from(b"{}\x1e\x02\x91\x06".as_slice()).into()
         )));
     }
 

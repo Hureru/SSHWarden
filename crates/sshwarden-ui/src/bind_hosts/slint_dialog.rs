@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
@@ -265,6 +265,15 @@ fn quick_validate_host_pattern(pattern: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn host_pattern_warning(pattern: &str) -> Option<&'static str> {
+    match pattern.trim() {
+        "*" | "!*" => Some(
+            "Warning: this pattern can match many hosts and may reintroduce MaxAuthTries failures.",
+        ),
+        _ => None,
+    }
+}
+
 pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
     let dialog = match BindHostsDialog::new() {
         Ok(d) => d,
@@ -298,12 +307,10 @@ pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
             .map(|k| (k.cipher_id.clone(), k.name.clone()))
             .collect(),
     );
+    let touched: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
 
     let initial_index = match initial_selection.as_deref() {
-        Some(id) => key_ids
-            .iter()
-            .position(|k| k == id)
-            .unwrap_or(0),
+        Some(id) => key_ids.iter().position(|k| k == id).unwrap_or(0),
         None => 0,
     } as i32;
 
@@ -409,6 +416,7 @@ pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
         let key_ids = key_ids.clone();
         let hosts_model = hosts_model.clone();
         let update_count = update_key_count.clone();
+        let touched = touched.clone();
         dialog.on_add_host(move || {
             let Some(d) = weak.upgrade() else { return };
             let raw = d.get_new_host_text().to_string();
@@ -431,6 +439,8 @@ pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
                 d.set_error_message("Host pattern already bound to this key".into());
                 return;
             }
+            let warning = host_pattern_warning(&trimmed);
+            touched.borrow_mut().insert(cipher_id.clone());
             working
                 .borrow_mut()
                 .entry(cipher_id)
@@ -439,7 +449,7 @@ pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
             hosts_model.push(SharedString::from(trimmed.as_str()));
             update_count(idx, hosts_model.row_count() as i32);
             d.set_new_host_text("".into());
-            d.set_error_message("".into());
+            d.set_error_message(warning.unwrap_or("").into());
         });
     }
 
@@ -450,6 +460,7 @@ pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
         let key_ids = key_ids.clone();
         let hosts_model = hosts_model.clone();
         let update_count = update_key_count.clone();
+        let touched = touched.clone();
         dialog.on_remove_host(move |host_idx| {
             let Some(d) = weak.upgrade() else { return };
             let idx = d.get_selected_index();
@@ -464,6 +475,7 @@ pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
                 let mut map = working.borrow_mut();
                 if let Some(v) = map.get_mut(&cipher_id) {
                     if host_idx < v.len() {
+                        touched.borrow_mut().insert(cipher_id.clone());
                         v.remove(host_idx);
                     } else {
                         return;
@@ -485,11 +497,13 @@ pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
         let weak = dialog.as_weak();
         let tx = tx_cell.clone();
         let working = working.clone();
+        let touched = touched.clone();
         dialog.on_save(move || {
-            let payload: BTreeMap<String, Vec<String>> = working
+            let working = working.borrow();
+            let payload: BTreeMap<String, Vec<String>> = touched
                 .borrow()
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .filter_map(|id| working.get(id).map(|hosts| (id.clone(), hosts.clone())))
                 .collect();
             if let Some(sender) = tx.borrow_mut().take() {
                 let _ = sender.send(BindHostsResult::Saved { bindings: payload });

@@ -37,10 +37,23 @@ pub fn get_peer_cmd(peer_pid: u32) -> Option<Vec<String>> {
         sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(peer_pid)]),
         true,
     );
-    let process = system.process(Pid::from_u32(peer_pid))?;
-    process
+    let Some(process) = system.process(Pid::from_u32(peer_pid)) else {
+        tracing::debug!(
+            peer_pid,
+            "Unable to infer SSH target: peer process not found"
+        );
+        return None;
+    };
+    let argv = process
         .cmd()
         .iter()
         .map(|s| s.to_str().map(String::from))
-        .collect::<Option<Vec<String>>>()
+        .collect::<Option<Vec<String>>>();
+    if argv.is_none() {
+        tracing::debug!(
+            peer_pid,
+            "Unable to infer SSH target: process argv is not valid UTF-8 or is unavailable"
+        );
+    }
+    argv
 }
