@@ -2,20 +2,30 @@
 
 ## 1. Identity
 
-- **What it is:** SSHWarden 守护进程的双线程架构：主线程运行 Slint GUI 事件循环，tokio 运行时在独立线程处理异步主循环（`tokio::select!` 四路事件）。
-- **Purpose:** 协调 IPC 控制命令、SSH Agent UI 请求、自动锁定检查和关闭信号。Slint 事件循环在主线程确保 PIN 对话框和授权对话框等 GUI 组件正常工作。
+- **What it is:** SSHWarden 守护进程的双线程架构：主线程运行 Slint GUI 事件循环，tokio 运行时在独立线程处理异步主循环（`tokio::select!` 六路事件）。
+- **Purpose:** 协调 IPC 控制命令、SSH Agent UI 请求、SignalR 通知事件、token 自动刷新、自动锁定检查和关闭信号。Slint 事件循环在主线程确保 PIN 对话框和授权对话框等 GUI 组件正常工作。
 
 ## 2. Core Components
 
 - `src/main.rs` (`main`): 同步入口，判断是否需要 UI。需要时创建 `mpsc::channel<UIRequest>`，在独立线程启动 tokio 运行时，主线程运行 `run_slint_event_loop()`. 参见 `src/main.rs:80-237`.
 - `src/main.rs` (`run_slint_event_loop`): 主线程 Slint 事件循环，bridge 线程从 mpsc 接收 `UIRequest`，match 分发到 `show_pin_dialog()` 或 `show_auth_dialog()`. 参见 `src/main.rs:243-290`.
-- `src/main.rs` (`run_foreground`): tokio 线程中的异步主循环入口，初始化通道和共享状态后进入 `tokio::select!` 循环. 参见 `src/main.rs:436-668`.
-- `src/main.rs` (`handle_control_command`): 处理 8 种 IPC 控制命令，PIN 对话框降级通过 `get_pin_encrypted_data()` + `make_pin_validator()` 构造 validator 后调用 `request_pin_dialog()`. 参见 `src/main.rs:672-1160`.
-- `src/main.rs` (`handle_ui_request`): 处理 SSH Agent UI 请求（列表/签名），含二级自动解锁（Hello 签名路径 -> 带 validator 的 Slint PIN 对话框）和 Slint 授权对话框. 参见 `src/main.rs:1209-1599`.
+- `src/main.rs` (`SecureKeyCache`, `CachedKeyTuples`): 安全密钥缓存，替代 `Vec<(String, String, String)>`。clear/drop 时自动擦零 PEM 私钥（`pem.zeroize()`）。`CachedKeyTuples = Arc<RwLock<SecureKeyCache>>`. 参见 `src/main.rs:11-42`.
+- `src/main.rs` (`lock_vault`): 统一的 vault 锁定辅助函数，清除 agent 密钥 + cached_key_tuples + key_names，确保 3 处锁定逻辑（ControlAction::Lock、SyncEvent::LogOut、Auto-lock timer）一致。参见 `src/main.rs:786-797`.
+- `src/main.rs` (`run_foreground`): tokio 线程中的异步主循环入口，初始化通道和共享状态后进入 `tokio::select!` 循环. 参见 `src/main.rs:442-746`.
+- `src/main.rs` (`handle_control_command`): 处理 8 种 IPC 控制命令，PIN 对话框降级通过 `get_pin_encrypted_data()` + `make_pin_validator()` 构造 validator 后调用 `request_pin_dialog()`。UnlockPassword 成功后连接通知服务. 参见 `src/main.rs:749-1260`.
+- `src/main.rs` (`handle_ui_request`): 处理 SSH Agent UI 请求（列表/签名），含二级自动解锁（Hello 签名路径 -> 带 validator 的 Slint PIN 对话框）和 Slint 授权对话框.
+- `src/main.rs` (`do_sync`): 共用的同步辅助函数，供手动 sync 命令和 SignalR 自动 sync 共用. 参见 `src/main.rs:1405-1456`.
+- `src/main.rs` (`try_restore_api_session`): PIN 解锁后从 session 文件恢复 API 会话（解密 refresh_token -> 刷新 access_token -> 连接通知服务）. 参见 `src/main.rs:1462-1544`.
+- `src/main.rs` (`try_restore_api_session_hello`): Windows Hello 解锁后从 session 文件恢复 API 会话. 参见 `src/main.rs:1310-1402`.
+- `src/main.rs` (`save_device_session`): 登录/SetPin/token 刷新后保存 session 文件. 参见 `src/main.rs:1550-1602`.
 - `src/main.rs` (`get_pin_encrypted_data`): 统一读取 PIN 加密数据（优先内存 `pin_encrypted_keys`，降级 `vault_file_data`）. 参见 `src/main.rs:1162-1174`.
 - `src/main.rs` (`make_pin_validator`): 构造 validator 闭包和 `decrypted_cache`。闭包调用 `pin_decrypt()` 验证 PIN，成功时缓存解密结果. 参见 `src/main.rs:1180-1202`.
-- `src/main.rs` (`finish_unlock_with_json`): 共用的解锁完成逻辑（JSON 解析 -> key_names 更新 -> Agent 加载 -> 锁定标志清除）. 参见 `src/main.rs:1204-1240`.
-- `src/main.rs` (`try_hello_unlock`): Windows Hello 签名路径解锁辅助函数. 参见 `src/main.rs:1165-1167`.
+- `src/main.rs` (`finish_unlock_with_json`): 共用的解锁完成逻辑（JSON 解析 -> key_names 更新 -> Agent 加载 -> 锁定标志清除）.
+- `src/main.rs` (`try_hello_unlock`): Windows Hello 签名路径解锁辅助函数.
+- `crates/sshwarden-api/src/notifications.rs` (`NotificationClient`, `SyncEvent`): SignalR WebSocket 通知客户端，监听 CipherChanged 和 LogOut 事件.
+- `crates/sshwarden-api/src/client.rs` (`BitwardenClient`): 新增 `refresh_token`/`token_expiry`/`device_id` 字段，支持 `refresh_access_token()`/`is_token_expiring_soon()`/`new_with_device_id()`.
+- `crates/sshwarden-config/src/session.rs` (`SessionFile`): 设备独立 session 文件（`session-{hostname}.enc`），存储加密的 refresh_token 和 device_id.
+- `crates/sshwarden-config/src/lib.rs` (`ServerConfig`): 新增 `notifications_url` 配置字段和 `notifications_url()` URL 解析方法.
 - `crates/sshwarden-ui/src/lib.rs` (`UIRequest`): 统一的跨线程 UI 请求枚举。`PinDialog` 变体含 `response_tx` 和 `validator: Arc<dyn Fn(&str) -> bool + Send + Sync>` 闭包（PIN 验证在对话框内部执行）。`AuthDialog` 变体含 `info` 和 `response_tx`.
 - `crates/sshwarden-ui/src/unlock/slint_dialog.rs` (`show_pin_dialog`, `request_pin_dialog`): Slint PIN 对话框实现及跨线程通信机制.
 - `crates/sshwarden-ui/src/notify/slint_dialog.rs` (`AuthDialogRequest`, `show_auth_dialog`, `request_authorization`): Slint 授权对话框实现及跨线程通信机制.
@@ -37,24 +47,28 @@
 - **2. 条件登录:** 无 vault.enc 且有 email 配置时 `fetch_vault_keys_with_client()` 登录同步. 参见 `src/main.rs:455-500`.
 - **3. 创建通道:** `request_tx/rx` (mpsc), `response_tx/rx` (broadcast). 参见 `src/main.rs:503-506`.
 - **4. 启动 Agent:** `SshWardenAgent::start_server()`. 参见 `src/main.rs:509-510`.
-- **5. 共享状态:** `cached_key_tuples`, `vault_locked`, `pin_encrypted_keys`, `vault_file_data` 等. 参见 `src/main.rs:525-534`.
-- **6. 启动 control server:** spawn `start_control_server()`. 参见 `src/main.rs:575-581`.
+- **5. 共享状态:** `cached_key_tuples` (SecureKeyCache — 擦零安全), `vault_locked`, `pin_encrypted_keys`, `vault_file_data`, `api_client` 等. 参见 `src/main.rs:530-539`.
+- **6. 启动 control server:** spawn `start_control_server()`. 参见 `src/main.rs:576-588`.
+- **7. 通知服务连接:** 若首次登录已有 access_token，连接 SignalR 通知服务，并保存 device session. 参见 `src/main.rs:603-628`.
+- **8. Token 刷新定时器:** `token_refresh_interval` 每 30 分钟一次（首次 tick 跳过）. 参见 `src/main.rs:599-601`.
 
-### 3.3 tokio::select! 四路事件处理
+### 3.3 tokio::select! 六路事件处理
 
-参见 `src/main.rs:593-662`:
+参见 `src/main.rs:630-741`:
 
-- **control_rx.recv():** IPC 控制命令，`handle_control_command()` 使用 `get_pin_encrypted_data()` + `make_pin_validator()` 构造 validator 传入 PIN 对话框. 更新 `last_activity`.
+- **control_rx.recv():** IPC 控制命令，`handle_control_command()` 使用 `get_pin_encrypted_data()` + `make_pin_validator()` 构造 validator 传入 PIN 对话框。UnlockPassword 成功后连接通知服务并保存 session. 更新 `last_activity`.
 - **request_rx.recv():** SSH Agent UI 请求，spawn 独立 task，传入 `ui_request_tx` 克隆. 自动解锁：Hello 签名 -> 带 validator 的 Slint PIN 对话框（对话框内验证，支持重试）. 授权：Slint 授权对话框.
+- **notification_rx.recv():** SignalR 通知事件。`CipherChanged` -> 调用 `do_sync()` 自动同步密钥。`LogOut` -> 调用 `lock_vault()` 统一锁定（擦零 cached_key_tuples + key_names）. 参见 `src/main.rs:683-704`.
+- **token_refresh_interval.tick():** 每 30 分钟检查 `is_token_expiring_soon()`，自动调用 `refresh_access_token()` 刷新，并更新 session 文件. 参见 `src/main.rs:706-722`.
 - **lock_check_interval.tick():** 每 60 秒检查自动锁定.
 - **ctrl_c:** break 退出.
 
 ### 3.4 关闭流程
 
 - **1. break:** 退出 select! 循环. tokio 线程结束.
-- **2. cancel:** `cancel_token.cancel()` 通知 control server. 参见 `src/main.rs:664`.
-- **3. stop agent:** `agent.stop()`. 参见 `src/main.rs:665`.
-- **4. channel 关闭:** `ui_request_tx` drop 后 bridge 线程检测到关闭，调用 `slint::quit_event_loop()` 退出主线程. 参见 `src/main.rs:288`.
+- **2. cancel:** `cancel_token.cancel()` 通知 control server 和 notification client. 参见 `src/main.rs:743`.
+- **3. stop agent:** `agent.stop()`. 参见 `src/main.rs:744`.
+- **4. channel 关闭:** `ui_request_tx` drop 后 bridge 线程检测到关闭，调用 `slint::quit_event_loop()` 退出主线程.
 
 ## 4. Design Rationale
 
@@ -64,6 +78,11 @@
 - **Bridge 线程:** 使用独立的 `current_thread` tokio 运行时从 mpsc 接收请求，避免在 Slint 主线程上阻塞等待。
 - **spawn per request:** UI 请求 spawn 独立 task，因为 Windows Hello、PIN 对话框和 Toast 通知可能阻塞数十秒。
 - **vault.enc 启动分支:** 有 vault.enc 时跳过密码提示进入锁定态，适合 daemon 自启动。
-- **启动文件夹自启动:** `daemon --install` 使用用户启动文件夹快捷方式. 参见 `src/main.rs:1792-1836`.
+- **启动文件夹自启动:** `daemon --install` 使用用户启动文件夹快捷方式.
+- **SignalR 通知:** `NotificationClient` 在首次登录或 unlock-password 成功后连接。后台 task 自动重连（指数退避 1s→60s）。`CipherChanged` 触发 `do_sync()` 复用手动 sync 逻辑；`LogOut` 直接锁定 vault。`notification_rx` 使用 `Option<Receiver>` 包装，未连接时 `std::future::pending()` 挂起。
+- **Token 自动刷新:** `token_refresh_interval` 每 30 分钟 tick 一次，检查 `is_token_expiring_soon()`（<5 分钟）后调用 `refresh_access_token()`。刷新成功后更新 session 文件保存新 refresh_token。
+- **设备独立 Session:** `session-{hostname}.enc` 文件存储加密的 refresh_token 和持久化 device_id。PIN/Hello 解锁后 `try_restore_api_session()`/`try_restore_api_session_hello()` 恢复 API 会话（无需主密码）。多设备通过 hostname 隔离互不干扰。
+- **do_sync 辅助函数:** 提取同步逻辑为独立函数，供 IPC sync 命令、SignalR 自动 sync、手动 sync 复用。
 - **last_activity 跟踪:** IPC 命令和 SSH 请求都更新活动时间戳.
+- **内存安全:** `SecureKeyCache` 替代裸 `Vec`，clear/drop 时擦零 PEM 私钥。`lock_vault()` 统一 3 处锁定逻辑（Lock/LogOut/Auto-lock），确保密钥材料一致清除。`prompt_password()` 和 IPC 接收的 PIN/password 用 `Zeroizing` 包装，scope 结束自动擦零。
 - **lock_timeout 可配置:** 默认 3600 秒，设为 0 禁用。

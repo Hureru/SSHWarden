@@ -18,6 +18,7 @@ slint::slint! {
         in-out property <string> error-message: "PIN cannot be empty";
         in-out property <bool> verifying: false;
         in-out property <string> pin-text: "";
+        in property <string> context-text: "";
 
         callback submit-pin(string);
         callback cancel();
@@ -43,6 +44,12 @@ slint::slint! {
                 text: "Enter PIN to unlock SSHWarden";
                 color: Palette.foreground;
                 font-size: 14px;
+            }
+
+            if context-text != "": Text {
+                text: context-text;
+                color: Palette.foreground;
+                font-size: 12px;
             }
 
             VerticalLayout {
@@ -104,6 +111,25 @@ fn center_and_focus_dialog(dialog: &PinDialog) {
     });
 }
 
+fn unlock_context_text(context: &crate::UnlockRequestContext) -> String {
+    let operation = match context.operation_kind.as_str() {
+        "git_signing" => "Git Signing",
+        "file_signing" => "File Signing",
+        "ssh_signature" => "SSH Signature",
+        "ssh_authentication" => "SSH Authentication",
+        other => other,
+    };
+    let forwarding = if context.is_forwarding {
+        " via agent forwarding"
+    } else {
+        ""
+    };
+    format!(
+        "{} requests {} with {}{}",
+        context.process_name, operation, context.key_name, forwarding
+    )
+}
+
 fn trigger_shake(weak: &slint::Weak<PinDialog>) {
     let offsets: &[f32] = &[10.0, -8.0, 6.0, -4.0, 2.0, 0.0];
     for (i, &offset) in offsets.iter().enumerate() {
@@ -125,6 +151,7 @@ fn trigger_shake(weak: &slint::Weak<PinDialog>) {
 pub fn show_pin_dialog(
     response_tx: tokio::sync::oneshot::Sender<Option<String>>,
     validator: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    context: Option<crate::UnlockRequestContext>,
 ) {
     let dialog = match PinDialog::new() {
         Ok(d) => d,
@@ -134,6 +161,10 @@ pub fn show_pin_dialog(
             return;
         }
     };
+
+    if let Some(context) = context {
+        dialog.set_context_text(unlock_context_text(&context).into());
+    }
 
     // Shared sender: Arc<Mutex> so it can be accessed from invoke_from_event_loop
     let tx_cell = std::sync::Arc::new(std::sync::Mutex::new(Some(response_tx)));
@@ -235,11 +266,20 @@ pub async fn request_pin_dialog(
     request_tx: &tokio::sync::mpsc::Sender<crate::UIRequest>,
     validator: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
 ) -> Option<String> {
+    request_pin_dialog_with_context(request_tx, validator, None).await
+}
+
+pub async fn request_pin_dialog_with_context(
+    request_tx: &tokio::sync::mpsc::Sender<crate::UIRequest>,
+    validator: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    context: Option<crate::UnlockRequestContext>,
+) -> Option<String> {
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
     let request = crate::UIRequest::PinDialog {
         response_tx,
         validator,
+        context,
     };
 
     if request_tx.send(request).await.is_err() {

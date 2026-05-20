@@ -1,0 +1,3 @@
+# Allow cached signing when Bitwarden is unreachable
+
+SSHWarden will allow signing from an unlocked local key cache when the configured Bitwarden service is unreachable, because local SSH client activity can still occur for Git signing, LAN/VPN hosts, or service outages. The Bitwarden vault remains the source of truth, but the local key cache is intentionally a usable recent snapshot; if a pending sync cannot be resolved after unlock, cached signing remains allowed by default while UI, status, and logs should make the unresolved sync and cached key use visible. A stricter future setting may require online sync before signing.

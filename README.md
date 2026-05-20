@@ -1,119 +1,236 @@
 # SSHWarden
 
-[![Build and Test](https://github.com/Hureru/SSHWarden/actions/workflows/build.yml/badge.svg)](https://github.com/Hureru/SSHWarden/actions/workflows/build.yml)
-[![Release](https://github.com/Hureru/SSHWarden/actions/workflows/release.yml/badge.svg)](https://github.com/Hureru/SSHWarden/actions/workflows/release.yml)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+SSHWarden 是一个轻量的独立 SSH Agent，目标是把 Bitwarden 中保存的 SSH Key 暴露给本机 `ssh` / `git` 使用，同时避免运行完整 Bitwarden Desktop 客户端。
 
-一个独立的命令行 SSH Agent 守护进程，从 Bitwarden 密码库获取 SSH 密钥，替代系统 OpenSSH Agent。
+> 当前项目处于跨平台 baseline 设计和实现推进阶段。现有代码最完整的是 Windows 路径；Linux/macOS 是一等支持目标，但部分控制通道、自启动、存储路径和平台原生解锁能力仍在建设中。
 
-> **注意**: 本项目基于 [Bitwarden clients](https://github.com/bitwarden/clients) 的部分代码开发，遵循 GPL-3.0 许可证。Bitwarden 是 Bitwarden Inc. 的注册商标。
+## 项目目标
 
-## 特性
+SSHWarden 的目标不是复刻完整 Bitwarden Desktop，而是提供一个专注于 SSH Agent 的轻量工具：
 
-- 🔐 **集中管理**: 通过 Bitwarden 集中存储和管理 SSH 私钥
-- 🔑 **Windows Hello**: 支持 Windows Hello 生物识别解锁
-- 📌 **PIN 快速解锁**: 使用 PIN 码快速解锁密钥库
-- 🔔 **Toast 通知**: SSH 签名请求通过 Windows Toast 通知授权
-- 💾 **密钥持久化**: vault.enc 文件持久化加密密钥，重启后无需重新登录
-- 🚀 **完全便携**: 所有数据文件存放在 exe 同目录，可随程序移动
-- 🔒 **自动锁定**: 可配置的自动锁定超时机制
+- 从 Bitwarden / Vaultwarden 同步 SSH Key
+- 作为本地 SSH Agent 服务 `ssh`、`git`、Git commit signing 等客户端
+- 在签名请求时显示授权对话框
+- 支持锁定、解锁、自动锁定和本地加密缓存
+- 支持 Windows、Linux 桌面会话、macOS 三个平台的完整用户体验
 
-## 技术栈
+## 当前状态
 
-- **语言**: Pure Rust
-- **异步运行时**: Tokio
-- **CLI 框架**: Clap
-- **SSH Agent**: bitwarden-russh
-- **Windows API**: WinRT (Toast 通知、Windows Hello)
-- **加密**: AES-256-CBC + HMAC-SHA256, Argon2id
+| 能力 | 当前状态 |
+|---|---|
+| Bitwarden 登录与 SSH Key 同步 | 已实现 |
+| SSH Agent 协议服务 | Windows 已实现；Unix socket 有基础实现 |
+| 签名授权对话框 | Slint 跨平台 UI 已实现 |
+| PIN 解锁 | 已实现，后续需迁移到 envelope encryption 模型 |
+| Windows Hello | 已有实现，后续需迁移到 envelope encryption 模型 |
+| IPC 控制命令 | Windows 已实现；Linux/macOS 待补独立 control socket |
+| Local Key Cache | 已实现旧模型；目标模型见 ADR |
+| 标准平台存储目录 | 待实现；当前代码仍使用 exe 同目录 |
+| 自启动 | Windows 已实现；macOS/Linux 待实现 |
+| Shell integration | 待实现 `sshwarden env` |
+| macOS native unlock | 已实现（Phase 6，Keychain；仍需平台实机验证） |
+| Linux native unlock | 已实现（Phase 6，Secret Service；仍需平台实机验证） |
 
-## 安装
+设计权威记录见：
 
-### 从 Release 下载（推荐）
+- [`CONTEXT.md`](CONTEXT.md) — 项目领域语言
+- [`docs/adr/`](docs/adr/) — 架构决策记录
 
-前往 [Releases](https://github.com/Hureru/SSHWarden/releases) 页面下载最新版本：
+`llmdoc/` 中包含历史分析和 Bitwarden Desktop 参考资料，不代表 SSHWarden 当前支持状态。
 
-- **Windows**: `sshwarden-x.x.x-windows-x64.zip`
-- **Linux**: `sshwarden-x.x.x-linux-x64.tar.gz`
-- **macOS**: `sshwarden-x.x.x-macos-x64.tar.gz`
+## 核心概念
 
-### 从源码构建
+### Bitwarden Vault
 
-```bash
-git clone https://github.com/Hureru/SSHWarden.git
-cd SSHWarden
-cargo build --release
+Bitwarden Vault 是 SSH Key 的权威来源。SSHWarden 成功 sync 后，运行时 key set 应镜像 Bitwarden 中当前未删除、未归档的 SSH Key。
+
+### Local Key Cache
+
+SSHWarden 会维护一个本地加密 SSH Key 快照，让 Remembered Device 在 Bitwarden 不可达时仍可解锁并签名。
+
+目标模型是 envelope encryption：
+
+```text
+Local Cache Key -> 加密 SSH keys
+
+PIN / Windows Hello / macOS Keychain / Linux Secret Service -> 解锁 Local Cache Key
 ```
 
-详细构建说明请参阅 [BUILD.md](BUILD.md)
+这允许 sync 成功后刷新本地缓存，而不需要长期保存用户 PIN。
 
-## 快速开始
+### Lock / Unlock / Forget
+
+- **Lock**：阻止签名并清除本地缓存刷新能力；Key Identity 仍可列出。
+- **Unlock**：用 PIN 或平台原生方法恢复签名能力。
+- **Forget**：删除本机记住的 key/session/native unlock material，下次必须重新登录 Bitwarden。
+
+### Signing Authorization
+
+签名请求和解锁是两个步骤：
+
+1. 如果 SSHWarden 已锁定，Signing Request 可以触发 Unlock。
+2. Unlock 成功后，Signing Request 仍可能需要用户 Authorization。
+3. Key List Request 不触发 Unlock；锁定状态下可以列出 Key Identity。
+
+## 目标平台
+
+SSHWarden 的一等支持平台目标是：
+
+- Windows 10/11
+- Linux 桌面会话
+- macOS 13+
+
+不把 WSL、BSD、移动端、浏览器环境、纯 headless server 作为 baseline 支持目标。
+
+## 计划中的 baseline 能力
+
+跨平台 baseline 应在所有一等平台上提供：
+
+- Bitwarden 登录和 SSH Key sync
+- 本地 SSH Agent endpoint
+- PIN Unlock
+- Signing Request 授权对话框
+- Lock / Unlock / Forget
+- Local Key Cache
+- Control Channel：`status`、`lock`、`unlock`、`sync`、`set-pin` 等控制命令
+- Shell Integration：`sshwarden env`
+- Startup Integration：登录桌面会话后自动启动
+- `status` 简洁状态报告
+- `doctor` 跨平台诊断检查
+
+平台原生 unlock 是 baseline 之后的增强路线：
+
+1. Windows Hello
+2. macOS Keychain + Touch ID / user presence
+3. Linux Secret Service-compatible keyring
+
+## 当前使用方式
+
+> 以下命令反映当前实现，后续 CLI 会随 baseline 设计调整。
 
 ### 配置
 
-1. 复制配置文件示例：
+复制配置示例：
+
 ```bash
 cp config.toml.example config.toml
 ```
 
-2. 编辑 `config.toml`，填写你的 Bitwarden 邮箱和其他配置。
+编辑 `config.toml`，填写 Bitwarden 邮箱、服务器地址等配置。
 
-### 使用
+### 启动 daemon
 
-1. 启动守护进程：
 ```bash
 sshwarden daemon
 ```
 
-2. 设置 PIN（可选）：
+或直接运行：
+
+```bash
+sshwarden
+```
+
+### 登录 / 同步 keys
+
+```bash
+sshwarden login
+sshwarden keys
+sshwarden sync
+```
+
+### 绑定 Host / 避免 MaxAuthTries
+
+当 Bitwarden 里有多把 SSH Key 时，OpenSSH 可能会因为 `MaxAuthTries` 在尝试完所有 agent key 前断开连接。SSHWarden 支持把 vault key 绑定到 SSH Host，并生成公开 `.pub` selector 文件与托管 SSH config：
+
+```bash
+# 一次性安装 ~/.ssh/config 的 SSHWarden Include
+sshwarden ssh-config install
+
+# 将 key 绑定到 host，可使用 key 名称或 vault item id
+sshwarden bindings add github-key github.com
+
+# 查看当前状态和生成的配置
+sshwarden ssh-config status
+sshwarden ssh-config show
+```
+
+也可以通过签名请求里的 **Bind & Approve...** 图形流程完成绑定。详见 [`docs/host-bindings.md`](docs/host-bindings.md)。
+
+兼容旧流程：`sshwarden ssh-config` 仍可打印建议 snippet，`sshwarden ssh-config --write` 仍可写入托管文件。
+
+### 锁定 / 解锁
+
+```bash
+sshwarden lock
+sshwarden unlock --pin
+sshwarden unlock --hello      # Windows 当前可用
+sshwarden unlock --password
+```
+
+### 设置 PIN
+
 ```bash
 sshwarden set-pin
 ```
 
-3. 查看状态：
+### 查看状态
+
 ```bash
 sshwarden status
 ```
 
-4. 锁定/解锁：
-```bash
-sshwarden lock
-sshwarden unlock --hello  # Windows Hello 解锁
-sshwarden unlock --pin    # PIN 解锁
-```
+### Windows 自启动
 
-5. 安装自启动：
 ```bash
 sshwarden daemon --install
+sshwarden daemon --uninstall
 ```
 
-## 架构
+Linux/macOS 自启动安装仍待实现。
 
-SSHWarden 采用模块化设计，包含以下 crate：
+## 与官方 Bitwarden Desktop 的关系
 
-- `sshwarden` (bin): CLI 入口和守护进程主循环
-- `sshwarden-agent`: SSH Agent 核心和 IPC 控制服务器
-- `sshwarden-api`: Bitwarden API 客户端和加解密
-- `sshwarden-ui`: Toast 通知和 Windows Hello 解锁
-- `sshwarden-config`: 配置管理和 vault.enc 持久化
+Bitwarden Desktop 已经提供 SSH Agent，但它依赖完整 Electron 桌面客户端。SSHWarden 的目标是提供一个更轻量的独立 agent。
 
-详细架构文档请参阅 `llmdoc/` 目录。
+设计上参考官方实现：
+
+- SSH Key 来自 Bitwarden Vault
+- SSH Agent 的运行时 key set 是 vault 的投影
+- 签名请求需要授权
+- Agent forwarding 始终需要显式授权
+- 锁定状态下可以保留可列出的 Key Identity
+
+不同点：
+
+- SSHWarden 不依赖 Electron/Angular
+- SSHWarden 需要自己维护轻量 Local Key Cache
+- SSHWarden 的跨平台 daemon/control/startup/shell integration 独立实现
+
+## 技术栈
+
+- Rust
+- Tokio
+- Clap
+- Slint
+- bitwarden-russh
+- reqwest
+- tokio-tungstenite
+- AES-256-CBC + HMAC-SHA256
+- Argon2id
+- zeroize
+
+## 构建
+
+```bash
+cargo build --release
+```
+
+更多构建信息见 [`BUILD.md`](BUILD.md)。
 
 ## 许可证
 
-本项目基于 [Bitwarden clients](https://github.com/bitwarden/clients) 开发，遵循 GPL-3.0 许可证。
+本项目基于 Bitwarden clients 的部分代码和设计参考开发，遵循 GPL-3.0 许可证。
 
-- **许可证**: GPL-3.0
-- **上游项目**: [Bitwarden clients](https://github.com/bitwarden/clients)
-- **商标**: Bitwarden 是 Bitwarden Inc. 的注册商标，本项目与 Bitwarden Inc. 无关联
-
-## 安全说明
-
-- 所有敏感数据（config.toml, vault.enc）都已在 .gitignore 中排除
-- 密钥使用 AES-256-CBC + HMAC-SHA256 加密
-- PIN 使用 Argon2id 进行密钥派生
-- 支持 Windows Hello 生物识别保护
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
+- License: GPL-3.0
+- Upstream: https://github.com/bitwarden/clients
+- Bitwarden 是 Bitwarden Inc. 的注册商标。本项目与 Bitwarden Inc. 无关联。

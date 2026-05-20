@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
 use tracing::{error, info};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -18,6 +17,8 @@ pub struct ControlResponse {
     pub locked: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 impl ControlResponse {
@@ -28,6 +29,7 @@ impl ControlResponse {
             error: None,
             locked: None,
             key_count: None,
+            details: None,
         }
     }
 
@@ -38,6 +40,7 @@ impl ControlResponse {
             error: Some(error.to_string()),
             locked: None,
             key_count: None,
+            details: None,
         }
     }
 
@@ -52,7 +55,13 @@ impl ControlResponse {
             error: None,
             locked: Some(locked),
             key_count: Some(key_count),
+            details: None,
         }
+    }
+
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 }
 
@@ -68,12 +77,25 @@ pub struct ControlRequest {
 pub enum ControlAction {
     Lock,
     Unlock,
-    UnlockPin { pin: String },
+    UnlockPin {
+        pin: String,
+    },
     UnlockHello,
-    UnlockPassword { password: String },
-    Status,
+    UnlockNative,
+    UnlockPassword {
+        password: String,
+    },
+    Status {
+        json: bool,
+    },
     Sync,
-    SetPin { pin: String },
+    SetPin {
+        pin: String,
+    },
+    Forget,
+    /// Open the host-binding management dialog. The daemon dispatches a
+    /// `UIRequest::BindHostsDialog` and responds once the dialog closes.
+    BindHostsDialog,
 }
 
 /// Start the control pipe server (daemon side).
@@ -86,7 +108,7 @@ pub async fn start_control_server(
     tx: tokio::sync::mpsc::Sender<ControlRequest>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
     info!("Control server starting on {}", CONTROL_PIPE_NAME);
@@ -145,76 +167,169 @@ pub async fn start_control_server(
             }
         }
 
-        let line = line.trim();
-        let cmd: ControlCommand = match serde_json::from_str(line) {
-            Ok(c) => c,
-            Err(e) => {
-                let resp = ControlResponse::err(&format!("Invalid command: {}", e));
-                let resp_json = serde_json::to_string(&resp).unwrap_or_default();
-                let _ = writer
-                    .write_all(format!("{}\n", resp_json).as_bytes())
-                    .await;
-                let _ = writer.flush().await;
-                continue;
-            }
-        };
+        let response = handle_control_line(line.trim(), &tx).await;
+        write_control_response(&mut writer, &response).await;
+    }
+}
 
-        let action = match cmd.cmd.as_str() {
-            "lock" => ControlAction::Lock,
-            "unlock" => ControlAction::Unlock,
-            "unlock-hello" => ControlAction::UnlockHello,
-            "status" => ControlAction::Status,
-            "sync" => ControlAction::Sync,
-            s if s.starts_with("unlock-pin:") => {
-                let pin = s.strip_prefix("unlock-pin:").unwrap_or("").to_string();
-                ControlAction::UnlockPin { pin }
-            }
-            s if s.starts_with("unlock-password:") => {
-                let password = s.strip_prefix("unlock-password:").unwrap_or("").to_string();
-                ControlAction::UnlockPassword { password }
-            }
-            s if s.starts_with("set-pin:") => {
-                let pin = s.strip_prefix("set-pin:").unwrap_or("").to_string();
-                ControlAction::SetPin { pin }
-            }
-            other => {
-                let resp = ControlResponse::err(&format!("Unknown command: {}", other));
-                let resp_json = serde_json::to_string(&resp).unwrap_or_default();
-                let _ = writer
-                    .write_all(format!("{}\n", resp_json).as_bytes())
-                    .await;
-                let _ = writer.flush().await;
-                continue;
-            }
-        };
-
-        // Send to main loop and wait for response
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let request = ControlRequest {
-            action,
-            reply: reply_tx,
-        };
-
-        if tx.send(request).await.is_err() {
-            let resp = ControlResponse::err("Agent is shutting down");
-            let resp_json = serde_json::to_string(&resp).unwrap_or_default();
-            let _ = writer
-                .write_all(format!("{}\n", resp_json).as_bytes())
-                .await;
-            let _ = writer.flush().await;
-            continue;
+async fn dispatch_control_command(
+    cmd: ControlCommand,
+    tx: &tokio::sync::mpsc::Sender<ControlRequest>,
+) -> ControlResponse {
+    let action = match cmd.cmd.as_str() {
+        "lock" => ControlAction::Lock,
+        "unlock" => ControlAction::Unlock,
+        "unlock-hello" => ControlAction::UnlockHello,
+        "unlock-native" => ControlAction::UnlockNative,
+        "status" => ControlAction::Status { json: false },
+        "status-json" => ControlAction::Status { json: true },
+        "sync" => ControlAction::Sync,
+        "forget" => ControlAction::Forget,
+        "bind-hosts-dialog" => ControlAction::BindHostsDialog,
+        s if s.starts_with("unlock-pin:") => {
+            let pin = s.strip_prefix("unlock-pin:").unwrap_or("").to_string();
+            ControlAction::UnlockPin { pin }
         }
+        s if s.starts_with("unlock-password:") => {
+            let password = s.strip_prefix("unlock-password:").unwrap_or("").to_string();
+            ControlAction::UnlockPassword { password }
+        }
+        s if s.starts_with("set-pin:") => {
+            let pin = s.strip_prefix("set-pin:").unwrap_or("").to_string();
+            ControlAction::SetPin { pin }
+        }
+        other => return ControlResponse::err(&format!("Unknown command: {other}")),
+    };
 
-        let response = match reply_rx.await {
-            Ok(resp) => resp,
-            Err(_) => ControlResponse::err("Internal error: no reply from agent"),
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let request = ControlRequest {
+        action,
+        reply: reply_tx,
+    };
+
+    if tx.send(request).await.is_err() {
+        return ControlResponse::err("Agent is shutting down");
+    }
+
+    match reply_rx.await {
+        Ok(resp) => resp,
+        Err(_) => ControlResponse::err("Internal error: no reply from agent"),
+    }
+}
+
+async fn handle_control_line(
+    line: &str,
+    tx: &tokio::sync::mpsc::Sender<ControlRequest>,
+) -> ControlResponse {
+    let cmd: ControlCommand = match serde_json::from_str(line) {
+        Ok(c) => c,
+        Err(e) => return ControlResponse::err(&format!("Invalid command: {e}")),
+    };
+
+    dispatch_control_command(cmd, tx).await
+}
+
+async fn write_control_response<W>(writer: &mut W, response: &ControlResponse)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let resp_json = serde_json::to_string(response).unwrap_or_default();
+    let _ = writer.write_all(format!("{resp_json}\n").as_bytes()).await;
+    let _ = writer.flush().await;
+}
+
+/// Start the Unix control socket server (daemon side).
+#[cfg(not(windows))]
+pub async fn start_control_server(
+    tx: tokio::sync::mpsc::Sender<ControlRequest>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::UnixListener;
+
+    let path = match sshwarden_config::default_control_socket_path() {
+        Ok(path) => path,
+        Err(e) => {
+            error!(error = %e, "Failed to resolve control socket path");
+            return;
+        }
+    };
+
+    if let Some(parent) = path.parent() {
+        let parent_existed = parent.exists();
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            error!(error = %e, ?parent, "Failed to create control socket directory");
+            return;
+        }
+        if !parent_existed {
+            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            {
+                error!(error = %e, ?parent, "Failed to set control socket directory permissions");
+                return;
+            }
+        }
+    }
+
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            error!(error = %e, ?path, "Failed to remove stale control socket");
+            return;
+        }
+    }
+
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!(error = %e, ?path, "Failed to bind control socket");
+            return;
+        }
+    };
+
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        error!(error = %e, ?path, "Failed to set control socket permissions");
+    }
+
+    info!(?path, "Control server starting on Unix socket");
+
+    loop {
+        let (stream, _addr) = tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok(value) => value,
+                    Err(e) => {
+                        error!(error = %e, "Control socket accept error");
+                        continue;
+                    }
+                }
+            }
+            _ = cancel.cancelled() => {
+                info!(?path, "Control server shutting down");
+                let _ = std::fs::remove_file(&path);
+                return;
+            }
         };
 
-        let resp_json = serde_json::to_string(&response).unwrap_or_default();
-        let _ = writer
-            .write_all(format!("{}\n", resp_json).as_bytes())
-            .await;
-        let _ = writer.flush().await;
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut buf_reader = BufReader::new(reader);
+            let mut line = String::new();
+
+            match buf_reader.read_line(&mut line).await {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) => {
+                    error!(error = %e, "Control socket read error");
+                    return;
+                }
+            }
+
+            let response = handle_control_line(line.trim(), &tx).await;
+            write_control_response(&mut writer, &response).await;
+        });
     }
 }
 
@@ -245,6 +360,38 @@ pub async fn send_control_command(cmd: &str) -> anyhow::Result<ControlResponse> 
     writer.shutdown().await?;
 
     // Read response
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    buf_reader.read_line(&mut line).await?;
+
+    let response: ControlResponse = serde_json::from_str(line.trim())?;
+    Ok(response)
+}
+
+/// Send a control command to the running daemon (client side).
+#[cfg(not(windows))]
+pub async fn send_control_command(cmd: &str) -> anyhow::Result<ControlResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let path = sshwarden_config::default_control_socket_path()?;
+    let stream = UnixStream::connect(&path).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to connect to SSHWarden daemon at {} (is it running?): {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    let command = ControlCommand {
+        cmd: cmd.to_string(),
+    };
+    let cmd_json = serde_json::to_string(&command)?;
+    writer.write_all(format!("{cmd_json}\n").as_bytes()).await?;
+    writer.shutdown().await?;
+
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
     buf_reader.read_line(&mut line).await?;

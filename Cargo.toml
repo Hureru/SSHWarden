@@ -26,11 +26,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 anyhow = "1"
 rpassword = "7"
+serde = { workspace = true }
 serde_json = { workspace = true }
+ssh-key = { workspace = true, features = ["encryption", "ed25519", "rsa", "getrandom"] }
+sha2 = "0.10"
 sysinfo = { workspace = true }
 base64 = { workspace = true }
+zeroize = { workspace = true }
 rand = "0.8"
 slint = "1.15"
+rustls = { version = "0.23", features = ["ring"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -52,6 +57,7 @@ base64 = "0.22"
 bitwarden-russh = { git = "https://github.com/bitwarden/bitwarden-russh.git", rev = "a641316227227f8777fdf56ac9fa2d6b5f7fe662" }
 bytes = "1.11"
 futures = "0.3"
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ssh-key = { version = "0.6.7", default-features = false }
@@ -61,6 +67,7 @@ tokio = { version = "1.48", features = ["io-util", "sync", "macros", "net"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [workspace.lints.clippy]
 print_stderr = "deny"

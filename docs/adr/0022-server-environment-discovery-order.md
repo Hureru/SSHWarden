@@ -1,0 +1,3 @@
+# Server environment discovery order
+
+SSHWarden will resolve Bitwarden service URLs in this order: explicit user configuration first, `/api/config` environment discovery second, and built-in defaults last. This lets self-hosted deployments such as `warden-worker` advertise their API, identity, and notification URLs (`environment.api`, `environment.identity`, `environment.notifications`) without requiring users to duplicate routing knowledge in SSHWarden configuration, while still preserving explicit override for unusual deployments. Discovery failure is non-fatal: SSHWarden logs and reports the failure, then falls back to built-in URL rules so older or partially compatible servers can still be used.

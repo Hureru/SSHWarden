@@ -22,8 +22,12 @@ pub struct SshAgentUIRequest {
     pub request_id: u32,
     pub cipher_id: Option<String>,
     pub process_name: String,
+    /// PID of the calling process (best-effort; 0 if unknown). Used by the
+    /// host application for UX features like host inference.
+    pub pid: u32,
     pub is_list: bool,
     pub namespace: Option<String>,
+    pub operation_kind: crate::request_parser::OperationKind,
     pub is_forwarding: bool,
 }
 
@@ -31,6 +35,7 @@ pub struct SshAgentUIRequest {
 #[derive(Clone)]
 pub struct SshWardenKey {
     pub private_key: Option<ssh_key::private::PrivateKey>,
+    pub public_key_bytes: Vec<u8>,
     pub name: String,
     pub cipher_uuid: String,
 }
@@ -41,14 +46,7 @@ impl SshKey for SshWardenKey {
     }
 
     fn public_key_bytes(&self) -> Vec<u8> {
-        if let Some(ref private_key) = self.private_key {
-            private_key
-                .public_key()
-                .to_bytes()
-                .expect("Cipher private key is always correctly parsed")
-        } else {
-            Vec::new()
-        }
+        self.public_key_bytes.clone()
     }
 
     fn private_key(&self) -> Option<Box<dyn ssh_key::SigningKey>> {
@@ -87,6 +85,7 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
                 return false;
             }
         };
+        let operation_kind = request_data.operation_kind();
         let namespace = match request_data {
             request_parser::SshAgentSignRequest::SshSigRequest(ref req) => {
                 Some(req.namespace.clone())
@@ -108,8 +107,10 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
                 request_id,
                 cipher_id: Some(ssh_key.cipher_uuid.clone()),
                 process_name: info.process_name().to_string(),
+                pid: info.pid(),
                 is_list: false,
                 namespace,
+                operation_kind,
                 is_forwarding: info.is_forwarding(),
             })
             .await
@@ -134,8 +135,10 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
             request_id,
             cipher_id: None,
             process_name: info.process_name().to_string(),
+            pid: info.pid(),
             is_list: true,
             namespace: None,
+            operation_kind: crate::request_parser::OperationKind::SshAuthentication,
             is_forwarding: info.is_forwarding(),
         };
         self.show_ui_request_tx
@@ -227,9 +230,10 @@ impl SshWardenAgent {
                         .to_bytes()
                         .expect("Cipher private key is always correctly parsed");
                     keystore.0.write().expect("RwLock is not poisoned").insert(
-                        public_key_bytes,
+                        public_key_bytes.clone(),
                         SshWardenKey {
                             private_key: Some(private_key),
+                            public_key_bytes,
                             name: name.clone(),
                             cipher_uuid: cipher_id.clone(),
                         },
@@ -237,6 +241,45 @@ impl SshWardenAgent {
                 }
                 Err(e) => {
                     error!(error=%e, "Error while parsing key");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn set_public_identities(
+        &mut self,
+        identities: Vec<(String, String, String)>,
+    ) -> Result<(), anyhow::Error> {
+        if !self.is_running() {
+            return Err(anyhow::anyhow!(
+                "[SshWardenAgent] Tried to set identities while agent is not running"
+            ));
+        }
+
+        let keystore = &mut self.keystore;
+        keystore.0.write().expect("RwLock is not poisoned").clear();
+        self.needs_unlock
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        for (public_key_openssh, name, cipher_id) in identities {
+            match ssh_key::PublicKey::from_openssh(&public_key_openssh)
+                .and_then(|public_key| public_key.to_bytes())
+            {
+                Ok(public_key_bytes) => {
+                    keystore.0.write().expect("RwLock is not poisoned").insert(
+                        public_key_bytes.clone(),
+                        SshWardenKey {
+                            private_key: None,
+                            public_key_bytes,
+                            name,
+                            cipher_uuid: cipher_id,
+                        },
+                    );
+                }
+                Err(e) => {
+                    error!(error=%e, "Error while parsing public key identity");
                 }
             }
         }
@@ -260,6 +303,8 @@ impl SshWardenAgent {
             .for_each(|(_public_key, key)| {
                 key.private_key = None;
             });
+        self.needs_unlock
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -277,6 +322,13 @@ impl SshWardenAgent {
             .read()
             .expect("RwLock is not poisoned")
             .len()
+    }
+
+    pub fn start_server(
+        auth_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
+        auth_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
+    ) -> Result<Self, anyhow::Error> {
+        Self::start_server_with_endpoint(auth_request_tx, auth_response_tx, None)
     }
 
     pub fn clear_needs_unlock(&self) {
@@ -369,6 +421,7 @@ nGZV/aEAZ3ZMrsrA3g32AAAAEHRlc3RAZXhhbXBsZS5jb20BAgMEBQ==
 
         assert_eq!(ssh_key.name, "ed25519-key");
         assert_eq!(ssh_key.cipher_uuid, "ed25519-uuid");
+        assert!(!ssh_key.public_key_bytes().is_empty());
 
         let signing_key = ssh_key.private_key().expect("should have signing key");
         let message = b"test message for ed25519";

@@ -1,6 +1,7 @@
-/// Quick test for Windows TaskDialog authorization and Windows Hello unlock prompts.
-///
-/// Run with: cargo run -p sshwarden-ui --example test_prompts
+#![allow(clippy::print_stdout)]
+//! Quick test for Windows TaskDialog authorization and Windows Hello unlock prompts.
+//!
+//! Run with: cargo run -p sshwarden-ui --example test_prompts
 
 #[tokio::main]
 async fn main() {
@@ -14,6 +15,7 @@ async fn main() {
         key_name: "id_ed25519 (test key)".to_string(),
         process_name: "ssh.exe (PID: 12345)".to_string(),
         namespace: Some("git".to_string()),
+        operation_kind: "git_signing".to_string(),
         is_forwarding: false,
     };
 
@@ -25,6 +27,7 @@ async fn main() {
         key_name: "server-key".to_string(),
         process_name: "unknown".to_string(),
         namespace: None,
+        operation_kind: "ssh_authentication".to_string(),
         is_forwarding: true,
     };
 
