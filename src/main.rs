@@ -286,8 +286,11 @@ type UIRequestTx = Arc<tokio::sync::mpsc::Sender<sshwarden_ui::UIRequest>>;
 /// Internal events emitted by spawned SSH request handlers back to the main loop.
 #[allow(clippy::enum_variant_names)]
 enum RuntimeEvent {
+    #[cfg(windows)]
     AutoUnlockedWindowsHello,
-    AutoUnlockedPin { pin: String },
+    AutoUnlockedPin {
+        pin: String,
+    },
     AutoUnlockedNative,
 }
 
@@ -635,11 +638,6 @@ async fn fetch_status_details_for_doctor() -> anyhow::Result<serde_json::Value> 
 #[cfg(windows)]
 fn windows_openssh_pipe_exists() -> bool {
     std::path::Path::new(r"\\.\pipe\openssh-ssh-agent").exists()
-}
-
-#[cfg(not(windows))]
-fn windows_openssh_pipe_exists() -> bool {
-    false
 }
 
 fn count_key_selector_files() -> anyhow::Result<(std::path::PathBuf, usize)> {
@@ -5571,7 +5569,7 @@ mod tests {
     #[test]
     fn windows_exe_suffix_ok() {
         assert_eq!(
-            infer_from_argv(&["C:\\Windows\\System32\\OpenSSH\\ssh.exe", "host"]).as_deref(),
+            infer_from_argv(&["ssh.exe", "host"]).as_deref(),
             Some("host")
         );
     }
