@@ -2640,8 +2640,8 @@ async fn run_foreground(
             // Runtime events from spawned SSH request handlers
             Some(event) = runtime_event_rx.recv() => {
                 match event {
+                    #[cfg(windows)]
                     RuntimeEvent::AutoUnlockedWindowsHello => {
-                        #[cfg(windows)]
                         try_restore_api_session_hello(
                             &api_client,
                             &config,
