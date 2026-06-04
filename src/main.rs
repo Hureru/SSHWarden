@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-#[cfg(windows)]
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use tokio::sync::RwLock;
@@ -369,12 +368,16 @@ fn main() -> anyhow::Result<()> {
                 // RT-02: single-instance guard for ANY run_foreground entry —
                 // both `sshwarden daemon` and a bare foreground `sshwarden` are
                 // the one singleton daemon (one agent + one control server + one
-                // OpenSSH endpoint); two cannot coexist. Previously only the
-                // daemon branch was guarded, so a bare `sshwarden` could spin up a
-                // second agent and control server competing for the same pipes.
-                if is_daemon_running() {
-                    info!("SSHWarden is already running");
-                    return Ok(());
+                // OpenSSH endpoint); two cannot coexist. Claim the PID file
+                // atomically so two near-simultaneous starters cannot both pass a
+                // check-then-write gate and spin up competing agents/pipes.
+                match claim_pid_file() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        info!("SSHWarden is already running");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
                 }
                 #[cfg(windows)]
                 if is_daemon_mode {
@@ -383,7 +386,6 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(not(windows))]
                 let _ = is_daemon_mode;
 
-                write_pid_file()?;
                 info!("SSHWarden started (PID: {})", std::process::id());
                 let result = run_foreground(config, ui_tx).await;
                 remove_pid_file();
@@ -1203,12 +1205,28 @@ async fn cmd_login(
     base_url: Option<&str>,
     email: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Capture whether the caller explicitly overrode email/server BEFORE
+    // resolving defaults, so we can reject overrides a running daemon would ignore.
+    let email_override = email.is_some();
+    let base_url_override = base_url.is_some();
     let email = match email {
         Some(e) => e.to_string(),
         None if !config.auth.email.is_empty() => config.auth.email.clone(),
         None => prompt_email("Email: ")?,
     };
     let password = prompt_password("Master password: ")?;
+
+    // UX-2: the control protocol carries only the password; a running daemon logs
+    // in with its OWN configured server/account. If the caller supplied
+    // --email/--base-url, the daemon cannot honor them — fail loud rather than
+    // silently logging into the wrong account/server.
+    if (email_override || base_url_override) && is_daemon_running() {
+        anyhow::bail!(
+            "A daemon is already running and logs in with its own configured account/server; \
+             --email/--base-url cannot be applied to it. Stop the daemon to log in standalone, \
+             or omit these flags."
+        );
+    }
 
     // Prefer the running daemon: it performs the login + sync and loads keys
     // into the live agent. The control protocol carries only the password, so
@@ -1572,13 +1590,20 @@ fn sync_managed_ssh_config_with_bindings(
 fn sync_managed_ssh_config_inner(keys: &[ManagedKey], force_write: bool) -> anyhow::Result<()> {
     let mut bindings = sshwarden_config::bindings::HostBindingsFile::load()
         .context("Failed to load host bindings")?;
-    let known_ids: Vec<&str> = keys.iter().map(|k| k.cipher_id.as_str()).collect();
-    let pruned = bindings.prune_orphans(known_ids.iter().copied());
-    if pruned > 0 {
-        bindings
-            .save()
-            .context("Failed to save host bindings after pruning orphans")?;
-        info!("Pruned {} orphan host binding(s)", pruned);
+    // UX-7/data-safety: an empty key set means we have no cache metadata to
+    // classify orphans against — e.g. binding ahead of first sync (see
+    // resolve_cipher_id), or the local key cache isn't loaded. Pruning against an
+    // empty known-set would delete EVERY binding, so only prune when we actually
+    // know the current key set.
+    if !keys.is_empty() {
+        let known_ids: Vec<&str> = keys.iter().map(|k| k.cipher_id.as_str()).collect();
+        let pruned = bindings.prune_orphans(known_ids.iter().copied());
+        if pruned > 0 {
+            bindings
+                .save()
+                .context("Failed to save host bindings after pruning orphans")?;
+            info!("Pruned {} orphan host binding(s)", pruned);
+        }
     }
 
     let include_path = managed_sshwarden_include_path()?;
@@ -2839,6 +2864,7 @@ async fn run_foreground(
                 let local_cache_key_state_clone = local_cache_key_state.clone();
                 let runtime_event_tx_clone = runtime_event_tx.clone();
                 let authorization_memory_clone = authorization_memory.clone();
+                let pin_failures_clone = pin_failures.clone();
 
                 let ui_tx_clone = ui_request_tx.clone();
 
@@ -2859,6 +2885,7 @@ async fn run_foreground(
                         ui_tx_clone,
                         runtime_event_tx_clone,
                         authorization_memory_clone,
+                        pin_failures_clone,
                     ).await;
                     in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 });
@@ -3088,7 +3115,7 @@ async fn lock_vault(
 #[derive(Default)]
 struct PinFailureState {
     consecutive_failures: u32,
-    locked_until: Option<tokio::time::Instant>,
+    locked_until: Option<std::time::Instant>,
 }
 
 type PinFailureHandle = Arc<std::sync::Mutex<PinFailureState>>;
@@ -3104,7 +3131,7 @@ const PIN_LOCKOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Reject a PIN attempt outright while a lockout is active. Returns the
 /// remaining lockout duration if locked, clearing an expired lockout.
 fn pin_lockout_remaining(pin_failures: &PinFailureHandle) -> Option<std::time::Duration> {
-    let now = tokio::time::Instant::now();
+    let now = std::time::Instant::now();
     let mut st = pin_failures.lock().unwrap_or_else(|e| e.into_inner());
     match st.locked_until {
         Some(until) if until > now => Some(until - now),
@@ -3127,7 +3154,7 @@ fn record_pin_attempt(pin_failures: &PinFailureHandle, success: bool) -> std::ti
     }
     st.consecutive_failures = st.consecutive_failures.saturating_add(1);
     if st.consecutive_failures >= PIN_MAX_ATTEMPTS {
-        st.locked_until = Some(tokio::time::Instant::now() + PIN_LOCKOUT);
+        st.locked_until = Some(std::time::Instant::now() + PIN_LOCKOUT);
     }
     std::cmp::min(
         PIN_FAILURE_BASE_DELAY * st.consecutive_failures,
@@ -3151,7 +3178,16 @@ async fn build_status_response(
     let count = agent.key_count();
     let signable = agent.signable_key_count();
     let agent_running = agent.is_running();
-    let has_pin = pin_encrypted_keys.read().await.is_some();
+    // SEC: reflect PIN availability across both layouts — the legacy
+    // pin_encrypted_keys slot AND the v3 local key cache, where set-pin/migration
+    // moves the PIN into local_cache_key.pin_encrypted (and clears the legacy slot).
+    let has_pin = pin_encrypted_keys.read().await.is_some()
+        || local_key_cache_data
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.local_cache_key.pin_encrypted.is_some())
+            .unwrap_or(false);
     let has_vault = vault_file_data.read().await.is_some();
     let has_local_key_cache = local_key_cache_data.read().await.is_some();
     let authenticated = api_client.read().await.is_some();
@@ -3440,6 +3476,9 @@ async fn handle_control_command(
 
                 if let Some(enc_data) = enc_data {
                     let (validator, decrypted_cache) = make_pin_validator(enc_data);
+                    // SEC-03: share the daemon-wide PIN brute-force lockout with
+                    // `unlock --pin` so dialog attempts can't bypass the cap.
+                    let validator = gate_pin_validator(validator, pin_failures);
                     let pin_result =
                         sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator).await;
 
@@ -4305,6 +4344,25 @@ fn make_pin_validator(enc_data: String) -> (PinValidator, DecryptedCache) {
     (validator, decrypted_cache)
 }
 
+/// Wrap a PIN validator so every attempt shares the daemon-wide brute-force
+/// accounting (SEC-03) with `ControlAction::UnlockPin`: reject outright while a
+/// lockout is active, and record each outcome so UI/SSH dialog attempts count
+/// toward the SAME lockout the control channel enforces — otherwise the dialog
+/// path is an unthrottled brute-force bypass. The wrapper runs inside the
+/// dialog's validation thread (not a tokio worker), so the failure accounting is
+/// intentionally clock-agnostic (std::time::Instant).
+fn gate_pin_validator(inner: PinValidator, pin_failures: &PinFailureHandle) -> PinValidator {
+    let pin_failures = pin_failures.clone();
+    Arc::new(move |pin: &str| -> bool {
+        if pin_lockout_remaining(&pin_failures).is_some() {
+            return false;
+        }
+        let ok = inner(pin);
+        let _ = record_pin_attempt(&pin_failures, ok);
+        ok
+    })
+}
+
 /// Try to restore an API session from the device session file after Hello unlock.
 ///
 /// Uses the Hello-encrypted refresh token stored in the session file.
@@ -4871,6 +4929,7 @@ async fn handle_ui_request(
     ui_request_tx: UIRequestTx,
     runtime_event_tx: tokio::sync::mpsc::Sender<RuntimeEvent>,
     authorization_memory: AuthorizationMemorySet,
+    pin_failures: PinFailureHandle,
 ) {
     if request.is_list {
         if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
@@ -5096,6 +5155,10 @@ async fn handle_ui_request(
                 let _ = response_tx.send((request.request_id, false));
                 return;
             };
+
+        // SEC-03: share the daemon-wide PIN brute-force lockout with the control
+        // channel so repeated wrong PINs in the SSH-request dialog also count.
+        let validator = gate_pin_validator(validator, &pin_failures);
 
         let context_key_name = {
             let names = key_names.read().await;
@@ -5402,6 +5465,18 @@ async fn persist_bind_payload(
 
         let keys = load_managed_keys_from_cache().unwrap_or_default();
         sync_managed_ssh_config_inner(&keys, true)?;
+
+        // CFG-2: a binding is inert unless ~/.ssh/config Includes the managed
+        // snippet. Mirror cmd_bindings_add so UI/sign-flow bindings install the
+        // Include line too (idempotent). Non-fatal — the snippet is already saved.
+        let include_path = managed_sshwarden_include_path()?;
+        let config_path = user_ssh_config_path()?;
+        if let Err(e) = write_sshwarden_include_line(&config_path, &include_path) {
+            tracing::warn!(
+                "Bindings saved, but failed to ensure the Include line in {}: {e}",
+                config_path.display()
+            );
+        }
         Ok(())
     })
     .await
@@ -5565,18 +5640,9 @@ fn log_file_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(data_dir()?.join("sshwarden.log"))
 }
 
-/// Check if daemon is already running by reading PID file and checking process.
-fn is_daemon_running() -> bool {
-    let pid_path = match pid_file_path() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-
-    if !pid_path.exists() {
-        return false;
-    }
-
-    let pid_str = match std::fs::read_to_string(&pid_path) {
+/// Return true if `path` holds a PID whose recorded process is still alive.
+fn pid_file_owner_alive(path: &std::path::Path) -> bool {
+    let pid_str = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -5593,12 +5659,64 @@ fn is_daemon_running() -> bool {
     sys.process(sysinfo::Pid::from_u32(pid)).is_some()
 }
 
-/// Write current PID to pid file.
-fn write_pid_file() -> anyhow::Result<()> {
-    let pid = std::process::id();
+/// Check if daemon is already running by reading PID file and checking process.
+fn is_daemon_running() -> bool {
+    match pid_file_path() {
+        Ok(p) => p.exists() && pid_file_owner_alive(&p),
+        Err(_) => false,
+    }
+}
+
+/// Atomically claim the singleton PID file (RT-02). Returns `Ok(true)` if this
+/// process is now the owner, `Ok(false)` if a live daemon already owns it.
+///
+/// Replaces the previous check-then-write (which let two near-simultaneous
+/// starters both pass the `is_daemon_running()` check). `create_new` is an atomic
+/// O_EXCL/CREATE_NEW open, so exactly one racing process wins the create. A
+/// leftover file whose owner is gone (crash without clean shutdown) is treated as
+/// stale and reclaimed.
+fn claim_pid_file() -> anyhow::Result<bool> {
+    use std::io::Write;
     let path = pid_file_path()?;
-    std::fs::write(&path, pid.to_string())
-        .with_context(|| format!("Failed to write PID file: {}", path.display()))
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create PID file directory: {}", parent.display())
+        })?;
+    }
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(std::process::id().to_string().as_bytes())
+                    .with_context(|| format!("Failed to write PID file: {}", path.display()))?;
+                return Ok(true);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if pid_file_owner_alive(&path) {
+                    return Ok(false);
+                }
+                // Stale: the recorded owner is gone. Remove and retry the atomic
+                // create; if another starter wins in between, the next iteration
+                // sees a live owner and yields.
+                match std::fs::remove_file(&path) {
+                    Ok(()) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("Failed to remove stale PID file: {}", path.display())
+                        })
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to create PID file: {}", path.display()))
+            }
+        }
+    }
 }
 
 /// Remove pid file on shutdown.

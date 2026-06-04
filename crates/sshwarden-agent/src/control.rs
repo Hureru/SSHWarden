@@ -235,6 +235,14 @@ pub async fn start_control_server(
         error!("Could not build control pipe security descriptor; using default DACL");
     }
 
+    // SEC-01: we must create the FIRST instance of the pipe ourselves so OUR
+    // security descriptor governs the DACL. Windows derives every additional
+    // instance's DACL from whoever created the first one, so attaching to a
+    // pre-existing pipe would silently inherit a (possibly hostile) DACL. Claim
+    // the first instance with FILE_FLAG_FIRST_PIPE_INSTANCE; once we own it,
+    // subsequent instances must drop the flag (the first instance still exists).
+    let mut first_instance = true;
+
     loop {
         // Create a new pipe instance for each connection. The SECURITY_ATTRIBUTES
         // pointer is derived and consumed entirely within this (await-free) block
@@ -248,23 +256,31 @@ pub async fn start_control_server(
                 .unwrap_or(std::ptr::null_mut());
             unsafe {
                 ServerOptions::new()
-                    .first_pipe_instance(false)
+                    .first_pipe_instance(first_instance)
                     .create_with_security_attributes_raw(CONTROL_PIPE_NAME, sa_ptr)
-                    .or_else(|_| {
-                        ServerOptions::new()
-                            .first_pipe_instance(true)
-                            .create_with_security_attributes_raw(CONTROL_PIPE_NAME, sa_ptr)
-                    })
             }
         };
         let server = match created {
             Ok(s) => s,
             Err(e) => {
+                if first_instance {
+                    // SEC-01: fail closed. We could not claim the first instance,
+                    // so another process already owns the name and would dictate
+                    // the DACL for any instance we attach to. Refuse rather than
+                    // inherit a foreign descriptor.
+                    error!(
+                        "Refusing to attach to existing control pipe (could not claim first instance): {}",
+                        e
+                    );
+                    return;
+                }
                 error!("Failed to create control pipe: {}", e);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
         };
+        // We own the first instance; further instances must not set the flag.
+        first_instance = false;
 
         // Wait for a client to connect, or cancellation
         tokio::select! {

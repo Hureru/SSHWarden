@@ -174,7 +174,14 @@ impl BitwardenClient {
         let token_resp: TokenResponse =
             serde_json::from_str(&body).context("Failed to parse token response")?;
 
-        self.access_token = Some(token_resp.access_token);
+        self.set_access_token(token_resp.access_token);
+        {
+            // SEC-05: scrub any previous refresh token before replacing it.
+            use zeroize::Zeroize;
+            if let Some(old) = self.refresh_token.as_mut() {
+                old.zeroize();
+            }
+        }
         self.refresh_token = token_resp.refresh_token.clone();
         self.token_expiry =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(token_resp.expires_in));
@@ -391,8 +398,23 @@ impl BitwardenClient {
             .map(ToOwned::to_owned))
     }
 
+    /// Replace the access token, scrubbing the previous value first (SEC-05) so
+    /// rotated tokens don't linger on the heap (Drop only covers the final value).
+    fn set_access_token(&mut self, token: String) {
+        use zeroize::Zeroize;
+        if let Some(old) = self.access_token.as_mut() {
+            old.zeroize();
+        }
+        self.access_token = Some(token);
+    }
+
     /// Set the refresh token (e.g., restored from session file).
     pub fn set_refresh_token(&mut self, token: String) {
+        // SEC-05: scrub any previous refresh token before overwriting it.
+        use zeroize::Zeroize;
+        if let Some(old) = self.refresh_token.as_mut() {
+            old.zeroize();
+        }
         self.refresh_token = Some(token);
     }
 
@@ -452,9 +474,9 @@ impl BitwardenClient {
         let token_resp: TokenResponse =
             serde_json::from_str(&body).context("Failed to parse token refresh response")?;
 
-        self.access_token = Some(token_resp.access_token);
+        self.set_access_token(token_resp.access_token);
         if let Some(new_refresh) = token_resp.refresh_token {
-            self.refresh_token = Some(new_refresh);
+            self.set_refresh_token(new_refresh);
         }
         self.token_expiry =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(token_resp.expires_in));
