@@ -27,6 +27,9 @@ pub struct VaultFile {
 }
 
 impl VaultFile {
+    /// Supported on-disk format versions for the legacy vault file.
+    const SUPPORTED_VERSIONS: &'static [u32] = &[1];
+
     /// Path to the vault file (alongside the executable).
     pub fn path() -> anyhow::Result<PathBuf> {
         Ok(crate::config_dir()?.join("vault.enc"))
@@ -42,22 +45,15 @@ impl VaultFile {
             .with_context(|| format!("Failed to read vault file: {}", path.display()))?;
         let vault: VaultFile = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse vault file: {}", path.display()))?;
-        Ok(Some(vault))
-    }
-
-    /// Save the vault file to disk, creating the parent directory if needed.
-    pub fn save(&self) -> anyhow::Result<()> {
-        let path = Self::path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create vault directory: {}", parent.display())
-            })?;
+        if !Self::SUPPORTED_VERSIONS.contains(&vault.version) {
+            anyhow::bail!(
+                "Unsupported vault file version {} (supported: {:?}): {}",
+                vault.version,
+                Self::SUPPORTED_VERSIONS,
+                path.display()
+            );
         }
-        let content =
-            serde_json::to_string_pretty(self).context("Failed to serialize vault file")?;
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write vault file: {}", path.display()))?;
-        Ok(())
+        Ok(Some(vault))
     }
 
     /// Delete the vault file from disk (if it exists).

@@ -255,27 +255,51 @@ pub fn encrypt_enc_string(data: &[u8], key: &SymmetricKey) -> anyhow::Result<Str
     ))
 }
 
-/// Derive a SymmetricKey from a PIN using Argon2id.
+/// The fixed legacy salt used before per-cache random salts (SEC-04).
 ///
-/// Uses a fixed salt derived from the purpose string. For PIN-based encryption
-/// this is sufficient as the PIN is just a convenience unlock mechanism.
-pub fn derive_pin_key(pin: &str) -> anyhow::Result<SymmetricKey> {
+/// Retained so pre-v3 local caches and the legacy `vault.enc` (both encrypted
+/// with this salt) stay decryptable; new material uses `random_pin_salt()`.
+pub fn legacy_pin_salt() -> [u8; 32] {
     use sha2::Digest;
-    let salt = Sha256::digest(b"sshwarden-pin-key-derivation");
+    let digest = Sha256::digest(b"sshwarden-pin-key-derivation");
+    let mut salt = [0u8; 32];
+    salt.copy_from_slice(&digest);
+    salt
+}
 
+/// A fresh random 16-byte salt for PIN key derivation. Stored alongside the
+/// PIN-encrypted material so an attacker cannot precompute a single Argon2id
+/// table against every user's cache (the 4-character PIN keyspace is small).
+pub fn random_pin_salt() -> [u8; 16] {
+    use rand::RngCore;
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt);
+    salt
+}
+
+/// Derive a SymmetricKey from a PIN and an explicit salt using Argon2id.
+pub fn derive_pin_key_with_salt(pin: &str, salt: &[u8]) -> anyhow::Result<SymmetricKey> {
     let params = argon2::Params::new(64 * 1024, 3, 1, Some(64))
         .map_err(|e| anyhow!("Invalid Argon2 params: {e}"))?;
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
     let mut key_material = Zeroizing::new(vec![0u8; 64]);
     argon2
-        .hash_password_into(pin.as_bytes(), &salt, &mut key_material)
+        .hash_password_into(pin.as_bytes(), salt, &mut key_material)
         .map_err(|e| anyhow!("Argon2 PIN derivation failed: {e}"))?;
 
     Ok(SymmetricKey {
         enc_key: key_material[..32].to_vec(),
         mac_key: key_material[32..].to_vec(),
     })
+}
+
+/// Derive a SymmetricKey from a PIN using the fixed legacy salt.
+///
+/// Backward-compatibility shim for the legacy `vault.enc` and pre-v3 caches.
+/// New code should use `derive_pin_key_with_salt` with a random salt.
+pub fn derive_pin_key(pin: &str) -> anyhow::Result<SymmetricKey> {
+    derive_pin_key_with_salt(pin, &legacy_pin_salt())
 }
 
 pub fn random_symmetric_key() -> SymmetricKey {
@@ -316,17 +340,27 @@ pub fn decode_symmetric_key(encoded: &str) -> anyhow::Result<SymmetricKey> {
     Ok(key)
 }
 
-/// Encrypt a string with a PIN-derived key.
-pub fn pin_encrypt(data: &str, pin: &str) -> anyhow::Result<String> {
-    let key = derive_pin_key(pin)?;
+/// Encrypt a string with a PIN-derived key using an explicit salt (SEC-04).
+pub fn pin_encrypt_with_salt(data: &str, pin: &str, salt: &[u8]) -> anyhow::Result<String> {
+    let key = derive_pin_key_with_salt(pin, salt)?;
     encrypt_enc_string(data.as_bytes(), &key)
 }
 
-/// Decrypt a string with a PIN-derived key.
-pub fn pin_decrypt(enc_string: &str, pin: &str) -> anyhow::Result<String> {
-    let key = derive_pin_key(pin)?;
+/// Decrypt a string with a PIN-derived key using an explicit salt (SEC-04).
+pub fn pin_decrypt_with_salt(enc_string: &str, pin: &str, salt: &[u8]) -> anyhow::Result<String> {
+    let key = derive_pin_key_with_salt(pin, salt)?;
     let bytes = decrypt_enc_string(enc_string, &key)?;
     String::from_utf8(bytes).context("PIN-decrypted data is not valid UTF-8")
+}
+
+/// Encrypt a string with a PIN-derived key using the fixed legacy salt.
+pub fn pin_encrypt(data: &str, pin: &str) -> anyhow::Result<String> {
+    pin_encrypt_with_salt(data, pin, &legacy_pin_salt())
+}
+
+/// Decrypt a string with a PIN-derived key using the fixed legacy salt.
+pub fn pin_decrypt(enc_string: &str, pin: &str) -> anyhow::Result<String> {
+    pin_decrypt_with_salt(enc_string, pin, &legacy_pin_salt())
 }
 
 #[cfg(test)]
@@ -394,5 +428,32 @@ mod tests {
         assert!(encrypted.starts_with("2."));
         let decrypted = decrypt_enc_string(&encrypted, &key).unwrap();
         assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn test_pin_salt_roundtrip_and_legacy_compat() {
+        let data = r#"[["k","n","i"]]"#;
+        let pin = "1234";
+        let salt = random_pin_salt();
+
+        // Round-trip with an explicit random salt.
+        let enc = pin_encrypt_with_salt(data, pin, &salt).unwrap();
+        assert_eq!(pin_decrypt_with_salt(&enc, pin, &salt).unwrap(), data);
+
+        // A different salt yields a different key, so decryption fails.
+        let other = random_pin_salt();
+        assert_ne!(salt, other);
+        assert!(pin_decrypt_with_salt(&enc, pin, &other).is_err());
+
+        // The legacy wrappers are equivalent to using the legacy salt explicitly,
+        // so existing vault.enc / pre-v3 caches stay decryptable.
+        let legacy = pin_encrypt(data, pin).unwrap();
+        assert_eq!(
+            pin_decrypt_with_salt(&legacy, pin, &legacy_pin_salt()).unwrap(),
+            data
+        );
+        // ...and a legacy ciphertext is NOT decryptable with a random salt,
+        // confirming the v2->v3 migration boundary is real.
+        assert!(pin_decrypt_with_salt(&legacy, pin, &random_pin_salt()).is_err());
     }
 }

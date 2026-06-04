@@ -10,7 +10,14 @@ mod platform {
     const ACCOUNT: &str = "SSHWarden";
 
     pub fn native_available() -> bool {
-        true
+        // XP-2: the macOS path reads/writes the login Keychain with no
+        // user-presence ceremony (Touch ID / password), which does not satisfy
+        // ADR-0015. Until a SecAccessControl (kSecAccessControlUserPresence) +
+        // LAContext ceremony is implemented and verified on real hardware,
+        // disable native unlock so SSHWarden falls back to PIN/password instead
+        // of silently using the Keychain.
+        // TODO(XP-2): implement the user-presence ceremony, then return true.
+        false
     }
 
     pub fn native_encrypt_local_cache_key(encoded_local_cache_key: &str) -> Result<String> {
@@ -91,9 +98,12 @@ mod platform {
 
     pub fn native_delete_local_cache_key(_slot: Option<&str>) -> Result<()> {
         let Some(secret_tool) = which_secret_tool() else {
+            // No keyring tool present — nothing was stored, nothing to delete.
             return Ok(());
         };
-        let _ = std::process::Command::new(&secret_tool)
+        // XP-5: check the exit status so a failed revocation is reported (and
+        // surfaced by `forget`) instead of silently claiming success.
+        let status = std::process::Command::new(&secret_tool)
             .args([
                 "clear",
                 "application",
@@ -101,7 +111,13 @@ mod platform {
                 "kind",
                 "local-cache-key",
             ])
-            .status();
+            .status()
+            .map_err(|e| anyhow!("secret-tool clear failed to run: {e}"))?;
+        if !status.success() {
+            return Err(anyhow!(
+                "secret-tool clear exited unsuccessfully; native unlock material may remain in the keyring"
+            ));
+        }
         Ok(())
     }
 

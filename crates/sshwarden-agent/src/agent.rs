@@ -68,6 +68,11 @@ pub struct SshWardenAgent {
     request_id: Arc<AtomicU32>,
     needs_unlock: Arc<AtomicBool>,
     is_running: Arc<AtomicBool>,
+    /// Reports a fatal agent-transport failure (e.g. the SSH agent endpoint
+    /// could not be claimed). The main loop watches this so the daemon shuts
+    /// down instead of running as a zombie that still answers status/unlock
+    /// while serving no SSH client (RT-01).
+    fatal_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
 }
 
 impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
@@ -102,7 +107,8 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
         );
 
         let mut rx_channel = self.ui_response_tx.subscribe();
-        self.show_ui_request_tx
+        if self
+            .show_ui_request_tx
             .send(SshAgentUIRequest {
                 request_id,
                 cipher_id: Some(ssh_key.cipher_uuid.clone()),
@@ -114,7 +120,13 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
                 is_forwarding: info.is_forwarding(),
             })
             .await
-            .expect("Should send request to ui");
+            .is_err()
+        {
+            // The host application's UI channel is gone (daemon shutting down or
+            // main loop exited). Fail closed instead of panicking the serve task.
+            error!("UI request channel closed; denying sign request");
+            return false;
+        }
         while let Ok((id, response)) = rx_channel.recv().await {
             if id == request_id {
                 return response;
@@ -141,10 +153,11 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
             operation_kind: crate::request_parser::OperationKind::SshAuthentication,
             is_forwarding: info.is_forwarding(),
         };
-        self.show_ui_request_tx
-            .send(message)
-            .await
-            .expect("Should send request to ui");
+        if self.show_ui_request_tx.send(message).await.is_err() {
+            // UI channel gone (daemon shutting down); fail closed, don't panic.
+            error!("UI request channel closed; denying list request");
+            return false;
+        }
         while let Ok((id, response)) = rx_channel.recv().await {
             if id == request_id {
                 return response;
@@ -175,6 +188,7 @@ impl SshWardenAgent {
         auth_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
         auth_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
     ) -> Self {
+        let (fatal_tx, _fatal_rx) = tokio::sync::watch::channel(None);
         Self {
             keystore: ssh_agent::KeyStore(Arc::new(RwLock::new(HashMap::new()))),
             cancellation_token: CancellationToken::new(),
@@ -183,6 +197,7 @@ impl SshWardenAgent {
             request_id: Arc::new(AtomicU32::new(0)),
             needs_unlock: Arc::new(AtomicBool::new(true)),
             is_running: Arc::new(AtomicBool::new(false)),
+            fatal_tx: Arc::new(fatal_tx),
         }
     }
 
@@ -229,7 +244,7 @@ impl SshWardenAgent {
                         .public_key()
                         .to_bytes()
                         .expect("Cipher private key is always correctly parsed");
-                    keystore.0.write().expect("RwLock is not poisoned").insert(
+                    let displaced = keystore.0.write().expect("RwLock is not poisoned").insert(
                         public_key_bytes.clone(),
                         SshWardenKey {
                             private_key: Some(private_key),
@@ -238,6 +253,17 @@ impl SshWardenAgent {
                             cipher_uuid: cipher_id.clone(),
                         },
                     );
+                    if displaced.is_some() {
+                        // LOGIC-7: the keystore is keyed by public key bytes, so
+                        // two vault items sharing a public key collapse into one.
+                        // Warn so the operator understands why status/key_count
+                        // can be lower than the number of vault keys.
+                        tracing::warn!(
+                            key = %name,
+                            "Duplicate public key: overwrote an earlier agent keystore entry; \
+                             status key_count will be lower than the vault key count"
+                        );
+                    }
                 }
                 Err(e) => {
                     error!(error=%e, "Error while parsing key");
@@ -324,6 +350,20 @@ impl SshWardenAgent {
             .len()
     }
 
+    /// Number of loaded keys that actually hold private material and can sign.
+    /// While the vault is locked this is 0 even though `key_count()` (listed
+    /// identities) may be non-zero. status reports this so what it shows matches
+    /// what the agent can actually sign.
+    pub fn signable_key_count(&self) -> usize {
+        self.keystore
+            .0
+            .read()
+            .expect("RwLock is not poisoned")
+            .values()
+            .filter(|k| k.private_key.is_some())
+            .count()
+    }
+
     pub fn start_server(
         auth_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
         auth_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
@@ -347,6 +387,18 @@ impl SshWardenAgent {
 
     pub fn is_running_flag(&self) -> Arc<AtomicBool> {
         self.is_running.clone()
+    }
+
+    /// A receiver the main loop watches for a fatal agent-transport failure.
+    /// When a value is sent, the daemon should shut down rather than keep
+    /// running as a zombie that still answers status/unlock (RT-01).
+    pub fn fatal_rx(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.fatal_tx.subscribe()
+    }
+
+    /// A clonable sender the transport listener uses to report a fatal failure.
+    pub fn fatal_tx(&self) -> Arc<tokio::sync::watch::Sender<Option<String>>> {
+        self.fatal_tx.clone()
     }
 
     pub fn keystore_clone(&self) -> ssh_agent::KeyStore<SshWardenKey> {
@@ -429,5 +481,33 @@ nGZV/aEAZ3ZMrsrA3g32AAAAEHRlc3RAZXhhbXBsZS5jb20BAgMEBQ==
 
         assert!(!signature.as_bytes().is_empty());
         assert_eq!(signature.algorithm(), ssh_key::Algorithm::Ed25519);
+    }
+
+    // lock-keystore: after lock(), identities remain listable (ssh-add -l keeps
+    // working so auto-unlock-on-request can fire) but hold no private material,
+    // so signable_key_count drops to 0 and status can report the truth.
+    #[test]
+    fn lock_keeps_keys_listable_but_not_signable() {
+        let (mut agent, _request_rx, _response_tx) = create_test_agent();
+        agent.is_running.store(true, Ordering::Relaxed);
+        agent
+            .set_keys(vec![(
+                TEST_ED25519_KEY.to_string(),
+                "ed25519-key".to_string(),
+                "ed25519-uuid".to_string(),
+            )])
+            .expect("set_keys should succeed");
+
+        assert_eq!(agent.key_count(), 1);
+        assert_eq!(agent.signable_key_count(), 1);
+
+        agent.lock().expect("lock should succeed");
+
+        assert_eq!(agent.key_count(), 1, "identity stays listable while locked");
+        assert_eq!(
+            agent.signable_key_count(),
+            0,
+            "no private material is signable while locked"
+        );
     }
 }

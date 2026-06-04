@@ -46,6 +46,9 @@ email = ""
 # 可选值:
 #   - "always": 每次请求都提示（最安全）
 #   - "never": 从不提示（自动批准所有请求）
+#       ⚠ 不安全:SSHWarden 不对调用方做进程级鉴权,因此本机上任何以你的用户身份
+#       运行的进程都能在你不知情的情况下让 agent 静默签名。仅在完全受信任的环境
+#       (如隔离的 CI runner)使用。
 #   - "remember_until_lock": 记住决定直到锁定（平衡安全与便利）
 # 默认: "always"
 prompt_behavior = "always"

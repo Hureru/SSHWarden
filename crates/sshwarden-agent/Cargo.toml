@@ -16,7 +16,7 @@ serde_json = { workspace = true }
 ssh-key = { workspace = true, features = ["encryption", "ed25519", "rsa", "getrandom"] }
 sysinfo = { workspace = true, features = ["windows"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "sync", "macros", "net"] }
+tokio = { workspace = true, features = ["io-util", "sync", "macros", "net", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing = { workspace = true }
 sshwarden-config = { path = "../sshwarden-config" }
@@ -26,7 +26,13 @@ pin-project = "1"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

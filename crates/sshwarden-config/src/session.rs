@@ -32,6 +32,9 @@ pub struct SessionFile {
 }
 
 impl SessionFile {
+    /// Supported on-disk format versions for the device session file.
+    const SUPPORTED_VERSIONS: &'static [u32] = &[1];
+
     /// Path to the session file: `{config_dir}/session-{hostname}.enc`
     pub fn path() -> anyhow::Result<PathBuf> {
         let hostname = hostname();
@@ -48,6 +51,14 @@ impl SessionFile {
             .with_context(|| format!("Failed to read session file: {}", path.display()))?;
         let session: SessionFile = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse session file: {}", path.display()))?;
+        if !Self::SUPPORTED_VERSIONS.contains(&session.version) {
+            anyhow::bail!(
+                "Unsupported session file version {} (supported: {:?}): {}",
+                session.version,
+                Self::SUPPORTED_VERSIONS,
+                path.display()
+            );
+        }
         Ok(Some(session))
     }
 
