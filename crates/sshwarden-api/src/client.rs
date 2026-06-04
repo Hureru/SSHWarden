@@ -182,7 +182,9 @@ impl BitwardenClient {
                 old.zeroize();
             }
         }
-        self.refresh_token = token_resp.refresh_token.clone();
+        // Move (not clone) so no extra plaintext copy of the freshly issued token
+        // lingers in token_resp on the heap until it drops.
+        self.refresh_token = token_resp.refresh_token;
         self.token_expiry =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(token_resp.expires_in));
 

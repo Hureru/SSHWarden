@@ -1205,28 +1205,20 @@ async fn cmd_login(
     base_url: Option<&str>,
     email: Option<&str>,
 ) -> anyhow::Result<()> {
-    // Capture whether the caller explicitly overrode email/server BEFORE
-    // resolving defaults, so we can reject overrides a running daemon would ignore.
-    let email_override = email.is_some();
-    let base_url_override = base_url.is_some();
-    let email = match email {
-        Some(e) => e.to_string(),
-        None if !config.auth.email.is_empty() => config.auth.email.clone(),
-        None => prompt_email("Email: ")?,
-    };
-    let password = prompt_password("Master password: ")?;
-
-    // UX-2: the control protocol carries only the password; a running daemon logs
-    // in with its OWN configured server/account. If the caller supplied
-    // --email/--base-url, the daemon cannot honor them — fail loud rather than
-    // silently logging into the wrong account/server.
-    if (email_override || base_url_override) && is_daemon_running() {
+    // UX-2: a running daemon logs in with its OWN configured server/account; the
+    // control protocol carries only the password. If the caller supplied
+    // --email/--base-url, reject up front — BEFORE prompting — rather than
+    // silently logging into the wrong account/server (and without wasting a
+    // password/email prompt the caller can't use).
+    if (email.is_some() || base_url.is_some()) && is_daemon_running() {
         anyhow::bail!(
             "A daemon is already running and logs in with its own configured account/server; \
              --email/--base-url cannot be applied to it. Stop the daemon to log in standalone, \
              or omit these flags."
         );
     }
+
+    let password = prompt_password("Master password: ")?;
 
     // Prefer the running daemon: it performs the login + sync and loads keys
     // into the live agent. The control protocol carries only the password, so
@@ -1261,6 +1253,12 @@ async fn cmd_login(
     }
 
     // Standalone fallback: authenticate and list keys without touching an agent.
+    // Resolve the email here (prompting only now) — the daemon path never needs it.
+    let email = match email {
+        Some(e) => e.to_string(),
+        None if !config.auth.email.is_empty() => config.auth.email.clone(),
+        None => prompt_email("Email: ")?,
+    };
     let mut client = create_client(config, base_url);
     info!("Logging in as {}...", email);
     client.login_password(&email, &password).await?;
@@ -3472,10 +3470,45 @@ async fn handle_control_command(
             // Fall back to PIN dialog when Hello sign-path fails
             if auto_unlock {
                 info!("Hello sign-path failed, trying PIN dialog fallback");
-                let enc_data = get_pin_encrypted_data(pin_encrypted_keys, vault_file_data).await;
+                // Envelope-first (v3 local key cache) with legacy vault.enc
+                // fallback, mirroring the SSH-request path so v3 PINs validate in
+                // this dialog too (get_pin_encrypted_data only reads legacy slots).
+                let envelope_cache = {
+                    let guard = local_key_cache_data.read().await;
+                    guard
+                        .as_ref()
+                        .filter(|c| c.local_cache_key.pin_encrypted.is_some())
+                        .cloned()
+                };
+                let validator_parts: Option<(PinValidator, DecryptedCache, _)> =
+                    if let Some(cache) = envelope_cache {
+                        let dc: DecryptedCache = Arc::new(std::sync::Mutex::new(None));
+                        let kh: Arc<std::sync::Mutex<Option<sshwarden_api::crypto::SymmetricKey>>> =
+                            Arc::new(std::sync::Mutex::new(None));
+                        let dc_inner = dc.clone();
+                        let kh_inner = kh.clone();
+                        let v: PinValidator = Arc::new(move |pin: &str| -> bool {
+                            match decrypt_envelope_local_key_cache_with_pin(&cache, pin) {
+                                Ok((keys_json, lck)) => {
+                                    *dc_inner.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(keys_json);
+                                    *kh_inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(lck);
+                                    true
+                                }
+                                Err(_) => false,
+                            }
+                        });
+                        Some((v, dc, Some(kh)))
+                    } else if let Some(enc_data) =
+                        get_pin_encrypted_data(pin_encrypted_keys, vault_file_data).await
+                    {
+                        let (v, dc) = make_pin_validator(enc_data);
+                        Some((v, dc, None))
+                    } else {
+                        None
+                    };
 
-                if let Some(enc_data) = enc_data {
-                    let (validator, decrypted_cache) = make_pin_validator(enc_data);
+                if let Some((validator, decrypted_cache, lck_holder)) = validator_parts {
                     // SEC-03: share the daemon-wide PIN brute-force lockout with
                     // `unlock --pin` so dialog attempts can't bypass the cap.
                     let validator = gate_pin_validator(validator, pin_failures);
@@ -3498,6 +3531,14 @@ async fn handle_control_command(
                                 );
                             }
                         };
+                        // If unlocked via the v3 envelope, hold the decrypted local
+                        // cache key so later operations (sync/re-encrypt) have it.
+                        if let Some(kh) = lck_holder {
+                            let maybe_lck = kh.lock().unwrap_or_else(|e| e.into_inner()).take();
+                            if let Some(lck) = maybe_lck {
+                                local_cache_key_state.write().await.set(lck);
+                            }
+                        }
                         let resp = finish_unlock_with_json(
                             &keys_json,
                             agent,
@@ -5652,11 +5693,33 @@ fn pid_file_owner_alive(path: &std::path::Path) -> bool {
         Err(_) => return false,
     };
 
-    // Check if the process is still running
+    // Verify the PID is not just alive but actually our daemon: a recycled PID
+    // (after a crash without clean shutdown) could belong to an unrelated process
+    // and would otherwise falsely block a healthy restart.
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+    match sys.process(sysinfo::Pid::from_u32(pid)) {
+        Some(proc) => process_is_sshwarden(proc),
+        None => false,
+    }
+}
+
+/// Confirm a process is this SSHWarden binary, not an unrelated process that
+/// recycled the PID. Prefer an exact exe-path match; fall back to the executable
+/// file name when `exe()` is empty/restricted (common on macOS) or the daemon was
+/// launched from a since-moved binary.
+fn process_is_sshwarden(proc: &sysinfo::Process) -> bool {
+    let self_exe = std::env::current_exe().ok();
+    if let (Some(proc_exe), Some(self_path)) = (proc.exe(), self_exe.as_deref()) {
+        if proc_exe == self_path {
+            return true;
+        }
+    }
+    match self_exe.as_deref().and_then(|p| p.file_name()) {
+        Some(name) => proc.name() == name,
+        None => false,
+    }
 }
 
 /// Check if daemon is already running by reading PID file and checking process.
