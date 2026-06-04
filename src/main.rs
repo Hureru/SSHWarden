@@ -1106,7 +1106,11 @@ fn create_client(
     sshwarden_api::BitwardenClient::new(base, &api_url, &identity_url)
 }
 
-/// Login command: authenticate and list SSH keys.
+/// Login command: authenticate and load keys into the running agent.
+///
+/// UX-2: routes through the running daemon (via the control channel) so a
+/// successful login actually loads keys into the agent serving SSH clients.
+/// Falls back to a standalone login that only lists keys if no daemon is up.
 async fn cmd_login(
     config: &sshwarden_config::Config,
     base_url: Option<&str>,
@@ -1119,19 +1123,57 @@ async fn cmd_login(
     };
     let password = prompt_password("Master password: ")?;
 
-    let mut client = create_client(config, base_url);
-
-    info!("Logging in as {}...", email);
-    client.login_password(&email, &password).await?;
-    info!("Login successful!");
-
-    let keys = client.sync_ssh_keys().await?;
-    for key in &keys {
-        info!("  SSH Key: {} (cipher: {})", key.name, key.cipher_id);
+    // Prefer the running daemon: it performs the login + sync and loads keys
+    // into the live agent. The control protocol carries only the password, so
+    // the daemon uses its own configured server/email.
+    match sshwarden_agent::control::send_control_command(&format!(
+        "unlock-password:{}",
+        &*password
+    ))
+    .await
+    {
+        Ok(response) => {
+            if response.ok {
+                if base_url.is_some() {
+                    info!("Note: the running daemon uses its own configured server; --base-url is ignored.");
+                }
+                out_line(
+                    response
+                        .message
+                        .as_deref()
+                        .unwrap_or("Logged in; keys loaded into the running agent."),
+                );
+            } else {
+                err_line(format!(
+                    "Login failed: {}",
+                    response.error.as_deref().unwrap_or("unknown error")
+                ));
+            }
+            return Ok(());
+        }
+        Err(_) => {
+            info!(
+                "Daemon not running; logging in for listing only (start `sshwarden` to serve keys)."
+            );
+        }
     }
 
+    // Standalone fallback: authenticate and list keys without touching an agent.
+    let mut client = create_client(config, base_url);
+    info!("Logging in as {}...", email);
+    client.login_password(&email, &password).await?;
+
+    let keys = client.sync_ssh_keys().await?;
     if keys.is_empty() {
-        info!("No SSH keys found in vault. Add SSH keys in Bitwarden to use them.");
+        out_line("No SSH keys found in vault. Add SSH keys in Bitwarden to use them.");
+    } else {
+        out_line("Login successful. Vault SSH keys:");
+        for key in &keys {
+            out_line(format!("  SSH Key: {} (cipher: {})", key.name, key.cipher_id));
+        }
+        out_line(
+            "\nNote: no daemon was running, so the agent was not loaded. Start `sshwarden`, then `sshwarden unlock --password`.",
+        );
     }
 
     Ok(())
@@ -2164,21 +2206,28 @@ async fn cmd_bindings_add(key: &str, hosts: &[String]) -> anyhow::Result<()> {
     bindings.save()?;
 
     let keys = load_managed_keys_from_cache().unwrap_or_default();
-    if let Err(e) = sync_managed_ssh_config_inner(&keys, true) {
-        tracing::warn!(
-            "Bindings saved but managed snippet regeneration failed: {}",
-            e
-        );
+    // UX-7: a failed snippet regeneration means `ssh host` would route to the
+    // wrong key (or none), so fail loudly rather than warn-and-continue.
+    sync_managed_ssh_config_inner(&keys, true)
+        .context("Bindings saved but managed snippet regeneration failed")?;
+
+    // CFG-2: a binding does nothing unless ~/.ssh/config Includes the managed
+    // snippet. Auto-install the Include line so `bindings add` is never a silent
+    // no-op (idempotent — only writes when the line is missing).
+    let include_path = managed_sshwarden_include_path()?;
+    let config_path = user_ssh_config_path()?;
+    if let Err(e) = write_sshwarden_include_line(&config_path, &include_path) {
+        err_line(format!(
+            "Binding saved, but failed to ensure the Include line in {}: {e}. Run `sshwarden ssh-config install`.",
+            config_path.display()
+        ));
     }
 
-    #[allow(clippy::print_stdout)]
-    {
-        println!(
-            "Added {} host pattern(s) to key {}.",
-            hosts.len(),
-            cipher_id
-        );
-    }
+    out_line(format!(
+        "Added {} host pattern(s) to key {}.",
+        hosts.len(),
+        cipher_id
+    ));
     Ok(())
 }
 
@@ -2205,17 +2254,10 @@ async fn cmd_bindings_remove(key: &str, host: Option<&str>, all: bool) -> anyhow
     bindings.save()?;
 
     let keys = load_managed_keys_from_cache().unwrap_or_default();
-    if let Err(e) = sync_managed_ssh_config_inner(&keys, true) {
-        tracing::warn!(
-            "Bindings saved but managed snippet regeneration failed: {}",
-            e
-        );
-    }
+    sync_managed_ssh_config_inner(&keys, true)
+        .context("Bindings saved but managed snippet regeneration failed")?;
 
-    #[allow(clippy::print_stdout)]
-    {
-        println!("Updated bindings for key {}.", cipher_id);
-    }
+    out_line(format!("Updated bindings for key {cipher_id}."));
     Ok(())
 }
 
