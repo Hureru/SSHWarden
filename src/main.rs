@@ -955,7 +955,7 @@ async fn cmd_doctor(
                         }
                     }
                     match std::env::var("SSH_AUTH_SOCK") {
-                        Ok(sock) if std::path::PathBuf::from(&sock) == path => {
+                        Ok(sock) if path.as_path() == std::path::Path::new(&sock) => {
                             checks.push(DoctorCheck::ok(
                                 "agent_endpoint.ssh_auth_sock",
                                 "SSH_AUTH_SOCK points at the SSHWarden agent socket",
