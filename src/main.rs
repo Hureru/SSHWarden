@@ -585,32 +585,72 @@ fn has_remembered_device_on_disk() -> bool {
     ) || matches!(sshwarden_config::vault::VaultFile::load(), Ok(Some(_)))
 }
 
-/// `stop`: ask the running agent to shut down cleanly over the control channel,
-/// then wait briefly for it to release the PID file. Idempotent — stopping an
-/// agent that is not running is reported and treated as success.
-async fn cmd_stop() -> anyhow::Result<()> {
-    if !is_daemon_running() {
-        out_line("No running SSHWarden agent.");
-        return Ok(());
+/// Three-way outcome of trying to reach the running daemon over the control
+/// channel. Drives `stop`/`restart`, which treat the control channel — not the
+/// PID file — as the source of truth for "is a daemon live", and only fall back
+/// to PID-file logic when nothing answers.
+enum DaemonContact {
+    /// The daemon replied.
+    Replied(sshwarden_agent::ControlResponse),
+    /// A daemon was reached, but no usable reply came back before the channel
+    /// closed or the wait timed out — the expected outcome when the agent tears
+    /// the channel down during a clean `stop`. Callers confirm the real state
+    /// via the PID file rather than assume the daemon is gone.
+    Unconfirmed(String),
+    /// Nothing is listening on the control channel — no daemon is running.
+    NotRunning,
+}
+
+/// Contact the running daemon over the control channel with a bounded timeout so
+/// a wedged or busy agent cannot hang `stop`/`restart` indefinitely. A connect
+/// failure is reported as [`DaemonContact::NotRunning`]; any post-connect error
+/// or timeout is [`DaemonContact::Unconfirmed`] (a daemon was there, but we
+/// can't be sure of the result).
+async fn contact_daemon(cmd: &str) -> DaemonContact {
+    let send = sshwarden_agent::control::send_control_command(cmd);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), send).await {
+        Ok(Ok(resp)) => DaemonContact::Replied(resp),
+        Ok(Err(e)) => {
+            if e.downcast_ref::<sshwarden_agent::control::ControlUnreachable>()
+                .is_some()
+            {
+                DaemonContact::NotRunning
+            } else {
+                DaemonContact::Unconfirmed(e.to_string())
+            }
+        }
+        Err(_) => DaemonContact::Unconfirmed("no reply within 5s".to_string()),
     }
-    match sshwarden_agent::control::send_control_command("stop").await {
-        Ok(resp) if resp.ok => {
+}
+
+/// `stop`: ask the running agent to shut down cleanly over the control channel,
+/// then wait briefly for it to release the PID file. The control channel is
+/// contacted unconditionally — a missing or stale PID file must not turn `stop`
+/// into a silent no-op while a daemon is still reachable. Idempotent — stopping
+/// an agent that is not running is reported and treated as success.
+async fn cmd_stop() -> anyhow::Result<()> {
+    match contact_daemon("stop").await {
+        DaemonContact::Replied(resp) if resp.ok => {
             out_line(resp.message.as_deref().unwrap_or("Stopping agent"));
         }
-        Ok(resp) => {
+        DaemonContact::Replied(resp) => {
             err_line(format!(
                 "Stop failed: {}",
                 resp.error.as_deref().unwrap_or("unknown error")
             ));
             std::process::exit(1);
         }
-        Err(e) => {
+        DaemonContact::NotRunning => {
+            out_line("No running SSHWarden agent.");
+            return Ok(());
+        }
+        DaemonContact::Unconfirmed(reason) => {
             // The agent may have torn down the control channel before its reply
             // reached us — the expected outcome of a clean stop, not a failure.
             // Fall through to the wait loop and let the PID file decide whether
             // it actually exited.
             err_line(format!(
-                "Agent closed the control channel before replying ({e}); confirming it exited…"
+                "No stop confirmation from the agent ({reason}); confirming it exited…"
             ));
         }
     }
@@ -626,11 +666,15 @@ async fn cmd_stop() -> anyhow::Result<()> {
     std::process::exit(1);
 }
 
-/// `restart`: stop any running agent, wait for it to exit, then spawn a fresh
-/// detached background agent (`run --background`).
+/// `restart`: stop any reachable agent, wait for it to exit, then spawn a fresh
+/// detached background agent (`run --background`). The running agent is detected
+/// over the control channel rather than the PID file — skipping the stop because
+/// of a missing or stale PID file would spawn a second agent that fights the
+/// live one for the SSH endpoint and control pipe.
 async fn cmd_restart() -> anyhow::Result<()> {
-    if is_daemon_running() {
-        let _ = sshwarden_agent::control::send_control_command("stop").await;
+    if !matches!(contact_daemon("stop").await, DaemonContact::NotRunning) {
+        // Replied, errored, or timed out — a daemon was (or may still be) alive.
+        // Confirm it actually exits before starting a replacement.
         let mut stopped = false;
         for _ in 0..50 {
             if !is_daemon_running() {
