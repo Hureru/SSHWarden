@@ -45,12 +45,12 @@ cd SSHWarden
 cargo build
 
 # 运行（开发模式）
-cargo run -- daemon
+cargo run -- run
 
 # 运行特定命令
 cargo run -- status
 cargo run -- lock
-cargo run -- unlock --hello
+cargo run -- unlock --method hello
 ```
 
 ### 3. Release 构建

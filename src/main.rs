@@ -605,8 +605,13 @@ async fn cmd_stop() -> anyhow::Result<()> {
             std::process::exit(1);
         }
         Err(e) => {
-            err_line(format!("Could not reach the agent to stop it: {e}"));
-            std::process::exit(2);
+            // The agent may have torn down the control channel before its reply
+            // reached us — the expected outcome of a clean stop, not a failure.
+            // Fall through to the wait loop and let the PID file decide whether
+            // it actually exited.
+            err_line(format!(
+                "Agent closed the control channel before replying ({e}); confirming it exited…"
+            ));
         }
     }
     // Wait up to ~5s for the agent to exit and remove its PID file.
@@ -972,7 +977,7 @@ async fn cmd_doctor(
         } else if legacy_migration_available {
             checks.push(DoctorCheck::warn(
                 "local_key_cache.migration",
-                "Legacy vault.enc is present without envelope Local Key Cache; run `sshwarden unlock --pin` to migrate",
+                "Legacy vault.enc is present without envelope Local Key Cache; run `sshwarden unlock --method pin` to migrate",
             ));
         } else {
             checks.push(DoctorCheck::warn(
@@ -1219,7 +1224,7 @@ async fn cmd_doctor(
                     }
                 }
                 if !include_path.exists() {
-                    let managed = "# SSHWarden managed key selector snippets\n# Run `sshwarden ssh-config` to print Host-specific examples.\n";
+                    let managed = "# SSHWarden managed key selector snippets\n# Run `sshwarden ssh-config write` to populate this from your bound keys.\n";
                     match write_private_file(&include_path, managed) {
                         Ok(()) => checks.push(DoctorCheck::ok(
                             "doctor.fix.include_file",
@@ -1723,7 +1728,7 @@ fn ssh_config_snippet_with_bindings(
     let mut lines = vec![
         "# SSHWarden managed SSH config — DO NOT EDIT".to_string(),
         "# This file is regenerated on every vault sync.".to_string(),
-        "# Manage bindings via `sshwarden bindings ...`.".to_string(),
+        "# Manage bindings via `sshwarden keys bind/unbind ...`.".to_string(),
         String::new(),
     ];
 
