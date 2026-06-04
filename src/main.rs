@@ -638,18 +638,15 @@ impl DoctorCheck {
     }
 }
 
-#[cfg(windows)]
+/// Fetch daemon status for the doctor report over the control channel. Works
+/// on every platform — the Unix control client is fully implemented, so this is
+/// no longer Windows-only (XP-1/UX-6/LOGIC-5).
 async fn fetch_status_details_for_doctor() -> anyhow::Result<serde_json::Value> {
     let response = sshwarden_agent::control::send_control_command("status-json").await?;
     Ok(response
         .details
         .clone()
         .unwrap_or_else(|| serde_json::to_value(&response).unwrap_or_default()))
-}
-
-#[cfg(not(windows))]
-async fn fetch_status_details_for_doctor() -> anyhow::Result<serde_json::Value> {
-    anyhow::bail!("IPC control is only supported on Windows currently")
 }
 
 #[cfg(windows)]
@@ -726,6 +723,26 @@ async fn cmd_doctor(
     };
 
     if let Some(status) = status.as_ref() {
+        // RT-05/XP-4: detect the "zombie" case where the control channel answers
+        // but the SSH agent task isn't actually serving the endpoint (e.g. on
+        // Windows the OpenSSH ssh-agent service owns the pipe). Uses the
+        // agent_running flag from status, so no extra platform FFI is needed.
+        let agent_running = status
+            .get("agent_running")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if agent_running {
+            checks.push(DoctorCheck::ok(
+                "agent.serving",
+                "SSHWarden's SSH agent task is serving the endpoint",
+            ));
+        } else {
+            checks.push(DoctorCheck::warn(
+                "agent.serving",
+                "The control channel answers but SSHWarden's SSH agent is NOT serving the endpoint — another agent likely owns it (on Windows, the OpenSSH 'ssh-agent' service: Stop-Service ssh-agent; Set-Service ssh-agent -StartupType Disabled). ssh/ssh-add will not see SSHWarden's keys until this is fixed.",
+            ));
+        }
+
         let authenticated = status
             .get("authenticated")
             .and_then(|v| v.as_bool())
@@ -888,13 +905,83 @@ async fn cmd_doctor(
         if windows_openssh_pipe_exists() {
             checks.push(DoctorCheck::ok(
                 "agent_endpoint.windows_pipe",
-                r"Windows OpenSSH agent pipe exists at \\.\pipe\openssh-ssh-agent",
+                r"OpenSSH agent pipe \\.\pipe\openssh-ssh-agent exists (it may be owned by SSHWarden or by the OS ssh-agent service — see the agent.serving check for which one is actually serving)",
             ));
         } else {
             checks.push(DoctorCheck::warn(
                 "agent_endpoint.windows_pipe",
-                r"Windows OpenSSH agent pipe is not present at \\.\pipe\openssh-ssh-agent; SSH clients may not be using SSHWarden",
+                r"No OpenSSH agent pipe at \\.\pipe\openssh-ssh-agent; SSH clients have no agent to talk to",
             ));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // XP-3: check the Unix agent socket exists with 0600 perms and that
+        // SSH_AUTH_SOCK points at it.
+        match sshwarden_config::default_agent_socket_path() {
+            Ok(path) => {
+                if path.exists() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        match std::fs::metadata(&path) {
+                            Ok(meta) => {
+                                let mode = meta.permissions().mode() & 0o777;
+                                if mode == 0o600 {
+                                    checks.push(DoctorCheck::ok(
+                                        "agent_endpoint.unix_socket",
+                                        format!(
+                                            "Agent socket present with 0600 perms: {}",
+                                            path.display()
+                                        ),
+                                    ));
+                                } else {
+                                    checks.push(DoctorCheck::warn(
+                                        "agent_endpoint.unix_socket",
+                                        format!(
+                                            "Agent socket {} has mode {mode:o}, expected 0600",
+                                            path.display()
+                                        ),
+                                    ));
+                                }
+                            }
+                            Err(e) => checks.push(DoctorCheck::warn(
+                                "agent_endpoint.unix_socket",
+                                format!("Could not stat agent socket {}: {e}", path.display()),
+                            )),
+                        }
+                    }
+                    match std::env::var("SSH_AUTH_SOCK") {
+                        Ok(sock) if std::path::PathBuf::from(&sock) == path => {
+                            checks.push(DoctorCheck::ok(
+                                "agent_endpoint.ssh_auth_sock",
+                                "SSH_AUTH_SOCK points at the SSHWarden agent socket",
+                            ));
+                        }
+                        Ok(sock) => checks.push(DoctorCheck::warn(
+                            "agent_endpoint.ssh_auth_sock",
+                            format!("SSH_AUTH_SOCK ({sock}) does not point at the SSHWarden agent socket ({}); run `eval \"$(sshwarden env)\"`", path.display()),
+                        )),
+                        Err(_) => checks.push(DoctorCheck::warn(
+                            "agent_endpoint.ssh_auth_sock",
+                            format!("SSH_AUTH_SOCK is not set; run `eval \"$(sshwarden env)\"` so ssh uses {}", path.display()),
+                        )),
+                    }
+                } else {
+                    checks.push(DoctorCheck::warn(
+                        "agent_endpoint.unix_socket",
+                        format!(
+                            "Agent socket not present at {}; is the daemon running?",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+            Err(e) => checks.push(DoctorCheck::warn(
+                "agent_endpoint.unix_socket",
+                format!("Could not resolve agent socket path: {e}"),
+            )),
         }
     }
 
@@ -1126,11 +1213,8 @@ async fn cmd_login(
     // Prefer the running daemon: it performs the login + sync and loads keys
     // into the live agent. The control protocol carries only the password, so
     // the daemon uses its own configured server/email.
-    match sshwarden_agent::control::send_control_command(&format!(
-        "unlock-password:{}",
-        &*password
-    ))
-    .await
+    match sshwarden_agent::control::send_control_command(&format!("unlock-password:{}", &*password))
+        .await
     {
         Ok(response) => {
             if response.ok {
@@ -1169,7 +1253,10 @@ async fn cmd_login(
     } else {
         out_line("Login successful. Vault SSH keys:");
         for key in &keys {
-            out_line(format!("  SSH Key: {} (cipher: {})", key.name, key.cipher_id));
+            out_line(format!(
+                "  SSH Key: {} (cipher: {})",
+                key.name, key.cipher_id
+            ));
         }
         out_line(
             "\nNote: no daemon was running, so the agent was not loaded. Start `sshwarden`, then `sshwarden unlock --password`.",
