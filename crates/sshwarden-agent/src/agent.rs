@@ -244,7 +244,7 @@ impl SshWardenAgent {
                         .public_key()
                         .to_bytes()
                         .expect("Cipher private key is always correctly parsed");
-                    keystore.0.write().expect("RwLock is not poisoned").insert(
+                    let displaced = keystore.0.write().expect("RwLock is not poisoned").insert(
                         public_key_bytes.clone(),
                         SshWardenKey {
                             private_key: Some(private_key),
@@ -253,6 +253,17 @@ impl SshWardenAgent {
                             cipher_uuid: cipher_id.clone(),
                         },
                     );
+                    if displaced.is_some() {
+                        // LOGIC-7: the keystore is keyed by public key bytes, so
+                        // two vault items sharing a public key collapse into one.
+                        // Warn so the operator understands why status/key_count
+                        // can be lower than the number of vault keys.
+                        tracing::warn!(
+                            key = %name,
+                            "Duplicate public key: overwrote an earlier agent keystore entry; \
+                             status key_count will be lower than the vault key count"
+                        );
+                    }
                 }
                 Err(e) => {
                     error!(error=%e, "Error while parsing key");
@@ -337,6 +348,20 @@ impl SshWardenAgent {
             .read()
             .expect("RwLock is not poisoned")
             .len()
+    }
+
+    /// Number of loaded keys that actually hold private material and can sign.
+    /// While the vault is locked this is 0 even though `key_count()` (listed
+    /// identities) may be non-zero. status reports this so what it shows matches
+    /// what the agent can actually sign.
+    pub fn signable_key_count(&self) -> usize {
+        self.keystore
+            .0
+            .read()
+            .expect("RwLock is not poisoned")
+            .values()
+            .filter(|k| k.private_key.is_some())
+            .count()
     }
 
     pub fn start_server(
@@ -456,5 +481,33 @@ nGZV/aEAZ3ZMrsrA3g32AAAAEHRlc3RAZXhhbXBsZS5jb20BAgMEBQ==
 
         assert!(!signature.as_bytes().is_empty());
         assert_eq!(signature.algorithm(), ssh_key::Algorithm::Ed25519);
+    }
+
+    // lock-keystore: after lock(), identities remain listable (ssh-add -l keeps
+    // working so auto-unlock-on-request can fire) but hold no private material,
+    // so signable_key_count drops to 0 and status can report the truth.
+    #[test]
+    fn lock_keeps_keys_listable_but_not_signable() {
+        let (mut agent, _request_rx, _response_tx) = create_test_agent();
+        agent.is_running.store(true, Ordering::Relaxed);
+        agent
+            .set_keys(vec![(
+                TEST_ED25519_KEY.to_string(),
+                "ed25519-key".to_string(),
+                "ed25519-uuid".to_string(),
+            )])
+            .expect("set_keys should succeed");
+
+        assert_eq!(agent.key_count(), 1);
+        assert_eq!(agent.signable_key_count(), 1);
+
+        agent.lock().expect("lock should succeed");
+
+        assert_eq!(agent.key_count(), 1, "identity stays listable while locked");
+        assert_eq!(
+            agent.signable_key_count(),
+            0,
+            "no private material is signable while locked"
+        );
     }
 }

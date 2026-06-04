@@ -2881,6 +2881,7 @@ async fn build_status_response(
 ) -> sshwarden_agent::ControlResponse {
     let locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
     let count = agent.key_count();
+    let signable = agent.signable_key_count();
     let agent_running = agent.is_running();
     let has_pin = pin_encrypted_keys.read().await.is_some();
     let has_vault = vault_file_data.read().await.is_some();
@@ -2892,6 +2893,7 @@ async fn build_status_response(
     let details = serde_json::json!({
         "locked": locked,
         "key_count": count,
+        "signable_key_count": signable,
         "agent_running": agent_running,
         "has_pin": has_pin,
         "has_vault_file": has_vault,
@@ -2908,6 +2910,11 @@ async fn build_status_response(
         // RT-01: surface the zombie state — the agent task is not serving SSH
         // clients even though the control channel still answers.
         extras.push("AGENT NOT SERVING (SSH endpoint unavailable)");
+    }
+    if count > 0 && signable < count {
+        // lock-keystore: identities are listed (ssh-add -l) but have no private
+        // material, so signing fails until unlock. Make that explicit.
+        extras.push("keys listed but not signable until unlock");
     }
     if has_pin {
         extras.push("PIN configured");
@@ -3693,6 +3700,11 @@ async fn handle_control_command(
             }
         }
         ControlAction::Sync => {
+            // do_sync cannot load keys into the agent while the vault is locked
+            // (no private material is held); it only refreshes the on-disk cache.
+            // Report that honestly and mark a pending sync so the next unlock
+            // applies the keys, instead of claiming the running agent was updated.
+            let was_locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
             match do_sync(
                 api_client,
                 cached_key_tuples,
@@ -3709,7 +3721,14 @@ async fn handle_control_command(
             .await
             {
                 Ok(count) => {
-                    sshwarden_agent::ControlResponse::ok(&format!("Synced {} SSH keys", count))
+                    if was_locked {
+                        pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                        sshwarden_agent::ControlResponse::ok(&format!(
+                            "Synced {count} SSH keys to cache; they will load into the agent on next unlock"
+                        ))
+                    } else {
+                        sshwarden_agent::ControlResponse::ok(&format!("Synced {count} SSH keys"))
+                    }
                 }
                 Err(e) => sshwarden_agent::ControlResponse::err(&e),
             }
@@ -4806,6 +4825,22 @@ async fn handle_ui_request(
         }
 
         // PIN cancelled or every path failed → deny the request.
+        let _ = response_tx.send((request.request_id, false));
+        return;
+    }
+
+    // LOGIC-2: reaching here with the vault still locked means the auto-unlock
+    // block above was skipped (auto_unlock disabled). The loaded entries have no
+    // private material, so deny cleanly rather than auto-approving under
+    // prompt_behavior=Never — otherwise ssh sees an "approval" followed by a
+    // broken signature with no way to recover.
+    if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+        info!(
+            request_id = request.request_id,
+            process = %request.process_name,
+            "Sign request denied: vault is locked and auto-unlock is disabled. \
+             Run `sshwarden unlock`, or enable [unlock] auto_unlock_on_request."
+        );
         let _ = response_tx.send((request.request_id, false));
         return;
     }
