@@ -21,13 +21,13 @@ SSHWarden 的目标不是复刻完整 Bitwarden Desktop，而是提供一个专�
 | Bitwarden 登录与 SSH Key 同步 | 已实现 |
 | SSH Agent 协议服务 | Windows 已实现；Unix socket 有基础实现 |
 | 签名授权对话框 | Slint 跨平台 UI 已实现 |
-| PIN 解锁 | 已实现，后续需迁移到 envelope encryption 模型 |
-| Windows Hello | 已有实现，后续需迁移到 envelope encryption 模型 |
-| IPC 控制命令 | Windows 已实现；Linux/macOS 待补独立 control socket |
-| Local Key Cache | 已实现旧模型；目标模型见 ADR |
-| 标准平台存储目录 | 待实现；当前代码仍使用 exe 同目录 |
+| PIN 解锁 | 已实现（信封加密 + 每库随机盐 + 失败延迟/锁定） |
+| Windows Hello | 已实现（信封加密模型） |
+| IPC 控制命令 | 已实现；Windows Named Pipe 与 Unix socket 均含调用方鉴权 |
+| Local Key Cache | 已实现信封加密模型（格式 v3，PIN 随机盐） |
+| 标准平台存储目录 | 已实现，默认平台标准目录（`%APPDATA%`/`$XDG_CONFIG_HOME`/`~/Library/Application Support`）；便携模式可选 |
 | 自启动 | Windows 已实现；macOS/Linux 待实现 |
-| Shell integration | 待实现 `sshwarden env` |
+| Shell integration | `sshwarden env` 已实现（sh/fish/powershell/cmd） |
 | macOS native unlock | 已实现（Phase 6，Keychain；仍需平台实机验证） |
 | Linux native unlock | 已实现（Phase 6，Secret Service；仍需平台实机验证） |
 

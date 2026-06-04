@@ -3045,6 +3045,11 @@ async fn build_status_response(
     let authenticated = api_client.read().await.is_some();
     let pending = pending_sync.load(std::sync::atomic::Ordering::Relaxed);
     let notification = notification_state.read().await.clone();
+    // P1-3: surface the resolved data directory so users can tell where their
+    // secrets actually live (docs historically disagreed on this).
+    let data_dir = sshwarden_config::config_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unresolved>".to_string());
 
     let details = serde_json::json!({
         "locked": locked,
@@ -3057,6 +3062,7 @@ async fn build_status_response(
         "legacy_migration_available": has_vault && !has_local_key_cache,
         "authenticated": authenticated,
         "pending_sync": pending,
+        "data_dir": data_dir,
         "notification": notification.to_json(),
     });
 

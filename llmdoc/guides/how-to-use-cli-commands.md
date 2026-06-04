@@ -1,8 +1,10 @@
 # How to Use SSHWarden CLI Commands
 
-SSHWarden 提供守护进程模式和多个 CLI 子命令。守护进程处理 SSH Agent 请求，CLI 子命令通过 IPC 控制通道与守护进程通信。支持三种解锁路径：Windows Hello 签名、PIN、主密码。所有数据文件（config.toml、vault.enc、sshwarden.log、sshwarden.pid）均存放在 exe 所在目录（完全便携模式）。
+SSHWarden 提供守护进程模式和多个 CLI 子命令。守护进程处理 SSH Agent 请求，CLI 子命令通过 IPC 控制通道与守护进程通信。支持三种解锁路径：Windows Hello 签名、PIN、主密码。
 
-1. **启动守护进程:** 运行 `sshwarden`（无子命令）。若 exe 同目录下存在 vault.enc 文件，守护进程直接启动并进入锁定状态，等待 Hello/PIN/Password 解锁；若无 vault.enc，程序提示输入 Bitwarden 主密码，登录后加载 SSH 密钥。确认输出 `SSH Agent is running` 即表示就绪。参见 `src/main.rs:323-504`.
+**数据目录解析（4 层优先级，见 `crates/sshwarden-config/src/lib.rs` `resolve_data_dir`）：** ① 环境变量 `SSHWARDEN_HOME`；② `SSHWARDEN_PORTABLE=1` → exe 所在目录；③ exe 同目录 `config.toml` 中 `[storage] portable = true`（可选 `portable_dir`）→ 便携目录；④ **默认：平台标准目录**（Windows `%APPDATA%\SSHWarden`、Linux `$XDG_CONFIG_HOME/sshwarden` 或 `~/.config/sshwarden`、macOS `~/Library/Application Support/SSHWarden`）。所有数据文件（`config.toml`、`local-key-cache.json`、旧版 `vault.enc`、`sshwarden.log`、`sshwarden.pid`、`session-*.enc`）都存放在解析出的该目录下。运行 `sshwarden status` 可查看实际解析出的 `data_dir`。
+
+1. **启动守护进程:** 运行 `sshwarden`（无子命令）。若数据目录下存在 `local-key-cache.json`（或旧版 `vault.enc`），守护进程直接启动并进入锁定状态，等待 Hello/PIN/Password 解锁；若无缓存，程序提示输入 Bitwarden 主密码，登录后加载 SSH 密钥。确认输出 `SSH Agent is running` 即表示就绪。参见 `src/main.rs` `run_foreground`.
 
 2. **查看状态:** 运行 `sshwarden status`。显示锁定状态（locked/unlocked）、密钥数量、是否配置 PIN、是否有 vault.enc 文件。若守护进程未运行则提示连接失败。参见 `src/main.rs:151`.
 
