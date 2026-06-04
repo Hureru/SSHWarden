@@ -366,22 +366,28 @@ fn main() -> anyhow::Result<()> {
         let ui_tx = ui_request_tx.clone();
         let tokio_handle = std::thread::spawn(move || -> anyhow::Result<()> {
             rt.block_on(async move {
-                if is_daemon_mode {
-                    if is_daemon_running() {
-                        info!("SSHWarden daemon is already running");
-                        return Ok(());
-                    }
-                    #[cfg(windows)]
-                    detach_console();
-
-                    write_pid_file()?;
-                    info!("SSHWarden daemon started (PID: {})", std::process::id());
-                    let result = run_foreground(config, ui_tx).await;
-                    remove_pid_file();
-                    result
-                } else {
-                    run_foreground(config, ui_tx).await
+                // RT-02: single-instance guard for ANY run_foreground entry —
+                // both `sshwarden daemon` and a bare foreground `sshwarden` are
+                // the one singleton daemon (one agent + one control server + one
+                // OpenSSH endpoint); two cannot coexist. Previously only the
+                // daemon branch was guarded, so a bare `sshwarden` could spin up a
+                // second agent and control server competing for the same pipes.
+                if is_daemon_running() {
+                    info!("SSHWarden is already running");
+                    return Ok(());
                 }
+                #[cfg(windows)]
+                if is_daemon_mode {
+                    detach_console();
+                }
+                #[cfg(not(windows))]
+                let _ = is_daemon_mode;
+
+                write_pid_file()?;
+                info!("SSHWarden started (PID: {})", std::process::id());
+                let result = run_foreground(config, ui_tx).await;
+                remove_pid_file();
+                result
             })
         });
 
@@ -2405,6 +2411,11 @@ async fn run_foreground(
     )
     .context("Failed to start SSH agent server")?;
 
+    // RT-01: watch for a fatal agent-transport failure (e.g. the OpenSSH pipe
+    // could not be claimed) so the daemon shuts down instead of running as a
+    // zombie that still answers status/unlock while serving no SSH client.
+    let mut agent_fatal_rx = agent.fatal_rx();
+
     // Build a map of cipher_id -> key_name for UI display
     let key_names: Arc<std::collections::HashMap<String, String>> = Arc::new(
         vault_keys
@@ -2806,6 +2817,20 @@ async fn run_foreground(
                     let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, Some(&local_cache_key_state), Some(&authorization_memory)).await;
                 }
             }
+            // SSH agent transport failed (e.g. could not claim the OpenSSH pipe).
+            // Shut down rather than run as a zombie that answers status/unlock
+            // while serving no SSH client (RT-01).
+            changed = agent_fatal_rx.changed() => {
+                if changed.is_err() {
+                    tracing::error!("SSH agent signal channel closed; shutting down");
+                    break;
+                }
+                let reason = agent_fatal_rx.borrow().clone();
+                if let Some(reason) = reason {
+                    tracing::error!(%reason, "SSH agent transport failed; shutting down daemon");
+                    break;
+                }
+            }
             // Shutdown signal
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C, shutting down...");
@@ -2856,6 +2881,7 @@ async fn build_status_response(
 ) -> sshwarden_agent::ControlResponse {
     let locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
     let count = agent.key_count();
+    let agent_running = agent.is_running();
     let has_pin = pin_encrypted_keys.read().await.is_some();
     let has_vault = vault_file_data.read().await.is_some();
     let has_local_key_cache = local_key_cache_data.read().await.is_some();
@@ -2866,6 +2892,7 @@ async fn build_status_response(
     let details = serde_json::json!({
         "locked": locked,
         "key_count": count,
+        "agent_running": agent_running,
         "has_pin": has_pin,
         "has_vault_file": has_vault,
         "has_local_key_cache": has_local_key_cache,
@@ -2877,6 +2904,11 @@ async fn build_status_response(
 
     let mut resp = sshwarden_agent::ControlResponse::status(locked, count).with_details(details);
     let mut extras = Vec::new();
+    if !agent_running {
+        // RT-01: surface the zombie state — the agent task is not serving SSH
+        // clients even though the control channel still answers.
+        extras.push("AGENT NOT SERVING (SSH endpoint unavailable)");
+    }
     if has_pin {
         extras.push("PIN configured");
     }

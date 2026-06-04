@@ -17,6 +17,7 @@ impl SshWardenAgent {
             endpoint,
             agent_state.cancellation_token(),
             agent_state.is_running_flag(),
+            agent_state.fatal_tx(),
         );
 
         let cloned_agent_state = agent_state.clone();

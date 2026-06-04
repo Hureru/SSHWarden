@@ -68,6 +68,11 @@ pub struct SshWardenAgent {
     request_id: Arc<AtomicU32>,
     needs_unlock: Arc<AtomicBool>,
     is_running: Arc<AtomicBool>,
+    /// Reports a fatal agent-transport failure (e.g. the SSH agent endpoint
+    /// could not be claimed). The main loop watches this so the daemon shuts
+    /// down instead of running as a zombie that still answers status/unlock
+    /// while serving no SSH client (RT-01).
+    fatal_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
 }
 
 impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
@@ -183,6 +188,7 @@ impl SshWardenAgent {
         auth_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
         auth_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
     ) -> Self {
+        let (fatal_tx, _fatal_rx) = tokio::sync::watch::channel(None);
         Self {
             keystore: ssh_agent::KeyStore(Arc::new(RwLock::new(HashMap::new()))),
             cancellation_token: CancellationToken::new(),
@@ -191,6 +197,7 @@ impl SshWardenAgent {
             request_id: Arc::new(AtomicU32::new(0)),
             needs_unlock: Arc::new(AtomicBool::new(true)),
             is_running: Arc::new(AtomicBool::new(false)),
+            fatal_tx: Arc::new(fatal_tx),
         }
     }
 
@@ -355,6 +362,18 @@ impl SshWardenAgent {
 
     pub fn is_running_flag(&self) -> Arc<AtomicBool> {
         self.is_running.clone()
+    }
+
+    /// A receiver the main loop watches for a fatal agent-transport failure.
+    /// When a value is sent, the daemon should shut down rather than keep
+    /// running as a zombie that still answers status/unlock (RT-01).
+    pub fn fatal_rx(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.fatal_tx.subscribe()
+    }
+
+    /// A clonable sender the transport listener uses to report a fatal failure.
+    pub fn fatal_tx(&self) -> Arc<tokio::sync::watch::Sender<Option<String>>> {
+        self.fatal_tx.clone()
     }
 
     pub fn keystore_clone(&self) -> ssh_agent::KeyStore<SshWardenKey> {

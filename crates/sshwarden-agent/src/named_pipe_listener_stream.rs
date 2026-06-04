@@ -28,11 +28,11 @@ pub struct NamedPipeServerStream {
 }
 
 impl NamedPipeServerStream {
-    #[allow(clippy::unwrap_used)]
     pub fn new(
         endpoint: Option<std::path::PathBuf>,
         cancellation_token: CancellationToken,
         is_running: Arc<AtomicBool>,
+        fatal_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
@@ -42,12 +42,28 @@ impl NamedPipeServerStream {
                 .unwrap_or(PIPE_NAME)
                 .to_string();
             info!("Creating named pipe server on {}", pipe_name);
-            let mut listener = match ServerOptions::new().create(&pipe_name) {
+            // RT-01: claim exclusive ownership of the endpoint with
+            // first_pipe_instance(true). If another SSH agent (most commonly the
+            // Windows OpenSSH `ssh-agent` service) already owns the pipe, create()
+            // fails here instead of silently coexisting as a second instance and
+            // stealing half of the client connections.
+            let mut listener = match ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&pipe_name)
+            {
                 Ok(pipe) => pipe,
                 Err(e) => {
-                    error!(error = %e, "Encountered an error creating the first pipe. The system's openssh service must likely be disabled");
-                    cancellation_token.cancel();
+                    let reason = format!(
+                        "Failed to claim SSH agent endpoint {pipe_name}: {e}. Another SSH agent \
+                         already owns it (most likely the Windows OpenSSH 'ssh-agent' service). \
+                         Stop and disable it (admin PowerShell: Stop-Service ssh-agent; \
+                         Set-Service ssh-agent -StartupType Disabled), or set [socket] path to a \
+                         custom endpoint, then restart SSHWarden."
+                    );
+                    error!(error = %e, "{reason}");
                     is_running.store(false, Ordering::Relaxed);
+                    cancellation_token.cancel();
+                    let _ = fatal_tx.send(Some(reason));
                     return;
                 }
             };
@@ -78,14 +94,22 @@ impl NamedPipeServerStream {
                             Ok(info) => info,
                         };
 
-                        tx.send((listener, peer_info)).await.unwrap();
+                        if tx.send((listener, peer_info)).await.is_err() {
+                            // Consumer (the served stream) was dropped, e.g. the
+                            // agent is stopping. Exit the listener cleanly.
+                            return;
+                        }
 
                         listener = match ServerOptions::new().create(&pipe_name) {
                             Ok(pipe) => pipe,
                             Err(e) => {
-                                error!(error = %e, "Encountered an error creating a new pipe");
-                                cancellation_token.cancel();
+                                let reason = format!(
+                                    "SSH agent pipe {pipe_name} could not be recreated: {e}"
+                                );
+                                error!(error = %e, "{reason}");
                                 is_running.store(false, Ordering::Relaxed);
+                                cancellation_token.cancel();
+                                let _ = fatal_tx.send(Some(reason));
                                 return;
                             }
                         };
