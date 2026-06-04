@@ -19,6 +19,21 @@ pub struct BitwardenClient {
     user_key: Option<SymmetricKey>,
 }
 
+impl Drop for BitwardenClient {
+    fn drop(&mut self) {
+        // SEC-05: scrub bearer tokens from memory when the client is dropped
+        // (e.g. on logout/forget/lock). Defence-in-depth alongside the
+        // ZeroizeOnDrop SymmetricKey user_key.
+        use zeroize::Zeroize;
+        if let Some(token) = self.access_token.as_mut() {
+            token.zeroize();
+        }
+        if let Some(token) = self.refresh_token.as_mut() {
+            token.zeroize();
+        }
+    }
+}
+
 /// A decrypted SSH key ready for use by the agent.
 /// The private key PEM is wrapped in `Zeroizing` for automatic memory cleanup.
 #[derive(Debug, Clone)]

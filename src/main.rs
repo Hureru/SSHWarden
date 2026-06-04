@@ -1739,6 +1739,15 @@ fn write_managed_ssh_config(snippet: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_env(config: &sshwarden_config::Config, shell: &str) -> anyhow::Result<()> {
+    // UX-5: Windows OpenSSH uses the fixed pipe and ignores SSH_AUTH_SOCK, so
+    // these exports are usually only relevant for a custom [socket] endpoint or
+    // third-party clients that honour SSH_AUTH_SOCK. Note goes to stderr so it
+    // doesn't break `eval`.
+    #[cfg(windows)]
+    err_line(
+        r"# Note: Windows OpenSSH talks to the fixed pipe \\.\pipe\openssh-ssh-agent and ignores SSH_AUTH_SOCK; these exports only matter for a custom [socket] endpoint or clients that honour SSH_AUTH_SOCK.",
+    );
+
     let endpoint = config
         .socket
         .path
@@ -4037,11 +4046,16 @@ async fn handle_control_command(
             }
         }
         ControlAction::Forget => {
+            // EH-06: accumulate failures to delete on-disk material so a
+            // revocation that left secrets on disk is not reported as success.
+            let mut failures: Vec<String> = Vec::new();
             if let Err(e) = sshwarden_config::cache::LocalKeyCacheFile::delete() {
                 tracing::warn!("Failed to delete local key cache: {}", e);
+                failures.push(format!("local key cache ({e})"));
             }
             if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
                 tracing::warn!("Failed to delete legacy vault file: {}", e);
+                failures.push(format!("legacy vault file ({e})"));
             }
             let native_slot = local_key_cache_data
                 .read()
@@ -4052,9 +4066,11 @@ async fn handle_control_command(
                 sshwarden_ui::unlock::native::native_delete_local_cache_key(native_slot.as_deref())
             {
                 tracing::warn!("Failed to delete native unlock material: {}", e);
+                failures.push(format!("native unlock material ({e})"));
             }
             if let Err(e) = sshwarden_config::session::SessionFile::delete() {
                 tracing::warn!("Failed to delete device session file: {}", e);
+                failures.push(format!("device session file ({e})"));
             }
 
             *local_key_cache_data.write().await = None;
@@ -4079,9 +4095,17 @@ async fn handle_control_command(
             let _ = agent.clear_keys();
             vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
 
-            sshwarden_agent::ControlResponse::ok(
-                "Forgot local key cache, legacy vault file, and device session material",
-            )
+            if failures.is_empty() {
+                sshwarden_agent::ControlResponse::ok(
+                    "Forgot local key cache, legacy vault file, and device session material",
+                )
+            } else {
+                sshwarden_agent::ControlResponse::err(&format!(
+                    "Cleared in-memory state, but FAILED to delete on-disk material: {}. \
+                     This material may still exist on disk — remove it manually.",
+                    failures.join("; ")
+                ))
+            }
         }
         ControlAction::SetPin { pin } => {
             let pin = zeroize::Zeroizing::new(pin);
