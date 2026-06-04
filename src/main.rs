@@ -475,9 +475,9 @@ fn main() -> anyhow::Result<()> {
                     let path = sshwarden_config::config_path()?;
                     if !path.exists() {
                         config.save()?;
-                        info!("Created default config at: {}", path.display());
+                        out_line(format!("Created default config at: {}", path.display()));
                     } else {
-                        info!("Config file: {}", path.display());
+                        out_line(format!("Config file: {}", path.display()));
                     }
                     Ok(())
                 }
@@ -552,6 +552,20 @@ fn run_slint_event_loop(mut ui_request_rx: tokio::sync::mpsc::Receiver<sshwarden
     let _ = slint::run_event_loop_until_quit();
 }
 /// Send a control command to the running daemon via IPC.
+/// Print a line of command *result* output to stdout so it can be piped and
+/// grepped (`sshwarden keys | grep ...`). Diagnostic/daemon logging stays on
+/// stderr via `tracing`; only user-facing results go here (UX-1).
+#[allow(clippy::print_stdout)]
+fn out_line(msg: impl std::fmt::Display) {
+    println!("{msg}");
+}
+
+/// Print a user-facing error line to stderr.
+#[allow(clippy::print_stderr)]
+fn err_line(msg: impl std::fmt::Display) {
+    eprintln!("{msg}");
+}
+
 async fn cmd_control(cmd: &str) -> anyhow::Result<()> {
     match sshwarden_agent::control::send_control_command(cmd).await {
         Ok(response) => {
@@ -562,41 +576,38 @@ async fn cmd_control(cmd: &str) -> anyhow::Result<()> {
                         .as_ref()
                         .cloned()
                         .unwrap_or_else(|| serde_json::to_value(&response).unwrap_or_default());
-                    #[allow(clippy::print_stdout)]
-                    {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    }
+                    out_line(serde_json::to_string_pretty(&value)?);
                     return Ok(());
                 }
                 if let Some(msg) = &response.message {
-                    info!("{}", msg);
+                    out_line(msg);
                 }
                 if let Some(locked) = response.locked {
-                    info!("  Locked: {}", locked);
+                    out_line(format!("  Locked: {locked}"));
                 }
                 if let Some(count) = response.key_count {
-                    info!("  Keys: {}", count);
+                    out_line(format!("  Keys: {count}"));
                 }
                 if let Some(details) = &response.details {
                     if let Some(notification) = details.get("notification") {
-                        info!("  Notification: {}", notification);
+                        out_line(format!("  Notification: {notification}"));
                     }
                     if let Some(pending) = details.get("pending_sync") {
-                        info!("  Pending sync: {}", pending);
+                        out_line(format!("  Pending sync: {pending}"));
                     }
                     if let Some(authenticated) = details.get("authenticated") {
-                        info!("  Authenticated: {}", authenticated);
+                        out_line(format!("  Authenticated: {authenticated}"));
                     }
                 }
             } else {
                 let err = response.error.as_deref().unwrap_or("Unknown error");
-                info!("Error: {}", err);
+                err_line(format!("Error: {err}"));
             }
             Ok(())
         }
         Err(e) => {
-            info!("Could not connect to SSHWarden daemon: {}", e);
-            info!("Is the daemon running? Start it with: sshwarden");
+            err_line(format!("Could not connect to SSHWarden daemon: {e}"));
+            err_line("Is the daemon running? Start it with: sshwarden");
             Ok(())
         }
     }
@@ -1026,9 +1037,9 @@ async fn cmd_doctor(
     } else {
         for check in &checks {
             if check.ok {
-                info!("[ok] {}: {}", check.name, check.message);
+                out_line(format!("[ok] {}: {}", check.name, check.message));
             } else {
-                info!("[warn] {}: {}", check.name, check.message);
+                out_line(format!("[warn] {}: {}", check.name, check.message));
             }
         }
     }
@@ -1040,7 +1051,7 @@ async fn cmd_doctor(
 async fn cmd_set_pin() -> anyhow::Result<()> {
     let pin = prompt_password("Enter new PIN: ")?;
     if pin.len() < 4 {
-        info!("PIN must be at least 4 characters");
+        err_line("PIN must be at least 4 characters");
         return Ok(());
     }
     let pin_confirm = prompt_password("Confirm PIN: ")?;
@@ -2347,9 +2358,9 @@ async fn cmd_keys(
 
     let keys = client.sync_ssh_keys().await?;
     if keys.is_empty() {
-        info!("No SSH keys found in vault.");
+        out_line("No SSH keys found in vault.");
     } else {
-        info!("Found {} SSH key(s):", keys.len());
+        out_line(format!("Found {} SSH key(s):", keys.len()));
         for key in &keys {
             // Show first line of PEM to identify key type
             let key_type = if key.private_key_pem.as_str().contains("ed25519") {
@@ -2359,8 +2370,9 @@ async fn cmd_keys(
             } else {
                 "SSH"
             };
-            info!("  [{}] {} ({})", key_type, key.name, key.cipher_id);
+            out_line(format!("  [{}] {} ({})", key_type, key.name, key.cipher_id));
         }
+        out_line("\nNote: this lists vault keys without changing the running agent. Use `sshwarden login` to load them.");
     }
 
     Ok(())
