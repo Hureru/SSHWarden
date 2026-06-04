@@ -2586,7 +2586,12 @@ async fn run_foreground(
     // Create channels for UI communication
     let (request_tx, mut request_rx) =
         tokio::sync::mpsc::channel::<sshwarden_agent::SshAgentUIRequest>(32);
-    let (response_tx, _response_rx) = tokio::sync::broadcast::channel::<(u32, bool)>(32);
+    // CONC-4 mitigation: a generous capacity makes a broadcast `Lagged` (which
+    // would otherwise be treated as a denial in confirm()/can_list()) effectively
+    // impossible under realistic concurrency. The fully race-free fix (per-request
+    // oneshot registry) needs runtime verification of the signing path and is
+    // tracked as a follow-up.
+    let (response_tx, _response_rx) = tokio::sync::broadcast::channel::<(u32, bool)>(256);
     let response_tx = Arc::new(response_tx);
     let (runtime_event_tx, mut runtime_event_rx) = tokio::sync::mpsc::channel::<RuntimeEvent>(32);
 
@@ -2639,6 +2644,10 @@ async fn run_foreground(
     let pending_sync = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pin_failures: PinFailureHandle =
         Arc::new(std::sync::Mutex::new(PinFailureState::default()));
+    // CONC-6: count in-flight UI requests (sign/unlock prompts) so the inactivity
+    // auto-lock does not fire while a prompt is open (last_activity is only
+    // refreshed at request arrival, not while the user is deciding).
+    let in_flight_prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let key_names = Arc::new(RwLock::new((*key_names).clone()));
 
     // Load vault keys into agent
@@ -2804,6 +2813,11 @@ async fn run_foreground(
             Some(request) = request_rx.recv() => {
                 last_activity = tokio::time::Instant::now();
 
+                // CONC-6: mark a request in flight for the duration of the
+                // handler (which may open a long sign/unlock prompt).
+                in_flight_prompts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let in_flight_done = in_flight_prompts.clone();
+
                 // Spawn a task to handle each request so we don't block the main loop
                 let response_tx_clone = (*response_tx).clone();
                 let vault_locked_clone = vault_locked.clone();
@@ -2837,6 +2851,7 @@ async fn run_foreground(
                         runtime_event_tx_clone,
                         authorization_memory_clone,
                     ).await;
+                    in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 });
             }
             // Runtime events from spawned SSH request handlers
@@ -3002,6 +3017,7 @@ async fn run_foreground(
             _ = lock_check_interval.tick() => {
                 if lock_timeout > 0
                     && !vault_locked.load(std::sync::atomic::Ordering::Relaxed)
+                    && in_flight_prompts.load(std::sync::atomic::Ordering::Relaxed) == 0
                     && last_activity.elapsed().as_secs() >= lock_timeout
                 {
                     info!("Auto-locking vault due to inactivity ({} seconds)", lock_timeout);
@@ -5407,13 +5423,17 @@ async fn dispatch_standalone_bind_hosts_dialog(
         .await
         .map_err(|_| anyhow::anyhow!("UI request channel closed"))?;
 
-    match response_rx.await {
-        Ok(sshwarden_ui::BindHostsResult::Saved { bindings: payload }) => {
+    // CONC-1: this dialog response is awaited inline in the main select! loop
+    // (via the BindHostsDialog control command), so an unbounded wait would
+    // freeze auto-lock, token refresh and notification handling. Bound it.
+    match tokio::time::timeout(std::time::Duration::from_secs(600), response_rx).await {
+        Ok(Ok(sshwarden_ui::BindHostsResult::Saved { bindings: payload })) => {
             persist_bind_payload(&payload).await?;
             Ok(true)
         }
-        Ok(sshwarden_ui::BindHostsResult::Cancelled) => Ok(false),
-        Err(_) => anyhow::bail!("Dialog response channel closed unexpectedly"),
+        Ok(Ok(sshwarden_ui::BindHostsResult::Cancelled)) => Ok(false),
+        Ok(Err(_)) => anyhow::bail!("Dialog response channel closed unexpectedly"),
+        Err(_) => anyhow::bail!("Host-binding dialog timed out after 600s"),
     }
 }
 
