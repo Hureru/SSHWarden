@@ -16,7 +16,7 @@ serde_json = { workspace = true }
 ssh-key = { workspace = true, features = ["encryption", "ed25519", "rsa", "getrandom"] }
 sysinfo = { workspace = true, features = ["windows"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "sync", "macros", "net"] }
+tokio = { workspace = true, features = ["io-util", "sync", "macros", "net", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing = { workspace = true }
 sshwarden-config = { path = "../sshwarden-config" }

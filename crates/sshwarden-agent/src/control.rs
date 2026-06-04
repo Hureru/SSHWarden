@@ -67,6 +67,12 @@ impl ControlResponse {
 
 pub const CONTROL_PIPE_NAME: &str = r"\\.\pipe\sshwarden-control";
 
+/// Maximum number of bytes accepted for a single control command line on the
+/// daemon side. The control protocol is one short JSON object per connection,
+/// so anything larger is malformed or hostile; capping the read avoids
+/// unbounded buffering from a local process flooding the channel (EH-08).
+const MAX_CONTROL_LINE_BYTES: u64 = 64 * 1024;
+
 /// A request sent from the control server to the main loop.
 pub struct ControlRequest {
     pub action: ControlAction,
@@ -108,7 +114,7 @@ pub async fn start_control_server(
     tx: tokio::sync::mpsc::Sender<ControlRequest>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
     info!("Control server starting on {}", CONTROL_PIPE_NAME);
@@ -150,9 +156,9 @@ pub async fn start_control_server(
             }
         }
 
-        // Read one line from the client
+        // Read one line from the client (bounded; EH-08)
         let (reader, mut writer) = tokio::io::split(server);
-        let mut buf_reader = BufReader::new(reader);
+        let mut buf_reader = BufReader::new(reader.take(MAX_CONTROL_LINE_BYTES));
         let mut line = String::new();
 
         match buf_reader.read_line(&mut line).await {
@@ -247,7 +253,7 @@ pub async fn start_control_server(
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use std::os::unix::fs::PermissionsExt;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::net::UnixListener;
 
     let path = match sshwarden_config::default_control_socket_path() {
@@ -315,7 +321,7 @@ pub async fn start_control_server(
         let tx = tx.clone();
         tokio::spawn(async move {
             let (reader, mut writer) = tokio::io::split(stream);
-            let mut buf_reader = BufReader::new(reader);
+            let mut buf_reader = BufReader::new(reader.take(MAX_CONTROL_LINE_BYTES));
             let mut line = String::new();
 
             match buf_reader.read_line(&mut line).await {

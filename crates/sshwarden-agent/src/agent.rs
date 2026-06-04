@@ -102,7 +102,8 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
         );
 
         let mut rx_channel = self.ui_response_tx.subscribe();
-        self.show_ui_request_tx
+        if self
+            .show_ui_request_tx
             .send(SshAgentUIRequest {
                 request_id,
                 cipher_id: Some(ssh_key.cipher_uuid.clone()),
@@ -114,7 +115,13 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
                 is_forwarding: info.is_forwarding(),
             })
             .await
-            .expect("Should send request to ui");
+            .is_err()
+        {
+            // The host application's UI channel is gone (daemon shutting down or
+            // main loop exited). Fail closed instead of panicking the serve task.
+            error!("UI request channel closed; denying sign request");
+            return false;
+        }
         while let Ok((id, response)) = rx_channel.recv().await {
             if id == request_id {
                 return response;
@@ -141,10 +148,11 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
             operation_kind: crate::request_parser::OperationKind::SshAuthentication,
             is_forwarding: info.is_forwarding(),
         };
-        self.show_ui_request_tx
-            .send(message)
-            .await
-            .expect("Should send request to ui");
+        if self.show_ui_request_tx.send(message).await.is_err() {
+            // UI channel gone (daemon shutting down); fail closed, don't panic.
+            error!("UI request channel closed; denying list request");
+            return false;
+        }
         while let Ok((id, response)) = rx_channel.recv().await {
             if id == request_id {
                 return response;

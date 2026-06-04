@@ -3130,7 +3130,21 @@ async fn handle_control_command(
                         sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator).await;
 
                     if let Some(ref entered_pin) = pin_result {
-                        let keys_json = decrypted_cache.lock().unwrap().take().unwrap();
+                        let keys_json = match decrypted_cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take()
+                        {
+                            Some(j) => j,
+                            None => {
+                                tracing::warn!(
+                                    "PIN validator reported success but cache was empty"
+                                );
+                                return sshwarden_agent::ControlResponse::err(
+                                    "PIN unlock failed: internal cache error",
+                                );
+                            }
+                        };
                         let resp = finish_unlock_with_json(
                             &keys_json,
                             agent,
@@ -3903,7 +3917,7 @@ fn make_pin_validator(enc_data: String) -> (PinValidator, DecryptedCache) {
     let validator: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(move |pin: &str| -> bool {
         match sshwarden_api::crypto::pin_decrypt(&enc_data, pin) {
             Ok(keys_json) => {
-                *cache_clone.lock().unwrap() = Some(keys_json);
+                *cache_clone.lock().unwrap_or_else(|e| e.into_inner()) = Some(keys_json);
                 true
             }
             Err(_) => false,

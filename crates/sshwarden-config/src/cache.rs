@@ -41,6 +41,10 @@ pub struct LocalCacheKeySlots {
 }
 
 impl LocalKeyCacheFile {
+    /// Supported on-disk format versions. v2 is the original envelope format;
+    /// v3 adds a per-cache random PIN salt (`LocalCacheKeySlots::pin_salt`).
+    const SUPPORTED_VERSIONS: &'static [u32] = &[2, 3];
+
     pub fn path() -> anyhow::Result<PathBuf> {
         Ok(crate::config_dir()?.join("local-key-cache.json"))
     }
@@ -54,6 +58,14 @@ impl LocalKeyCacheFile {
             .with_context(|| format!("Failed to read local key cache: {}", path.display()))?;
         let cache: LocalKeyCacheFile = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse local key cache: {}", path.display()))?;
+        if !Self::SUPPORTED_VERSIONS.contains(&cache.version) {
+            anyhow::bail!(
+                "Unsupported local key cache version {} (supported: {:?}): {}",
+                cache.version,
+                Self::SUPPORTED_VERSIONS,
+                path.display()
+            );
+        }
         Ok(Some(cache))
     }
 
