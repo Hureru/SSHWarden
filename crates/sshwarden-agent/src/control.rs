@@ -208,6 +208,9 @@ pub enum ControlAction {
         pin: String,
     },
     Forget,
+    /// Cleanly shut down the daemon: cancel the main loop, stop the agent and
+    /// control server, and remove the PID file. Used by `stop` / `restart`.
+    Stop,
     /// Open the host-binding management dialog. The daemon dispatches a
     /// `UIRequest::BindHostsDialog` and responds once the dialog closes.
     BindHostsDialog,
@@ -331,6 +334,7 @@ async fn dispatch_control_command(
         "status-json" => ControlAction::Status { json: true },
         "sync" => ControlAction::Sync,
         "forget" => ControlAction::Forget,
+        "stop" => ControlAction::Stop,
         "bind-hosts-dialog" => ControlAction::BindHostsDialog,
         s if s.starts_with("unlock-pin:") => {
             let pin = s.strip_prefix("unlock-pin:").unwrap_or("").to_string();

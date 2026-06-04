@@ -2,7 +2,7 @@
 
 ## 1. Core Summary
 
-SSHWarden 守护进程在 `\\.\pipe\sshwarden-control` Named Pipe（非 Windows：运行时目录下的 Unix socket，权限 0600）上监听 JSON 控制命令。客户端连接后发送一行 JSON，守护进程处理后回写一行 JSON 响应并关闭连接。协议为单命令-单响应模型。支持 12 种命令字符串，涵盖锁定/解锁（自动/Hello/原生/PIN/主密码）/状态（人类可读与 JSON）/同步/遗忘/PIN 设置/主机绑定对话框。守护进程仅接受同一用户的连接（Unix 校验 peer uid；Windows 管道 DACL 限定当前用户 + SYSTEM）。
+SSHWarden 守护进程在 `\\.\pipe\sshwarden-control` Named Pipe（非 Windows：运行时目录下的 Unix socket，权限 0600）上监听 JSON 控制命令。客户端连接后发送一行 JSON，守护进程处理后回写一行 JSON 响应并关闭连接。协议为单命令-单响应模型。支持 13 种命令字符串，涵盖锁定/解锁（自动/Hello/原生/PIN/主密码）/状态（人类可读与 JSON）/同步/遗忘/PIN 设置/停止守护进程/主机绑定对话框。守护进程仅接受同一用户的连接（Unix 校验 peer uid；Windows 管道 DACL 限定当前用户 + SYSTEM）。
 
 ## 2. Source of Truth
 
@@ -27,7 +27,7 @@ SSHWarden 守护进程在 `\\.\pipe\sshwarden-control` Named Pipe（非 Windows�
 
 ### Command List
 
-`dispatch_control_command` (`crates/sshwarden-agent/src/control.rs`) maps 12
+`dispatch_control_command` (`crates/sshwarden-agent/src/control.rs`) maps 13
 command strings to `ControlAction` variants:
 
 | Command | ControlAction | Description |
@@ -42,6 +42,7 @@ command strings to `ControlAction` variants:
 | `status-json` | `Status { json: true }` | 同上，仅返回 `details` JSON |
 | `sync` | `Sync` | 重新同步 Bitwarden 密码库（需已认证）；锁定时仅刷新缓存并置 pending_sync |
 | `forget` | `Forget` | 删除本地密钥缓存/会话材料并清空 agent |
+| `stop` | `Stop` | 干净关闭守护进程（取消主循环、停止 agent 与控制服务、删除 PID 文件）；供 `stop`/`restart` 使用 |
 | `set-pin:{pin}` | `SetPin { pin }` | 用 PIN（随机盐，格式 v3）加密当前密钥缓存并持久化，可选注册 Hello/原生 |
 | `bind-hosts-dialog` | `BindHostsDialog` | 打开主机绑定管理对话框，对话框关闭后返回 |
 

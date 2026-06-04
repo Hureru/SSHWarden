@@ -347,7 +347,7 @@ brew install openssl
 ```bash
 # 生成性能分析数据
 cargo build --release --profile release-with-debug
-perf record -g target/release/sshwarden daemon
+perf record -g target/release/sshwarden run
 perf report
 
 # 或使用 flamegraph
