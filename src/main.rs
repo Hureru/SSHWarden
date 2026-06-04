@@ -1683,6 +1683,7 @@ fn build_envelope_local_key_cache(
     server_url: &str,
     local_cache_key: &sshwarden_api::crypto::SymmetricKey,
     pin_encrypted: Option<String>,
+    pin_salt: Option<String>,
     hello_challenge: Option<String>,
     hello_encrypted: Option<String>,
     native_encrypted: Option<String>,
@@ -1691,7 +1692,7 @@ fn build_envelope_local_key_cache(
     let encrypted_payload =
         sshwarden_api::crypto::encrypt_enc_string(keys_json.as_bytes(), local_cache_key)?;
     let cache = sshwarden_config::cache::LocalKeyCacheFile {
-        version: 2,
+        version: 3,
         header: sshwarden_config::cache::LocalKeyCacheHeader {
             email: email.to_string(),
             server_url: server_url.to_string(),
@@ -1700,6 +1701,7 @@ fn build_envelope_local_key_cache(
         encrypted_payload,
         local_cache_key: sshwarden_config::cache::LocalCacheKeySlots {
             pin_encrypted,
+            pin_salt,
             hello_challenge,
             hello_encrypted,
             native_encrypted,
@@ -1718,13 +1720,14 @@ fn write_envelope_local_key_cache(
     sshwarden_api::crypto::SymmetricKey,
 )> {
     let local_cache_key = sshwarden_api::crypto::random_symmetric_key();
-    let pin_encrypted = encrypt_local_cache_key_with_pin(&local_cache_key, pin)?;
+    let (pin_encrypted, pin_salt) = encrypt_local_cache_key_with_pin(&local_cache_key, pin)?;
     let mut cache = build_envelope_local_key_cache(
         keys,
         email,
         server_url,
         &local_cache_key,
         Some(pin_encrypted),
+        Some(pin_salt),
         None,
         None,
         None,
@@ -1755,6 +1758,7 @@ fn refresh_envelope_local_key_cache(
         &existing.header.server_url,
         local_cache_key,
         existing.local_cache_key.pin_encrypted.clone(),
+        existing.local_cache_key.pin_salt.clone(),
         existing.local_cache_key.hello_challenge.clone(),
         existing.local_cache_key.hello_encrypted.clone(),
         existing.local_cache_key.native_encrypted.clone(),
@@ -1790,12 +1794,18 @@ fn enroll_hello_for_local_key_cache(
     Ok(())
 }
 
+/// Encrypt the local cache key with a PIN, generating a fresh random salt.
+/// Returns `(pin_encrypted, pin_salt_b64)` for the v3 cache format (SEC-04).
 fn encrypt_local_cache_key_with_pin(
     local_cache_key: &sshwarden_api::crypto::SymmetricKey,
     pin: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, String)> {
     let encoded_local_cache_key = sshwarden_api::crypto::encode_symmetric_key(local_cache_key);
-    sshwarden_api::crypto::pin_encrypt(&encoded_local_cache_key, pin)
+    let salt = sshwarden_api::crypto::random_pin_salt();
+    let pin_encrypted =
+        sshwarden_api::crypto::pin_encrypt_with_salt(&encoded_local_cache_key, pin, &salt)?;
+    let pin_salt = base64::engine::general_purpose::STANDARD.encode(salt);
+    Ok((pin_encrypted, pin_salt))
 }
 
 #[cfg(windows)]
@@ -1870,11 +1880,48 @@ fn decrypt_envelope_local_key_cache_with_pin(
         .pin_encrypted
         .as_deref()
         .context("Local key cache has no PIN unlock slot")?;
-    let encoded_lck = sshwarden_api::crypto::pin_decrypt(encrypted_lck, pin)
-        .context("Failed to unlock Local Cache Key with PIN")?;
+    let encoded_lck = match cache.local_cache_key.pin_salt.as_deref() {
+        Some(salt_b64) => {
+            let salt = base64::engine::general_purpose::STANDARD
+                .decode(salt_b64)
+                .context("Invalid PIN salt in local key cache")?;
+            sshwarden_api::crypto::pin_decrypt_with_salt(encrypted_lck, pin, &salt)
+        }
+        // Pre-v3 cache: the PIN slot was derived with the fixed legacy salt.
+        None => sshwarden_api::crypto::pin_decrypt_with_salt(
+            encrypted_lck,
+            pin,
+            &sshwarden_api::crypto::legacy_pin_salt(),
+        ),
+    }
+    .context("Failed to unlock Local Cache Key with PIN")?;
     let local_cache_key = sshwarden_api::crypto::decode_symmetric_key(&encoded_lck)
         .context("Failed to decode Local Cache Key")?;
     decrypt_envelope_payload(cache, local_cache_key)
+}
+
+/// Transparently migrate a pre-v3 (fixed-salt) cache to v3 with a fresh random
+/// PIN salt after a successful PIN unlock (SEC-04). Only the PIN slot is
+/// re-wrapped; the local cache key and other slots (Hello/native) are preserved
+/// so there is no biometric re-prompt. Best-effort: a failure is logged, not
+/// fatal (the unlock itself already succeeded).
+fn needs_pin_salt_migration(cache: &sshwarden_config::cache::LocalKeyCacheFile) -> bool {
+    cache.local_cache_key.pin_encrypted.is_some()
+        && (cache.version < 3 || cache.local_cache_key.pin_salt.is_none())
+}
+
+fn migrate_pin_salt_to_v3(
+    cache: &sshwarden_config::cache::LocalKeyCacheFile,
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+    pin: &str,
+) -> anyhow::Result<sshwarden_config::cache::LocalKeyCacheFile> {
+    let (pin_encrypted, pin_salt) = encrypt_local_cache_key_with_pin(local_cache_key, pin)?;
+    let mut migrated = cache.clone();
+    migrated.version = 3;
+    migrated.local_cache_key.pin_encrypted = Some(pin_encrypted);
+    migrated.local_cache_key.pin_salt = Some(pin_salt);
+    migrated.save()?;
+    Ok(migrated)
 }
 
 #[cfg(windows)]
@@ -2449,6 +2496,8 @@ async fn run_foreground(
     let key_material_fingerprints: KeyMaterialFingerprints =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
     let pending_sync = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pin_failures: PinFailureHandle =
+        Arc::new(std::sync::Mutex::new(PinFailureState::default()));
     let key_names = Arc::new(RwLock::new((*key_names).clone()));
 
     // Load vault keys into agent
@@ -2606,6 +2655,7 @@ async fn run_foreground(
                     &pending_sync,
                     &notification_state,
                     &authorization_memory,
+                    &pin_failures,
                 ).await;
                 let _ = ctrl_req.reply.send(response);
             }
@@ -2867,6 +2917,58 @@ async fn lock_vault(
     Ok(())
 }
 
+/// SEC-03: in-memory PIN brute-force protection. Kept per daemon run (not
+/// persisted) so it cannot be reset by tampering with on-disk state.
+#[derive(Default)]
+struct PinFailureState {
+    consecutive_failures: u32,
+    locked_until: Option<tokio::time::Instant>,
+}
+
+type PinFailureHandle = Arc<std::sync::Mutex<PinFailureState>>;
+
+/// Lock PIN unlock after this many consecutive wrong attempts.
+const PIN_MAX_ATTEMPTS: u32 = 5;
+/// Per-failure delay scales with the failure count, capped, to slow guessing.
+const PIN_FAILURE_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const PIN_FAILURE_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Lockout window once PIN_MAX_ATTEMPTS consecutive failures is reached.
+const PIN_LOCKOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reject a PIN attempt outright while a lockout is active. Returns the
+/// remaining lockout duration if locked, clearing an expired lockout.
+fn pin_lockout_remaining(pin_failures: &PinFailureHandle) -> Option<std::time::Duration> {
+    let now = tokio::time::Instant::now();
+    let mut st = pin_failures.lock().unwrap_or_else(|e| e.into_inner());
+    match st.locked_until {
+        Some(until) if until > now => Some(until - now),
+        Some(_) => {
+            st.locked_until = None;
+            None
+        }
+        None => None,
+    }
+}
+
+/// Record a PIN unlock outcome: reset on success, otherwise bump the failure
+/// counter (arming a lockout at the threshold) and return the delay to apply.
+fn record_pin_attempt(pin_failures: &PinFailureHandle, success: bool) -> std::time::Duration {
+    let mut st = pin_failures.lock().unwrap_or_else(|e| e.into_inner());
+    if success {
+        st.consecutive_failures = 0;
+        st.locked_until = None;
+        return std::time::Duration::ZERO;
+    }
+    st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+    if st.consecutive_failures >= PIN_MAX_ATTEMPTS {
+        st.locked_until = Some(tokio::time::Instant::now() + PIN_LOCKOUT);
+    }
+    std::cmp::min(
+        PIN_FAILURE_BASE_DELAY * st.consecutive_failures,
+        PIN_FAILURE_MAX_DELAY,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_status_response(
     json: bool,
@@ -2975,6 +3077,7 @@ async fn handle_control_command(
     pending_sync: &Arc<std::sync::atomic::AtomicBool>,
     notification_state: &Arc<RwLock<NotificationRuntimeState>>,
     authorization_memory: &AuthorizationMemorySet,
+    pin_failures: &PinFailureHandle,
 ) -> sshwarden_agent::ControlResponse {
     use sshwarden_agent::ControlAction;
 
@@ -3445,77 +3548,105 @@ async fn handle_control_command(
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
 
-            if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
-                match decrypt_envelope_local_key_cache_with_pin(&cache, &pin) {
-                    Ok((keys_json, local_cache_key)) => {
-                        local_cache_key_state.write().await.set(local_cache_key);
-                        let resp = finish_unlock_with_json(
-                            &keys_json,
-                            agent,
-                            vault_locked,
-                            cached_key_tuples,
-                            key_names,
-                            "Vault unlocked via PIN local key cache",
-                        )
-                        .await;
-
-                        if resp.ok {
-                            try_restore_api_session(
-                                api_client,
-                                config,
-                                &pin,
-                                notification_rx,
-                                notification_client,
-                                notification_state,
-                            )
-                            .await;
-                            resolve_pending_sync(
-                                pending_sync,
-                                api_client,
-                                cached_key_tuples,
-                                public_key_identity_tuples,
-                                local_key_cache_data,
-                                local_cache_key_state,
-                                authorization_memory,
-                                key_material_fingerprints,
-                                vault_locked,
-                                agent,
-                                key_names,
-                                notification_state,
-                            )
-                            .await;
-                        }
-
-                        return resp;
-                    }
-                    Err(e) => {
-                        tracing::warn!("PIN unlock from local key cache failed: {}", e);
-                    }
-                }
+            // SEC-03: reject outright while a brute-force lockout is active (no
+            // Argon2 work performed) so the control channel can't be hammered.
+            if let Some(wait) = pin_lockout_remaining(pin_failures) {
+                return sshwarden_agent::ControlResponse::err(&format!(
+                    "Too many failed PIN attempts; locked for {}s",
+                    wait.as_secs() + 1
+                ));
             }
 
-            // Fall back to legacy in-memory/vault.enc cache.
-            let encrypted = {
-                let mem = pin_encrypted_keys.read().await.clone();
-                if mem.is_some() {
-                    mem
-                } else {
-                    vault_file_data
-                        .read()
-                        .await
-                        .as_ref()
-                        .map(|v| v.pin_encrypted.clone())
-                }
-            };
+            let resp = 'unlock: {
+                if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
+                    match decrypt_envelope_local_key_cache_with_pin(&cache, &pin) {
+                        Ok((keys_json, local_cache_key)) => {
+                            // SEC-04: now that we hold the local cache key and a
+                            // verified PIN, transparently upgrade a pre-v3 (fixed
+                            // salt) cache to a random per-cache salt.
+                            if needs_pin_salt_migration(&cache) {
+                                match migrate_pin_salt_to_v3(&cache, &local_cache_key, &pin) {
+                                    Ok(migrated) => {
+                                        *local_key_cache_data.write().await = Some(migrated);
+                                        info!(
+                                            "Migrated local key cache PIN slot to v3 (random salt)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "PIN salt v3 migration failed (non-fatal): {e}"
+                                        )
+                                    }
+                                }
+                            }
+                            local_cache_key_state.write().await.set(local_cache_key);
+                            let resp = finish_unlock_with_json(
+                                &keys_json,
+                                agent,
+                                vault_locked,
+                                cached_key_tuples,
+                                key_names,
+                                "Vault unlocked via PIN local key cache",
+                            )
+                            .await;
 
-            match encrypted {
-                Some(enc_data) => match sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
-                    Ok(keys_json) => {
-                        if local_key_cache_data.read().await.is_none() {
-                            let keys_for_migration: Result<Vec<(String, String, String)>, _> =
-                                serde_json::from_str(&keys_json);
-                            if let Ok(keys_for_migration) = keys_for_migration {
-                                match write_envelope_local_key_cache(
+                            if resp.ok {
+                                try_restore_api_session(
+                                    api_client,
+                                    config,
+                                    &pin,
+                                    notification_rx,
+                                    notification_client,
+                                    notification_state,
+                                )
+                                .await;
+                                resolve_pending_sync(
+                                    pending_sync,
+                                    api_client,
+                                    cached_key_tuples,
+                                    public_key_identity_tuples,
+                                    local_key_cache_data,
+                                    local_cache_key_state,
+                                    authorization_memory,
+                                    key_material_fingerprints,
+                                    vault_locked,
+                                    agent,
+                                    key_names,
+                                    notification_state,
+                                )
+                                .await;
+                            }
+
+                            break 'unlock resp;
+                        }
+                        Err(e) => {
+                            tracing::warn!("PIN unlock from local key cache failed: {}", e);
+                        }
+                    }
+                }
+
+                // Fall back to legacy in-memory/vault.enc cache.
+                let encrypted = {
+                    let mem = pin_encrypted_keys.read().await.clone();
+                    if mem.is_some() {
+                        mem
+                    } else {
+                        vault_file_data
+                            .read()
+                            .await
+                            .as_ref()
+                            .map(|v| v.pin_encrypted.clone())
+                    }
+                };
+
+                match encrypted {
+                    Some(enc_data) => match sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
+                        Ok(keys_json) => {
+                            if local_key_cache_data.read().await.is_none() {
+                                let keys_for_migration: Result<Vec<(String, String, String)>, _> =
+                                    serde_json::from_str(&keys_json);
+                                if let Ok(keys_for_migration) = keys_for_migration {
+                                    match write_envelope_local_key_cache(
                                     &keys_for_migration,
                                     &config.auth.email,
                                     &config.server.base_url,
@@ -3536,54 +3667,63 @@ async fn handle_control_command(
                                         e
                                     ),
                                 }
+                                }
                             }
-                        }
-                        let resp = finish_unlock_with_json(
-                            &keys_json,
-                            agent,
-                            vault_locked,
-                            cached_key_tuples,
-                            key_names,
-                            "Vault unlocked via PIN",
-                        )
-                        .await;
-
-                        if resp.ok {
-                            // Try to restore API session from device session file
-                            try_restore_api_session(
-                                api_client,
-                                config,
-                                &pin,
-                                notification_rx,
-                                notification_client,
-                                notification_state,
-                            )
-                            .await;
-                            resolve_pending_sync(
-                                pending_sync,
-                                api_client,
-                                cached_key_tuples,
-                                public_key_identity_tuples,
-                                local_key_cache_data,
-                                local_cache_key_state,
-                                authorization_memory,
-                                key_material_fingerprints,
-                                vault_locked,
+                            let resp = finish_unlock_with_json(
+                                &keys_json,
                                 agent,
+                                vault_locked,
+                                cached_key_tuples,
                                 key_names,
-                                notification_state,
+                                "Vault unlocked via PIN",
                             )
                             .await;
-                        }
 
-                        resp
-                    }
-                    Err(_) => sshwarden_agent::ControlResponse::err("Invalid PIN"),
-                },
-                None => sshwarden_agent::ControlResponse::err(
-                    "No PIN configured. Use 'sshwarden set-pin' first.",
-                ),
+                            if resp.ok {
+                                // Try to restore API session from device session file
+                                try_restore_api_session(
+                                    api_client,
+                                    config,
+                                    &pin,
+                                    notification_rx,
+                                    notification_client,
+                                    notification_state,
+                                )
+                                .await;
+                                resolve_pending_sync(
+                                    pending_sync,
+                                    api_client,
+                                    cached_key_tuples,
+                                    public_key_identity_tuples,
+                                    local_key_cache_data,
+                                    local_cache_key_state,
+                                    authorization_memory,
+                                    key_material_fingerprints,
+                                    vault_locked,
+                                    agent,
+                                    key_names,
+                                    notification_state,
+                                )
+                                .await;
+                            }
+
+                            resp
+                        }
+                        Err(_) => sshwarden_agent::ControlResponse::err("Invalid PIN"),
+                    },
+                    None => sshwarden_agent::ControlResponse::err(
+                        "No PIN configured. Use 'sshwarden set-pin' first.",
+                    ),
+                }
+            };
+
+            // SEC-03: record the outcome — reset on success, otherwise apply an
+            // escalating delay and arm a lockout once the threshold is reached.
+            let delay = record_pin_attempt(pin_failures, resp.ok);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
+            resp
         }
         ControlAction::UnlockPassword { password } => {
             let password = zeroize::Zeroizing::new(password);

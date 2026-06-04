@@ -73,6 +73,115 @@ pub const CONTROL_PIPE_NAME: &str = r"\\.\pipe\sshwarden-control";
 /// unbounded buffering from a local process flooding the channel (EH-08).
 const MAX_CONTROL_LINE_BYTES: u64 = 64 * 1024;
 
+/// SEC-01 (Windows): build a security descriptor restricting the control pipe
+/// to the current user + LocalSystem, so the named pipe is not created with the
+/// default DACL (which grants Everyone read access). Best-effort: callers fall
+/// back to the default DACL if the descriptor cannot be built.
+#[cfg(windows)]
+mod win_security {
+    use windows::core::{HSTRING, PWSTR};
+    use windows::Win32::Foundation::LocalFree;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// Owns the security descriptor and the SECURITY_ATTRIBUTES referencing it;
+    /// frees the descriptor on drop.
+    pub struct PipeSecurity {
+        sd: PSECURITY_DESCRIPTOR,
+        sa: SECURITY_ATTRIBUTES,
+    }
+
+    impl PipeSecurity {
+        /// Build a DACL granting only the current user and LocalSystem full
+        /// control. Returns None on any failure (caller uses the default DACL).
+        pub fn current_user_only() -> Option<Self> {
+            unsafe {
+                let sid = current_user_sid_string()?;
+                let sddl = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)");
+                let mut sd = PSECURITY_DESCRIPTOR(core::ptr::null_mut());
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    &HSTRING::from(&sddl),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    None,
+                )
+                .ok()?;
+                if sd.0.is_null() {
+                    return None;
+                }
+                let sa = SECURITY_ATTRIBUTES {
+                    nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: sd.0,
+                    bInheritHandle: false.into(),
+                };
+                Some(Self { sd, sa })
+            }
+        }
+
+        /// Raw pointer to the SECURITY_ATTRIBUTES for
+        /// `create_with_security_attributes_raw`. Valid while `self` is alive.
+        pub fn as_attrs_ptr(&mut self) -> *mut core::ffi::c_void {
+            &mut self.sa as *mut _ as *mut core::ffi::c_void
+        }
+    }
+
+    impl Drop for PipeSecurity {
+        fn drop(&mut self) {
+            if !self.sd.0.is_null() {
+                unsafe {
+                    let _ = LocalFree(Some(HLOCAL(self.sd.0)));
+                }
+            }
+        }
+    }
+
+    // SAFETY: the owned security descriptor is process-global heap memory
+    // (LocalAlloc'd) accessed only for pipe creation and freed on drop, so the
+    // owning value is safe to move between tokio worker threads.
+    unsafe impl Send for PipeSecurity {}
+
+    unsafe fn current_user_sid_string() -> Option<String> {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+
+        // First call sizes the buffer, the second fills it.
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        if len == 0 {
+            let _ = CloseHandle(token);
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        let res = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            len,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        res.ok()?;
+
+        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut pwstr = PWSTR::null();
+        ConvertSidToStringSidW(token_user.User.Sid, &mut pwstr).ok()?;
+        if pwstr.is_null() {
+            return None;
+        }
+        let sid = pwstr.to_string().ok();
+        let _ = LocalFree(Some(HLOCAL(pwstr.0 as *mut core::ffi::c_void)));
+        sid
+    }
+}
+
 /// A request sent from the control server to the main loop.
 pub struct ControlRequest {
     pub action: ControlAction,
@@ -119,26 +228,41 @@ pub async fn start_control_server(
 
     info!("Control server starting on {}", CONTROL_PIPE_NAME);
 
+    // SEC-01: restrict the control pipe to the current user + SYSTEM. If the
+    // descriptor cannot be built, fall back to the default DACL.
+    let mut pipe_security = win_security::PipeSecurity::current_user_only();
+    if pipe_security.is_none() {
+        error!("Could not build control pipe security descriptor; using default DACL");
+    }
+
     loop {
-        // Create a new pipe instance for each connection
-        let server = match ServerOptions::new()
-            .first_pipe_instance(false)
-            .create(CONTROL_PIPE_NAME)
-        {
+        // Create a new pipe instance for each connection. The SECURITY_ATTRIBUTES
+        // pointer is derived and consumed entirely within this (await-free) block
+        // so it is never held across an await point (which would make the task
+        // non-Send). sa_ptr is null (default DACL) or points to pipe_security's
+        // SECURITY_ATTRIBUTES, which outlives the call.
+        let created = {
+            let sa_ptr = pipe_security
+                .as_mut()
+                .map(|s| s.as_attrs_ptr())
+                .unwrap_or(std::ptr::null_mut());
+            unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(false)
+                    .create_with_security_attributes_raw(CONTROL_PIPE_NAME, sa_ptr)
+                    .or_else(|_| {
+                        ServerOptions::new()
+                            .first_pipe_instance(true)
+                            .create_with_security_attributes_raw(CONTROL_PIPE_NAME, sa_ptr)
+                    })
+            }
+        };
+        let server = match created {
             Ok(s) => s,
             Err(e) => {
-                // If this is the very first instance, try with first_pipe_instance(true)
-                match ServerOptions::new()
-                    .first_pipe_instance(true)
-                    .create(CONTROL_PIPE_NAME)
-                {
-                    Ok(s) => s,
-                    Err(e2) => {
-                        error!("Failed to create control pipe: {} / {}", e, e2);
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        continue;
-                    }
-                }
+                error!("Failed to create control pipe: {}", e);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
         };
 
@@ -317,6 +441,27 @@ pub async fn start_control_server(
                 return;
             }
         };
+
+        // SEC-01: only the owning user may drive the control channel. The 0600
+        // socket already blocks other users at the filesystem layer; this is a
+        // defence-in-depth check rejecting any peer whose uid differs from ours
+        // (e.g. if the socket permissions were somehow widened).
+        match stream.peer_cred() {
+            Ok(cred) => {
+                let our_uid = unsafe { libc::geteuid() };
+                if cred.uid() != our_uid {
+                    error!(
+                        peer_uid = cred.uid(),
+                        our_uid, "Rejecting control connection from a different uid"
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Could not read control peer credentials; rejecting");
+                continue;
+            }
+        }
 
         let tx = tx.clone();
         tokio::spawn(async move {

@@ -32,6 +32,11 @@ pub struct KeyIdentity {
 pub struct LocalCacheKeySlots {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin_encrypted: Option<String>,
+    /// Base64-encoded random salt for PIN key derivation (format v3+). When
+    /// absent (pre-v3 caches), the fixed legacy salt is used; a successful
+    /// unlock transparently re-saves with a fresh random salt (SEC-04).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_salt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hello_challenge: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

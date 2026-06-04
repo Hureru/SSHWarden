@@ -5263,6 +5263,7 @@ dependencies = [
  "bitwarden-russh",
  "bytes",
  "futures",
+ "libc",
  "pin-project",
  "serde",
  "serde_json",
