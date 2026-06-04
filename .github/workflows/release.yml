@@ -44,7 +44,7 @@ jobs:
             1. 下载对应平台的压缩包
             2. 解压到任意目录
             3. 将 `config.toml.example` 复制为 `config.toml` 并配置
-            4. 运行 `sshwarden daemon` 启动守护进程
+            4. 运行 `sshwarden run --background` 启动后台代理，然后运行 `sshwarden login` 登录
 
             详细文档请参阅 [README.md](https://github.com/Hureru/SSHWarden/blob/main/README.md)
 

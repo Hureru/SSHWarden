@@ -1,6 +1,33 @@
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
+/// Returned by [`send_control_command`] when the control endpoint could not be
+/// contacted at all — nothing is listening on the pipe/socket, so no daemon is
+/// running. Kept distinct from post-connect failures (channel closed before the
+/// reply arrived, malformed reply) so callers can tell "no daemon" apart from
+/// "daemon present but the reply didn't make it back" — e.g. when the agent
+/// tears the channel down during a clean `stop`.
+#[derive(Debug)]
+pub struct ControlUnreachable {
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for ControlUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to connect to SSHWarden daemon (is it running?): {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for ControlUnreachable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ControlCommand {
     pub cmd: String,
@@ -208,6 +235,9 @@ pub enum ControlAction {
         pin: String,
     },
     Forget,
+    /// Cleanly shut down the daemon: cancel the main loop, stop the agent and
+    /// control server, and remove the PID file. Used by `stop` / `restart`.
+    Stop,
     /// Open the host-binding management dialog. The daemon dispatches a
     /// `UIRequest::BindHostsDialog` and responds once the dialog closes.
     BindHostsDialog,
@@ -331,6 +361,7 @@ async fn dispatch_control_command(
         "status-json" => ControlAction::Status { json: true },
         "sync" => ControlAction::Sync,
         "forget" => ControlAction::Forget,
+        "stop" => ControlAction::Stop,
         "bind-hosts-dialog" => ControlAction::BindHostsDialog,
         s if s.starts_with("unlock-pin:") => {
             let pin = s.strip_prefix("unlock-pin:").unwrap_or("").to_string();
@@ -507,12 +538,9 @@ pub async fn send_control_command(cmd: &str) -> anyhow::Result<ControlResponse> 
     use tokio::net::windows::named_pipe::ClientOptions;
 
     // Try to connect to the control pipe
-    let client = ClientOptions::new().open(CONTROL_PIPE_NAME).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to connect to SSHWarden daemon (is it running?): {}",
-            e
-        )
-    })?;
+    let client = ClientOptions::new()
+        .open(CONTROL_PIPE_NAME)
+        .map_err(|e| anyhow::Error::new(ControlUnreachable { source: e }))?;
 
     let (reader, mut writer) = tokio::io::split(client);
 
@@ -543,11 +571,9 @@ pub async fn send_control_command(cmd: &str) -> anyhow::Result<ControlResponse> 
 
     let path = sshwarden_config::default_control_socket_path()?;
     let stream = UnixStream::connect(&path).await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to connect to SSHWarden daemon at {} (is it running?): {}",
-            path.display(),
-            e
-        )
+        anyhow::Error::new(ControlUnreachable {
+            source: std::io::Error::new(e.kind(), format!("{}: {e}", path.display())),
+        })
     })?;
 
     let (reader, mut writer) = tokio::io::split(stream);

@@ -26,7 +26,7 @@ SSHWarden 的目标不是复刻完整 Bitwarden Desktop，而是提供一个专�
 | IPC 控制命令 | 已实现；Windows Named Pipe 与 Unix socket 均含调用方鉴权 |
 | Local Key Cache | 已实现信封加密模型（格式 v3，PIN 随机盐） |
 | 标准平台存储目录 | 已实现，默认平台标准目录（`%APPDATA%`/`$XDG_CONFIG_HOME`/`~/Library/Application Support`）；便携模式可选 |
-| 自启动 | Windows 已实现；macOS/Linux 待实现 |
+| 自启动 | `startup enable`/`disable`；Windows/Linux/macOS 均已实现（Linux/macOS 待实机验证） |
 | Shell integration | `sshwarden env` 已实现（sh/fish/powershell/cmd） |
 | macOS native unlock | 已实现（Phase 6，Keychain；仍需平台实机验证） |
 | Linux native unlock | 已实现（Phase 6，Secret Service；仍需平台实机验证） |
@@ -92,7 +92,7 @@ SSHWarden 的一等支持平台目标是：
 - Signing Request 授权对话框
 - Lock / Unlock / Forget
 - Local Key Cache
-- Control Channel：`status`、`lock`、`unlock`、`sync`、`set-pin` 等控制命令
+- Control Channel：`status`、`lock`、`unlock`、`sync`、`set-pin`、`stop` 等控制命令
 - Shell Integration：`sshwarden env`
 - Startup Integration：登录桌面会话后自动启动
 - `status` 简洁状态报告
@@ -106,8 +106,6 @@ SSHWarden 的一等支持平台目标是：
 
 ## 当前使用方式
 
-> 以下命令反映当前实现，后续 CLI 会随 baseline 设计调整。
-
 ### 配置
 
 复制配置示例：
@@ -118,75 +116,73 @@ cp config.toml.example config.toml
 
 编辑 `config.toml`，填写 Bitwarden 邮箱、服务器地址等配置。
 
-### 启动 daemon
+### ① 运行 agent（进程生命周期）
 
 ```bash
-sshwarden daemon
+sshwarden run                 # 前台运行（Ctrl-C 停止）；直接运行 `sshwarden` 等价于此
+sshwarden run --background    # 后台运行
+sshwarden stop                # 停止后台 agent
+sshwarden restart             # 重启后台 agent
+sshwarden status              # 查看 agent / vault 状态与下一步建议
+sshwarden doctor [--fix]      # 诊断（--fix 执行安全修复，如写入 ~/.ssh/config 的 Include 行）
 ```
 
-或直接运行：
+### ② Vault 会话（需联网）
 
 ```bash
-sshwarden
+sshwarden login               # 登录 Bitwarden、同步、设置本机 PIN（Remembered Device），并把 key 交给运行中的 agent
+sshwarden sync                # 从 Bitwarden 同步 key 到运行中的 agent
+sshwarden forget              # 删除本机记住的 key/session/PIN
 ```
 
-### 登录 / 同步 keys
+### ③ 锁定状态（不联网）
 
 ```bash
-sshwarden login
-sshwarden keys
-sshwarden sync
+sshwarden lock
+sshwarden unlock                    # 默认 auto：先平台解锁，再降级到 PIN
+sshwarden unlock --method pin
+sshwarden unlock --method hello     # Windows
+sshwarden unlock --method native    # macOS Keychain / Linux Secret Service
+sshwarden set-pin
 ```
 
-### 绑定 Host / 避免 MaxAuthTries
+> 主密码只在 `sshwarden login` 中使用；不再有 `unlock --password`。
 
-当 Bitwarden 里有多把 SSH Key 时，OpenSSH 可能会因为 `MaxAuthTries` 在尝试完所有 agent key 前断开连接。SSHWarden 支持把 vault key 绑定到 SSH Host，并生成公开 `.pub` selector 文件与托管 SSH config：
+### ④ Key 与 Host 绑定（离线对象操作）
+
+当 Bitwarden 里有多把 SSH Key 时，OpenSSH 可能会因为 `MaxAuthTries` 在尝试完所有 agent key 前断开连接。把 vault key 绑定到 SSH Host 可避免该问题（绑定会生成公开 `.pub` selector 文件与托管 SSH config）：
 
 ```bash
-# 一次性安装 ~/.ssh/config 的 SSHWarden Include
-sshwarden ssh-config install
-
-# 将 key 绑定到 host，可使用 key 名称或 vault item id
-sshwarden bindings add github-key github.com
-
-# 查看当前状态和生成的配置
-sshwarden ssh-config status
-sshwarden ssh-config show
+sshwarden keys                            # 离线列出缓存的 key、绑定的 host、selector 与 ssh-config 状态
+sshwarden keys bind github-key github.com   # 用 key 名称或 vault item id 绑定 host
+sshwarden keys unbind github-key github.com # 解绑单个 host
+sshwarden keys unbind github-key --all      # 解绑全部 host
+sshwarden keys ui                         # 图形绑定管理器（需 agent 运行）
 ```
 
 也可以通过签名请求里的 **Bind & Approve...** 图形流程完成绑定。详见 [`docs/host-bindings.md`](docs/host-bindings.md)。
 
-兼容旧流程：`sshwarden ssh-config` 仍可打印建议 snippet，`sshwarden ssh-config --write` 仍可写入托管文件。
-
-### 锁定 / 解锁
+### ⑤ 集成（本机设置）
 
 ```bash
-sshwarden lock
-sshwarden unlock --pin
-sshwarden unlock --hello      # Windows 当前可用
-sshwarden unlock --password
+sshwarden env                 # 打印 shell 环境变量（sh/fish/powershell/cmd）
+sshwarden ssh-config          # 查看托管 snippet 路径与 Include 状态
+sshwarden ssh-config show     # 打印托管 snippet
+sshwarden ssh-config write    # 从本地缓存 + 绑定离线重写 snippet 并确保 Include 行
+sshwarden ssh-config remove   # 从 ~/.ssh/config 移除 Include 行
+sshwarden startup enable      # 登录时自启动（需先 `login` 建立 Remembered Device）
+sshwarden startup disable     # 取消自启动
+sshwarden config              # 显示配置文件路径
 ```
 
-### 设置 PIN
+### 典型首次流程
 
 ```bash
-sshwarden set-pin
+sshwarden run --background    # 启动后台 agent
+sshwarden login               # 登录 + 同步 + 按提示设置 PIN
+sshwarden status              # 确认状态
+sshwarden startup enable      # 可选：开机自启
 ```
-
-### 查看状态
-
-```bash
-sshwarden status
-```
-
-### Windows 自启动
-
-```bash
-sshwarden daemon --install
-sshwarden daemon --uninstall
-```
-
-Linux/macOS 自启动安装仍待实现。
 
 ## 与官方 Bitwarden Desktop 的关系
 

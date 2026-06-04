@@ -1,29 +1,49 @@
 # How to Use SSHWarden CLI Commands
 
-SSHWarden 提供守护进程模式和多个 CLI 子命令。守护进程处理 SSH Agent 请求，CLI 子命令通过 IPC 控制通道与守护进程通信。支持三种解锁路径：Windows Hello 签名、PIN、主密码。
+SSHWarden 提供一个 SSH Agent 守护进程和一组 CLI 子命令。守护进程处理 SSH Agent 请求；CLI 子命令通过 IPC 控制通道与运行中的 agent 通信，或直接读写本地文件。命令按用途分为五组：① 进程生命周期 ② Vault 会话（联网）③ 锁定状态（离线）④ Key 与 Host 绑定（离线）⑤ 集成（本机设置）。解锁方式：Windows Hello / 平台原生、PIN；主密码仅用于 `login`。
 
 **数据目录解析（4 层优先级，见 `crates/sshwarden-config/src/lib.rs` `resolve_data_dir`）：** ① 环境变量 `SSHWARDEN_HOME`；② `SSHWARDEN_PORTABLE=1` → exe 所在目录；③ exe 同目录 `config.toml` 中 `[storage] portable = true`（可选 `portable_dir`）→ 便携目录；④ **默认：平台标准目录**（Windows `%APPDATA%\SSHWarden`、Linux `$XDG_CONFIG_HOME/sshwarden` 或 `~/.config/sshwarden`、macOS `~/Library/Application Support/SSHWarden`）。所有数据文件（`config.toml`、`local-key-cache.json`、旧版 `vault.enc`、`sshwarden.log`、`sshwarden.pid`、`session-*.enc`）都存放在解析出的该目录下。运行 `sshwarden status` 可查看实际解析出的 `data_dir`。
 
-1. **启动守护进程:** 运行 `sshwarden`（无子命令）。若数据目录下存在 `local-key-cache.json`（或旧版 `vault.enc`），守护进程直接启动并进入锁定状态，等待 Hello/PIN/Password 解锁；若无缓存，程序提示输入 Bitwarden 主密码，登录后加载 SSH 密钥。确认输出 `SSH Agent is running` 即表示就绪。参见 `src/main.rs` `run_foreground`.
+## ① 进程生命周期
 
-2. **查看状态:** 运行 `sshwarden status`。显示锁定状态（locked/unlocked）、密钥数量、是否配置 PIN、是否有 vault.enc 文件。若守护进程未运行则提示连接失败。参见 `src/main.rs:151`.
+1. **启动 agent:** `sshwarden run`（前台，Ctrl-C 停止）或 `sshwarden run --background`（后台）。直接运行 `sshwarden`（无子命令）等价于 `sshwarden run`。若数据目录下存在 `local-key-cache.json`（或旧版 `vault.enc`），agent 直接启动并进入锁定状态，等待 Hello/PIN/原生 解锁；若无缓存，提示输入 Bitwarden 主密码登录后加载密钥。参见 `src/main.rs` `run_foreground`.
 
-3. **锁定密码库:** 运行 `sshwarden lock`。守护进程清除内存中的私钥材料（公钥元数据保留），后续签名请求将被拒绝或触发解锁流程。参见 `src/main.rs:135`.
+2. **停止 / 重启:** `sshwarden stop` 经控制通道请求 agent 干净关闭并等待其释放 PID 文件（对未运行的 agent 幂等，退出码 0）。`sshwarden restart` 先停止再以后台方式重新拉起（`run --background`）。
 
-4. **解锁密码库（自动选择）:** 运行 `sshwarden unlock`。守护进程按优先级尝试：先 Hello 签名路径（若 vault.enc 含 hello_challenge），再 Windows Hello UV 验证（需内存缓存），成功后重新加载密钥。参见 `src/main.rs:136-149`.
+3. **查看状态:** `sshwarden status` 显示一屏可读摘要（Agent / Device / Lock / Bitwarden / Sync / Keys）与建议的下一步；agent 未运行时回退为本地文件视图。`sshwarden status --json` 打印原始机器可读 JSON。
 
-5. **解锁密码库（Hello 签名路径）:** 运行 `sshwarden unlock --hello`。仅使用 KeyCredentialManager 签名路径解锁。需要先通过 `set-pin` 注册签名路径（Hello 可用时自动注册）。参见 `src/main.rs:145-146`.
+4. **诊断:** `sshwarden doctor` 运行只读检查；`sshwarden doctor --fix` 执行安全修复（例如向 `~/.ssh/config` 写入 SSHWarden Include 行）。
 
-6. **解锁密码库（PIN）:** 运行 `sshwarden unlock --pin`，输入之前设置的 PIN。守护进程用 PIN 派生密钥解密缓存的密钥数据并加载到 Agent。支持从 vault.enc 持久化数据解密。参见 `src/main.rs:137-140`.
+## ② Vault 会话（联网）
 
-7. **解锁密码库（主密码）:** 运行 `sshwarden unlock --password`，输入 Bitwarden 主密码。守护进程重新登录 Bitwarden API 并同步最新密钥。适用于密钥已过期或需要更新的场景。参见 `src/main.rs:141-144`.
+5. **登录 / 引导:** `sshwarden login` 将主密码经控制通道交给运行中的 agent，由其登录 Bitwarden、同步并加载密钥；若本机尚无 Remembered Device，CLI 会在客户端提示设置 PIN（经 `set-pin` 写入信封缓存，完成 Remembered Device）。无 agent 运行时退化为仅列出密钥并提示先 `run --background`。
 
-8. **设置 PIN:** 运行 `sshwarden set-pin`，输入并确认 PIN（至少 4 字符）。守护进程将当前密钥用 PIN 加密后同时存入内存和 exe 同目录下的 vault.enc 文件。若 Windows Hello 可用，自动注册签名路径。参见 `src/main.rs:162`.
+6. **手动同步:** `sshwarden sync`。agent 用缓存的 Bitwarden API 客户端重新同步密钥（需已认证）；锁定时仅刷新缓存并置 pending_sync。
 
-9. **手动同步:** 运行 `sshwarden sync`。守护进程使用缓存的 Bitwarden API 客户端重新同步密码库 SSH 密钥。需要守护进程已认证（启动时已登录或通过 `unlock --password` 登录）。参见 `src/main.rs:163`.
+7. **遗忘:** `sshwarden forget` 删除本机记住的密钥缓存 / 会话 / PIN / 原生材料，下次需重新登录。
 
-10. **安装开机自启动:** 运行 `sshwarden daemon --install`。在用户启动文件夹 (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`) 创建 SSHWarden.lnk 快捷方式，目标为 `<exe> daemon`，WorkingDirectory 设为 exe 同目录（保持便携模式）。通过 PowerShell 调用 `WScript.Shell` COM 创建 .lnk 文件。用户登录后快捷方式自动执行，守护进程在用户交互式桌面会话中运行，确保 Toast 通知、Windows Hello 等 UI 交互正常工作。参见 `src/main.rs:1458-1505`.
+## ③ 锁定状态（离线）
 
-11. **卸载开机自启动:** 运行 `sshwarden daemon --uninstall`。删除启动文件夹中的 SSHWarden.lnk 快捷方式文件。若文件不存在则提示无需操作。参见 `src/main.rs:1515-1529`.
+8. **锁定:** `sshwarden lock`。清除内存私钥（公钥身份保留可列出）。
 
-**验证:** 使用 `ssh -T git@github.com` 触发 SSH 签名请求，确认 Windows Toast 通知弹出并正确显示密钥名和操作类型。
+9. **解锁:** `sshwarden unlock` 默认 `--method auto`（先平台解锁，再降级到 PIN 对话框）。可显式 `--method pin` / `--method hello` / `--method native`。主密码不再用于 `unlock`，改由 `login`。
+
+10. **设置 PIN:** `sshwarden set-pin`，输入并确认 PIN（≥4 字符）。agent 用 PIN（随机盐，信封格式 v3）加密当前密钥缓存并持久化，可选注册 Hello / 原生。
+
+## ④ Key 与 Host 绑定（离线）
+
+11. **列出 keys:** `sshwarden keys`（或 `keys list`）离线读取 `local-key-cache.json`，显示每个 key 的身份、绑定的 host、selector 文件是否存在、以及 ssh-config Include 状态。
+
+12. **绑定 / 解绑:** `sshwarden keys bind <key> <host>...` 绑定（key 可用名称或 vault item id）；`sshwarden keys unbind <key> <host>` 解绑单个 host，`--all` 解绑全部。`sshwarden keys ui` 打开图形绑定管理器（需 agent 运行）。
+
+## ⑤ 集成（本机设置）
+
+13. **Shell 环境:** `sshwarden env [--shell sh|fish|powershell|cmd]` 打印 agent 发现用的环境变量导出。
+
+14. **SSH config:** `sshwarden ssh-config` 显示托管 snippet 路径与 Include 状态；`ssh-config show` 打印 snippet；`ssh-config write` 从本地缓存 + 绑定离线重写 snippet 并确保 Include 行；`ssh-config remove` 移除 Include 行（snippet 文件保留）。
+
+15. **开机自启动:** `sshwarden startup enable` 安装平台自启动项（Windows 启动文件夹 .lnk、Linux XDG autostart、macOS LaunchAgent），目标为 `<exe> run --background`，WorkingDirectory 设为 exe 同目录；若本机尚无 Remembered Device 会拒绝并提示先 `login`。`sshwarden startup disable` 移除自启动项。
+
+16. **配置:** `sshwarden config` 显示配置文件路径（不存在则创建默认）。
+
+**验证:** 使用 `ssh -T git@github.com` 触发 SSH 签名请求，确认授权对话框 / 通知正确显示密钥名和操作类型。

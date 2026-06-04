@@ -39,23 +39,21 @@ After logging in or syncing once so SSHWarden has a local key cache:
 
 ```bash
 sshwarden login
-sshwarden ssh-config install
-sshwarden bindings add github-key github.com
+sshwarden keys bind github-key github.com
 ssh github.com
 ```
 
-You can use either the key display name or the vault item id shown by `sshwarden keys` / `sshwarden bindings list`.
+You can use either the key display name or the vault item id shown by `sshwarden keys`.
 
 Useful commands:
 
 ```bash
-sshwarden bindings list
-sshwarden bindings add github-key github.com gitlab.com
-sshwarden bindings remove github-key github.com
-sshwarden bindings clear github-key
-sshwarden ssh-config status
+sshwarden keys                                        # list keys + bindings + ssh-config status
+sshwarden keys bind github-key github.com gitlab.com
+sshwarden keys unbind github-key github.com
+sshwarden keys unbind github-key --all
 sshwarden ssh-config show
-sshwarden ssh-config regenerate
+sshwarden ssh-config write                            # regenerate snippet + ensure Include
 ```
 
 ## GUI path
@@ -80,7 +78,7 @@ In portable mode, SSHWarden's own config and selector files move to the portable
 Remove the Include line:
 
 ```bash
-sshwarden ssh-config uninstall
+sshwarden ssh-config remove
 ```
 
 This preserves `~/.ssh/sshwarden_config` and `bindings.json`. Delete them manually if you want a fully clean setup.
@@ -92,13 +90,13 @@ This preserves `~/.ssh/sshwarden_config` and `bindings.json`. Delete them manual
 Run:
 
 ```bash
-sshwarden ssh-config install
+sshwarden ssh-config write
 ```
 
 Then confirm with:
 
 ```bash
-sshwarden ssh-config status
+sshwarden ssh-config
 ```
 
 ### Wrong key offered

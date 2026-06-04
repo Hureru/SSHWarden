@@ -139,144 +139,134 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run daemon in background
-    Daemon {
-        /// Create startup shortcut for auto-start on login
+    /// Start the SSHWarden agent (foreground; Ctrl-C to stop). [starts the agent]
+    Run {
+        /// Detach and run in the background — used by `startup enable`. [starts the agent]
         #[arg(long)]
-        install: bool,
-        /// Remove startup shortcut
-        #[arg(long)]
-        uninstall: bool,
+        background: bool,
     },
-    /// Login to Bitwarden server and start agent with vault keys
-    Login {
-        /// Bitwarden server base URL (overrides config)
-        #[arg(long)]
-        base_url: Option<String>,
-        /// Email address
-        #[arg(long)]
-        email: Option<String>,
-    },
-    /// Unlock the vault
-    Unlock {
-        /// Use PIN instead of Windows Hello
-        #[arg(long)]
-        pin: bool,
-        /// Use master password to re-login and unlock
-        #[arg(long)]
-        password: bool,
-        /// Use Windows Hello sign-path to unlock
-        #[arg(long)]
-        hello: bool,
-        /// Use platform-native unlock (macOS Keychain / Linux Secret Service)
-        #[arg(long)]
-        native: bool,
-    },
-    /// Lock the vault (clear private keys from memory)
-    Lock,
-    /// Set or update PIN for quick unlock
-    SetPin,
-    /// Show agent status
+    /// Stop the running agent. [needs running agent]
+    Stop,
+    /// Restart the agent in the background. [needs running agent]
+    Restart,
+    /// Show agent + vault status and a suggested next step. [reads the agent if up, else local files]
     Status {
-        /// Print full machine-readable status JSON
+        /// Print the full machine-readable status JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Run read-only diagnostics
+    /// Run diagnostics; with --fix, apply safe repairs. [local + running agent]
     Doctor {
-        /// Print machine-readable diagnostic JSON
+        /// Print machine-readable diagnostic JSON.
         #[arg(long)]
         json: bool,
-        /// Explicitly allow repairs (no repairs implemented yet)
+        /// Apply safe repairs (e.g. add the SSHWarden Include line to ~/.ssh/config).
         #[arg(long)]
         fix: bool,
     },
-    /// List available SSH keys from vault (requires login)
-    Keys {
-        /// Bitwarden server base URL (overrides config)
+    /// Authenticate, sync keys, set up this device (PIN), and hand keys to the agent. [contacts Bitwarden]
+    Login {
+        /// Bitwarden server base URL — standalone login only (rejected if a daemon is running).
         #[arg(long)]
         base_url: Option<String>,
-        /// Email address
+        /// Email address — standalone login only.
         #[arg(long)]
         email: Option<String>,
     },
-    /// Manually trigger vault sync
+    /// Sync keys from Bitwarden into the running agent. [needs running agent + Bitwarden]
     Sync,
-    /// Forget local remembered key/session material
+    /// Forget remembered device material (local cache, session, PIN). [needs running agent]
     Forget,
-    /// Print shell environment exports for SSHWarden agent discovery
+    /// Lock the vault (clear private keys from memory). [needs running agent]
+    Lock,
+    /// Unlock the vault. [needs running agent]
+    Unlock {
+        /// Unlock method: auto (platform unlock then PIN), pin, hello, or native.
+        #[arg(long, default_value = "auto")]
+        method: UnlockMethod,
+    },
+    /// Set or update the quick-unlock PIN. [needs running agent]
+    SetPin,
+    /// Show cached SSH keys + host bindings (offline), or manage bindings. [local only]
+    Keys {
+        #[command(subcommand)]
+        action: Option<KeysAction>,
+    },
+    /// Print shell environment exports for SSHWarden agent discovery. [local only]
     Env {
-        /// Shell syntax to emit: sh, powershell, fish, or cmd
+        /// Shell syntax to emit: sh, powershell, fish, or cmd.
         #[arg(long, default_value = "sh")]
         shell: String,
     },
-    /// Print SSH config snippets using selector files
+    /// Show or update the managed SSH config snippet + Include line (offline). [local only]
     SshConfig {
-        /// Bitwarden server base URL (overrides config)
-        #[arg(long)]
-        base_url: Option<String>,
-        /// Email address
-        #[arg(long)]
-        email: Option<String>,
-        /// Write selector files, a managed include file, and add it to ~/.ssh/config
-        #[arg(long)]
-        write: bool,
-        /// Manage the include line and managed snippet locally (no network)
         #[command(subcommand)]
         action: Option<SshConfigAction>,
     },
-    /// Manage host bindings for SSH keys (offline, uses local key cache)
-    Bindings {
+    /// Manage auto-start of the agent at login. [local only]
+    Startup {
         #[command(subcommand)]
-        action: BindingsAction,
+        action: StartupAction,
     },
-    /// Edit configuration
+    /// Show the config file path (creating a default if missing). [local only]
     Config,
+}
+
+/// Unlock method selected via `unlock --method`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum UnlockMethod {
+    /// Try platform unlock (Windows Hello / native), falling back to a PIN prompt.
+    Auto,
+    /// Prompt for the quick-unlock PIN.
+    Pin,
+    /// Use the Windows Hello sign path.
+    Hello,
+    /// Use platform-native unlock (macOS Keychain / Linux Secret Service).
+    Native,
+}
+
+#[derive(Subcommand, Clone)]
+enum KeysAction {
+    /// List cached keys with bound hosts and ssh-config status (offline; the default).
+    List,
+    /// Bind one or more host patterns to a key (by name or cipher id). [local only]
+    Bind {
+        /// Key name (as shown in `sshwarden keys`) or cipher uuid.
+        key: String,
+        /// Host patterns: hostnames, IPs, or globs (e.g. `*.prod.example.com`).
+        #[arg(required = true)]
+        hosts: Vec<String>,
+    },
+    /// Remove a host from a key's bindings, or all of them with `--all`. [local only]
+    Unbind {
+        /// Key name or cipher uuid.
+        key: String,
+        /// Host pattern to remove (omit with `--all` to clear every host).
+        host: Option<String>,
+        /// Remove every host bound to this key.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Open the graphical bindings manager. [needs running agent]
+    Ui,
 }
 
 #[derive(Subcommand, Clone)]
 enum SshConfigAction {
-    /// Regenerate the managed snippet and add Include to ~/.ssh/config
-    Install,
-    /// Remove the Include line from ~/.ssh/config (snippet file is preserved)
-    Uninstall,
-    /// Show paths, Include status, and binding counts
-    Status,
-    /// Rewrite the managed snippet from current bindings + local key cache
-    Regenerate,
-    /// Print the managed snippet to stdout
+    /// Print the managed snippet to stdout.
     Show,
+    /// Regenerate the snippet from the local cache + bindings and ensure the Include line (offline).
+    Write,
+    /// Remove the Include line from ~/.ssh/config (the snippet file is preserved).
+    Remove,
 }
 
 #[derive(Subcommand, Clone)]
-enum BindingsAction {
-    /// List all bindings, cross-referenced with the local key cache
-    List,
-    /// Bind one or more host patterns to a key (by name or cipher id)
-    Add {
-        /// Key name (as shown in `sshwarden keys`) or cipher uuid
-        key: String,
-        /// Host patterns: hostnames, IPs, or globs (e.g. `*.prod.example.com`)
-        #[arg(required = true)]
-        hosts: Vec<String>,
-    },
-    /// Remove a single host from a key's bindings, or all if `--all`
-    Remove {
-        /// Key name or cipher uuid
-        key: String,
-        /// Host pattern to remove (omit with `--all` to clear)
-        host: Option<String>,
-        /// Remove every host for this key
-        #[arg(long)]
-        all: bool,
-    },
-    /// Remove every host pattern bound to a key
-    Clear {
-        /// Key name or cipher uuid
-        key: String,
-    },
-    /// Open the graphical bindings manager (requires the daemon to be running)
-    Ui,
+enum StartupAction {
+    /// Enable auto-start at login (requires a Remembered Device — run `login` first).
+    Enable,
+    /// Disable auto-start at login.
+    Disable,
 }
 
 /// Type alias for the UI request sender passed through the system.
@@ -304,13 +294,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Daemon mode: log to file; otherwise log to stderr
-    let is_daemon = matches!(
-        cli.command,
-        Some(Commands::Daemon {
-            install: false,
-            uninstall: false
-        })
-    );
+    // Background mode = `run --background`; foreground `run` and the bare
+    // invocation log to stderr.
+    let is_daemon = matches!(cli.command, Some(Commands::Run { background: true }));
 
     if is_daemon {
         let log_path = log_file_path()?;
@@ -339,14 +325,10 @@ fn main() -> anyhow::Result<()> {
 
     let config = sshwarden_config::Config::load().context("Failed to load configuration")?;
 
-    // Determine if we need the Slint UI event loop (foreground/daemon modes)
-    let needs_ui = matches!(
-        cli.command,
-        None | Some(Commands::Daemon {
-            install: false,
-            uninstall: false
-        })
-    );
+    // The Slint UI event loop is needed whenever we start the agent: the bare
+    // invocation (defaults to `run`) and `run [--background]` both serve SSH and
+    // may pop unlock/bind dialogs.
+    let needs_ui = matches!(cli.command, None | Some(Commands::Run { .. }));
 
     if needs_ui {
         // Create UI request channel for tokio <-> Slint communication
@@ -410,69 +392,38 @@ fn main() -> anyhow::Result<()> {
 
         rt.block_on(async move {
             match cli.command {
-                None => unreachable!(),
-                Some(Commands::Daemon { install, uninstall }) => {
-                    if install {
-                        cmd_daemon_install().await
-                    } else if uninstall {
-                        cmd_daemon_uninstall().await
-                    } else {
-                        unreachable!()
-                    }
-                }
+                // Agent-starting variants are handled in the needs_ui branch.
+                None | Some(Commands::Run { .. }) => unreachable!(),
+                Some(Commands::Stop) => cmd_stop().await,
+                Some(Commands::Restart) => cmd_restart().await,
                 Some(Commands::Login { base_url, email }) => {
                     cmd_login(&config, base_url.as_deref(), email.as_deref()).await
                 }
-                Some(Commands::Keys { base_url, email }) => {
-                    cmd_keys(&config, base_url.as_deref(), email.as_deref()).await
-                }
                 Some(Commands::Lock) => cmd_control("lock").await,
-                Some(Commands::Unlock {
-                    pin,
-                    password,
-                    hello,
-                    native,
-                }) => {
-                    if pin {
+                Some(Commands::Unlock { method }) => match method {
+                    UnlockMethod::Pin => {
                         let pin_value = prompt_password("Enter PIN: ")?;
-                        let cmd = format!("unlock-pin:{}", &*pin_value);
-                        cmd_control(&cmd).await
-                    } else if password {
-                        let pw = prompt_password("Master password: ")?;
-                        let cmd = format!("unlock-password:{}", &*pw);
-                        cmd_control(&cmd).await
-                    } else if hello {
-                        cmd_control("unlock-hello").await
-                    } else if native {
-                        cmd_control("unlock-native").await
-                    } else {
-                        cmd_control("unlock").await
+                        cmd_control(&format!("unlock-pin:{}", &*pin_value)).await
                     }
-                }
-                Some(Commands::Status { json }) => {
-                    if json {
-                        cmd_control("status-json").await
-                    } else {
-                        cmd_control("status").await
-                    }
-                }
-                Some(Commands::Doctor { json, fix }) => cmd_doctor(&config, json, fix).await,
-                Some(Commands::SshConfig {
-                    base_url,
-                    email,
-                    write,
-                    action,
-                }) => match action {
-                    Some(SshConfigAction::Install) => cmd_sshcfg_install().await,
-                    Some(SshConfigAction::Uninstall) => cmd_sshcfg_uninstall().await,
-                    Some(SshConfigAction::Status) => cmd_sshcfg_status().await,
-                    Some(SshConfigAction::Regenerate) => cmd_sshcfg_regenerate().await,
-                    Some(SshConfigAction::Show) => cmd_sshcfg_show().await,
-                    None => {
-                        cmd_ssh_config(&config, base_url.as_deref(), email.as_deref(), write).await
-                    }
+                    UnlockMethod::Hello => cmd_control("unlock-hello").await,
+                    UnlockMethod::Native => cmd_control("unlock-native").await,
+                    UnlockMethod::Auto => cmd_control("unlock").await,
                 },
-                Some(Commands::Bindings { action }) => cmd_bindings(action).await,
+                Some(Commands::Status { json }) => cmd_status(json).await,
+                Some(Commands::Doctor { json, fix }) => cmd_doctor(&config, json, fix).await,
+                Some(Commands::Keys { action }) => {
+                    cmd_keys(action.unwrap_or(KeysAction::List)).await
+                }
+                Some(Commands::SshConfig { action }) => match action {
+                    Some(SshConfigAction::Show) => cmd_sshcfg_show().await,
+                    Some(SshConfigAction::Write) => cmd_sshcfg_write().await,
+                    Some(SshConfigAction::Remove) => cmd_sshcfg_uninstall().await,
+                    None => cmd_sshcfg_status().await,
+                },
+                Some(Commands::Startup { action }) => match action {
+                    StartupAction::Enable => cmd_startup_enable().await,
+                    StartupAction::Disable => cmd_daemon_uninstall().await,
+                },
                 Some(Commands::Config) => {
                     let path = sshwarden_config::config_path()?;
                     if !path.exists() {
@@ -604,15 +555,288 @@ async fn cmd_control(cmd: &str) -> anyhow::Result<()> {
             } else {
                 let err = response.error.as_deref().unwrap_or("Unknown error");
                 err_line(format!("Error: {err}"));
+                std::process::exit(1);
             }
             Ok(())
         }
         Err(e) => {
-            err_line(format!("Could not connect to SSHWarden daemon: {e}"));
-            err_line("Is the daemon running? Start it with: sshwarden");
-            Ok(())
+            err_line(format!("Could not connect to SSHWarden agent: {e}"));
+            err_line("Is the agent running? Start it with: sshwarden run");
+            std::process::exit(2);
         }
     }
+}
+
+/// Resolve the running agent's PID from the PID file, if a live owner exists.
+fn running_agent_pid() -> Option<u32> {
+    let path = pid_file_path().ok()?;
+    if !pid_file_owner_alive(&path) {
+        return None;
+    }
+    std::fs::read_to_string(&path).ok()?.trim().parse().ok()
+}
+
+/// True when a Remembered Device exists on disk (local key cache or legacy vault
+/// file) — the offline equivalent of run_foreground's startup check.
+fn has_remembered_device_on_disk() -> bool {
+    matches!(
+        sshwarden_config::cache::LocalKeyCacheFile::load(),
+        Ok(Some(_))
+    ) || matches!(sshwarden_config::vault::VaultFile::load(), Ok(Some(_)))
+}
+
+/// Three-way outcome of trying to reach the running daemon over the control
+/// channel. Drives `stop`/`restart`, which treat the control channel — not the
+/// PID file — as the source of truth for "is a daemon live", and only fall back
+/// to PID-file logic when nothing answers.
+enum DaemonContact {
+    /// The daemon replied.
+    Replied(sshwarden_agent::ControlResponse),
+    /// A daemon was reached, but no usable reply came back before the channel
+    /// closed or the wait timed out — the expected outcome when the agent tears
+    /// the channel down during a clean `stop`. Callers confirm the real state
+    /// via the PID file rather than assume the daemon is gone.
+    Unconfirmed(String),
+    /// Nothing is listening on the control channel — no daemon is running.
+    NotRunning,
+}
+
+/// Contact the running daemon over the control channel with a bounded timeout so
+/// a wedged or busy agent cannot hang `stop`/`restart` indefinitely. A connect
+/// failure is reported as [`DaemonContact::NotRunning`]; any post-connect error
+/// or timeout is [`DaemonContact::Unconfirmed`] (a daemon was there, but we
+/// can't be sure of the result).
+async fn contact_daemon(cmd: &str) -> DaemonContact {
+    let send = sshwarden_agent::control::send_control_command(cmd);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), send).await {
+        Ok(Ok(resp)) => DaemonContact::Replied(resp),
+        Ok(Err(e)) => {
+            if e.downcast_ref::<sshwarden_agent::control::ControlUnreachable>()
+                .is_some()
+            {
+                DaemonContact::NotRunning
+            } else {
+                DaemonContact::Unconfirmed(e.to_string())
+            }
+        }
+        Err(_) => DaemonContact::Unconfirmed("no reply within 5s".to_string()),
+    }
+}
+
+/// `stop`: ask the running agent to shut down cleanly over the control channel,
+/// then wait briefly for it to release the PID file. The control channel is
+/// contacted unconditionally — a missing or stale PID file must not turn `stop`
+/// into a silent no-op while a daemon is still reachable. Idempotent — stopping
+/// an agent that is not running is reported and treated as success.
+async fn cmd_stop() -> anyhow::Result<()> {
+    match contact_daemon("stop").await {
+        DaemonContact::Replied(resp) if resp.ok => {
+            out_line(resp.message.as_deref().unwrap_or("Stopping agent"));
+        }
+        DaemonContact::Replied(resp) => {
+            err_line(format!(
+                "Stop failed: {}",
+                resp.error.as_deref().unwrap_or("unknown error")
+            ));
+            std::process::exit(1);
+        }
+        DaemonContact::NotRunning => {
+            out_line("No running SSHWarden agent.");
+            return Ok(());
+        }
+        DaemonContact::Unconfirmed(reason) => {
+            // The agent may have torn down the control channel before its reply
+            // reached us — the expected outcome of a clean stop, not a failure.
+            // Fall through to the wait loop and let the PID file decide whether
+            // it actually exited.
+            err_line(format!(
+                "No stop confirmation from the agent ({reason}); confirming it exited…"
+            ));
+        }
+    }
+    // Wait up to ~5s for the agent to exit and remove its PID file.
+    for _ in 0..50 {
+        if !is_daemon_running() {
+            out_line("Agent stopped.");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    err_line("Agent acknowledged stop but is still running after 5s.");
+    std::process::exit(1);
+}
+
+/// `restart`: stop any reachable agent, wait for it to exit, then spawn a fresh
+/// detached background agent (`run --background`). The running agent is detected
+/// over the control channel rather than the PID file — skipping the stop because
+/// of a missing or stale PID file would spawn a second agent that fights the
+/// live one for the SSH endpoint and control pipe.
+async fn cmd_restart() -> anyhow::Result<()> {
+    if !matches!(contact_daemon("stop").await, DaemonContact::NotRunning) {
+        // Replied, errored, or timed out — a daemon was (or may still be) alive.
+        // Confirm it actually exits before starting a replacement.
+        let mut stopped = false;
+        for _ in 0..50 {
+            if !is_daemon_running() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !stopped {
+            err_line("Existing agent did not stop within 5s; not restarting.");
+            std::process::exit(1);
+        }
+        out_line("Stopped existing agent.");
+    }
+
+    let exe = std::env::current_exe().context("Failed to find the SSHWarden executable")?;
+    spawn_background_agent(&exe)?;
+    out_line("Started agent in the background.");
+    Ok(())
+}
+
+/// Spawn a detached background agent process (`<exe> run --background`).
+fn spawn_background_agent(exe: &std::path::Path) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["run", "--background"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so the child outlives this
+        // CLI invocation and does not share its console.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn()
+        .with_context(|| format!("Failed to start background agent: {}", exe.display()))?;
+    Ok(())
+}
+
+/// `startup enable`: refuse unless a Remembered Device exists, then install the
+/// platform auto-start entry (so the agent can unlock at login).
+async fn cmd_startup_enable() -> anyhow::Result<()> {
+    if !has_remembered_device_on_disk() {
+        anyhow::bail!(
+            "No Remembered Device yet, so an agent started at login could not unlock. \
+             Run `sshwarden login` first, then `sshwarden startup enable`."
+        );
+    }
+    cmd_daemon_install().await
+}
+
+/// `status`: a legible one-screen summary plus a suggested next step. With
+/// `--json`, prints the agent's raw machine-readable status. Works even when the
+/// agent is down (falls back to local file inspection).
+async fn cmd_status(json: bool) -> anyhow::Result<()> {
+    let details = match sshwarden_agent::control::send_control_command("status-json").await {
+        Ok(r) => r.details.unwrap_or_else(|| serde_json::json!({})),
+        Err(_) => {
+            // Agent unreachable: render an offline view.
+            if json {
+                out_line(serde_json::to_string_pretty(&serde_json::json!({
+                    "agent_running": false,
+                    "has_remembered_device": has_remembered_device_on_disk(),
+                }))?);
+                return Ok(());
+            }
+            out_line("Agent:     not running");
+            out_line(format!(
+                "Device:    {}",
+                if has_remembered_device_on_disk() {
+                    "Remembered"
+                } else {
+                    "not set up"
+                }
+            ));
+            out_line("");
+            if has_remembered_device_on_disk() {
+                out_line("Next:      sshwarden run        (start the agent, then `unlock`)");
+            } else {
+                out_line("Next:      sshwarden login      (set up this device)");
+            }
+            return Ok(());
+        }
+    };
+
+    if json {
+        out_line(serde_json::to_string_pretty(&details)?);
+        return Ok(());
+    }
+
+    let b = |k: &str| details.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    let n = |k: &str| details.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let agent_running = b("agent_running");
+    let locked = b("locked");
+    let has_device = b("has_local_key_cache") || b("has_vault_file");
+    let key_count = n("key_count");
+    let signable = n("signable_key_count");
+    let stale = details
+        .get("notification")
+        .and_then(|x| x.get("stale_cache"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    out_line(format!(
+        "Agent:     {}",
+        if agent_running {
+            match running_agent_pid() {
+                Some(pid) => format!("running (pid {pid})"),
+                None => "running".to_string(),
+            }
+        } else {
+            "not serving SSH — run `sshwarden doctor`".to_string()
+        }
+    ));
+    out_line(format!(
+        "Device:    {}",
+        if has_device {
+            "Remembered"
+        } else {
+            "not set up"
+        }
+    ));
+    out_line(format!(
+        "Lock:      {}",
+        if locked { "locked" } else { "unlocked" }
+    ));
+    out_line(format!(
+        "Bitwarden: {}",
+        if b("authenticated") {
+            "logged in"
+        } else {
+            "offline"
+        }
+    ));
+    out_line(format!(
+        "Sync:      {}",
+        if stale {
+            "stale (reconnect to refresh)"
+        } else if b("pending_sync") {
+            "pending (loads on next unlock)"
+        } else {
+            "up to date"
+        }
+    ));
+    out_line(format!(
+        "Keys:      {key_count} listed, {signable} signable"
+    ));
+
+    let next = if !has_device {
+        Some("sshwarden login      (set up this device)")
+    } else if locked {
+        Some("sshwarden unlock")
+    } else if key_count == 0 {
+        Some("sshwarden sync       (no keys cached yet)")
+    } else {
+        None
+    };
+    if let Some(next) = next {
+        out_line(format!("Next:      {next}"));
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -797,7 +1021,7 @@ async fn cmd_doctor(
         } else if legacy_migration_available {
             checks.push(DoctorCheck::warn(
                 "local_key_cache.migration",
-                "Legacy vault.enc is present without envelope Local Key Cache; run `sshwarden unlock --pin` to migrate",
+                "Legacy vault.enc is present without envelope Local Key Cache; run `sshwarden unlock --method pin` to migrate",
             ));
         } else {
             checks.push(DoctorCheck::warn(
@@ -1007,7 +1231,7 @@ async fn cmd_doctor(
                 } else {
                     checks.push(DoctorCheck::warn(
                         "ssh_config.selector_rules",
-                        "Managed SSH config does not contain Host-specific IdentityFile + IdentitiesOnly yes rules; run `sshwarden ssh-config` to print examples or `sshwarden ssh-config --write` to replace the managed include",
+                        "Managed SSH config does not contain Host-specific IdentityFile + IdentitiesOnly yes rules; run `sshwarden ssh-config show` to print it or `sshwarden ssh-config write` to regenerate the managed include",
                     ));
                 }
             } else {
@@ -1044,7 +1268,7 @@ async fn cmd_doctor(
                     }
                 }
                 if !include_path.exists() {
-                    let managed = "# SSHWarden managed key selector snippets\n# Run `sshwarden ssh-config` to print Host-specific examples.\n";
+                    let managed = "# SSHWarden managed key selector snippets\n# Run `sshwarden ssh-config write` to populate this from your bound keys.\n";
                     match write_private_file(&include_path, managed) {
                         Ok(()) => checks.push(DoctorCheck::ok(
                             "doctor.fix.include_file",
@@ -1099,7 +1323,7 @@ async fn cmd_doctor(
                 checks.push(DoctorCheck::warn(
                     "ssh_config.include",
                     format!(
-                        "{} does not include SSHWarden managed config; run `sshwarden ssh-config --write` if desired",
+                        "{} does not include SSHWarden managed config; run `sshwarden ssh-config write` if desired",
                         config_path.display()
                     ),
                 ));
@@ -1229,7 +1453,7 @@ async fn cmd_login(
         Ok(response) => {
             if response.ok {
                 if base_url.is_some() {
-                    info!("Note: the running daemon uses its own configured server; --base-url is ignored.");
+                    info!("Note: the running agent uses its own configured server; --base-url is ignored.");
                 }
                 out_line(
                     response
@@ -1237,17 +1461,25 @@ async fn cmd_login(
                         .as_deref()
                         .unwrap_or("Logged in; keys loaded into the running agent."),
                 );
+                // Onboarding: if this device has no Remembered Device yet, offer to
+                // set a PIN so future unlocks skip the master password. The PIN is
+                // entered here (client side) and persisted by the agent's SetPin
+                // handler, so it works even when the agent runs detached.
+                if !has_remembered_device_on_disk() {
+                    offer_pin_setup().await?;
+                }
             } else {
                 err_line(format!(
                     "Login failed: {}",
                     response.error.as_deref().unwrap_or("unknown error")
                 ));
+                std::process::exit(1);
             }
             return Ok(());
         }
         Err(_) => {
             info!(
-                "Daemon not running; logging in for listing only (start `sshwarden` to serve keys)."
+                "No agent running; logging in for listing only (start `sshwarden run --background` to serve keys)."
             );
         }
     }
@@ -1275,10 +1507,51 @@ async fn cmd_login(
             ));
         }
         out_line(
-            "\nNote: no daemon was running, so the agent was not loaded. Start `sshwarden`, then `sshwarden unlock --password`.",
+            "\nNote: no agent was running, so keys were not loaded. Start `sshwarden run --background`, then run `sshwarden login` again.",
         );
     }
 
+    Ok(())
+}
+
+/// Offer to set a quick-unlock PIN after a successful daemon login. The PIN is
+/// read on this (client) terminal and sent to the agent's SetPin handler, which
+/// writes the envelope Local Key Cache — completing the Remembered Device. Works
+/// even when the agent runs detached, since the prompt is client-side.
+async fn offer_pin_setup() -> anyhow::Result<()> {
+    use std::io::Write;
+    #[allow(clippy::print_stderr)]
+    {
+        eprint!("Set up a PIN to unlock without your master password next time? [Y/n] ");
+    }
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return Ok(());
+    }
+    let input = input.trim().to_lowercase();
+    if !input.is_empty() && input != "y" && input != "yes" {
+        out_line("Skipped PIN setup. You can set it later with `sshwarden set-pin`.");
+        return Ok(());
+    }
+    let pin = prompt_password("Enter new PIN (>= 4 chars): ")?;
+    if pin.len() < 4 {
+        err_line("PIN must be at least 4 characters. Skipped — run `sshwarden set-pin` later.");
+        return Ok(());
+    }
+    let confirm = prompt_password("Confirm PIN: ")?;
+    if *pin != *confirm {
+        err_line("PINs do not match. Skipped — run `sshwarden set-pin` later.");
+        return Ok(());
+    }
+    match sshwarden_agent::control::send_control_command(&format!("set-pin:{}", &*pin)).await {
+        Ok(resp) if resp.ok => out_line("PIN set — this device is now remembered."),
+        Ok(resp) => err_line(format!(
+            "Could not set PIN: {}",
+            resp.error.as_deref().unwrap_or("unknown error")
+        )),
+        Err(e) => err_line(format!("Could not set PIN: {e}")),
+    }
     Ok(())
 }
 
@@ -1458,27 +1731,6 @@ fn write_key_selector_files(keys: &[sshwarden_api::DecryptedSshKey]) -> anyhow::
     Ok(())
 }
 
-fn ssh_config_snippet_for_keys(keys: &[sshwarden_api::DecryptedSshKey]) -> anyhow::Result<String> {
-    let mut lines = Vec::new();
-    lines.push("# SSHWarden key selector snippets".to_string());
-    lines.push("# Copy a Host block and replace <host> with the destination host.".to_string());
-    lines.push("".to_string());
-
-    for key in keys {
-        let path = selector_path_for_key(&key.name, &key.cipher_id)?;
-        lines.push(format!("# {} ({})", key.name, key.cipher_id));
-        lines.push("Host <host>".to_string());
-        lines.push(format!(
-            "    IdentityFile {}",
-            sshwarden_config::ssh_config::path_arg(&path)
-        ));
-        lines.push("    IdentitiesOnly yes".to_string());
-        lines.push("".to_string());
-    }
-
-    Ok(lines.join("\n"))
-}
-
 /// Generate a managed `sshwarden_config` snippet driven by [`HostBindingsFile`].
 ///
 /// Each key with one or more bound host patterns produces a real `Host` block
@@ -1520,7 +1772,7 @@ fn ssh_config_snippet_with_bindings(
     let mut lines = vec![
         "# SSHWarden managed SSH config — DO NOT EDIT".to_string(),
         "# This file is regenerated on every vault sync.".to_string(),
-        "# Manage bindings via `sshwarden bindings ...`.".to_string(),
+        "# Manage bindings via `sshwarden keys bind/unbind ...`.".to_string(),
         String::new(),
     ];
 
@@ -1584,7 +1836,7 @@ fn sync_managed_ssh_config_with_bindings(
 }
 
 /// Inner sync: optionally force write even when no bindings + no existing file
-/// (used by `ssh-config install` / `regenerate` explicit CLI commands).
+/// (used by `ssh-config write`).
 fn sync_managed_ssh_config_inner(keys: &[ManagedKey], force_write: bool) -> anyhow::Result<()> {
     let mut bindings = sshwarden_config::bindings::HostBindingsFile::load()
         .context("Failed to load host bindings")?;
@@ -1742,23 +1994,6 @@ fn remove_sshwarden_include_line(
     write_private_file(config_path, &new_config)
         .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
     Ok(true)
-}
-
-fn write_managed_ssh_config(snippet: &str) -> anyhow::Result<()> {
-    let include_path = managed_sshwarden_include_path()?;
-    write_private_file(&include_path, snippet).with_context(|| {
-        format!(
-            "Failed to write managed SSHWarden SSH config: {}",
-            include_path.display()
-        )
-    })?;
-
-    let config_path = user_ssh_config_path()?;
-    write_sshwarden_include_line(&config_path, &include_path)?;
-
-    info!("Wrote managed SSH config: {}", include_path.display());
-    info!("Ensured Include line in: {}", config_path.display());
-    Ok(())
 }
 
 fn cmd_env(config: &sshwarden_config::Config, shell: &str) -> anyhow::Result<()> {
@@ -2188,38 +2423,6 @@ fn key_tuples_from_cache_header(
         .collect()
 }
 
-async fn cmd_ssh_config(
-    config: &sshwarden_config::Config,
-    base_url: Option<&str>,
-    email: Option<&str>,
-    write: bool,
-) -> anyhow::Result<()> {
-    let email = match email {
-        Some(e) => e.to_string(),
-        None if !config.auth.email.is_empty() => config.auth.email.clone(),
-        None => prompt_email("Email: ")?,
-    };
-    let password = prompt_password("Master password: ")?;
-
-    let mut client = create_client(config, base_url);
-    info!("Logging in as {}...", email);
-    client.login_password(&email, &password).await?;
-    let keys = client.sync_ssh_keys().await?;
-    write_key_selector_files(&keys)?;
-    let snippet = ssh_config_snippet_for_keys(&keys)?;
-
-    if write {
-        write_managed_ssh_config(&snippet)?;
-    } else {
-        #[allow(clippy::print_stdout)]
-        {
-            println!("{}", snippet);
-        }
-    }
-
-    Ok(())
-}
-
 /// Load `ManagedKey`s from the local key cache header (offline, no decryption).
 ///
 /// Returns an error when no cache exists — callers should surface this as a
@@ -2262,50 +2465,109 @@ fn resolve_cipher_id(query: &str) -> anyhow::Result<String> {
     }
 }
 
-async fn cmd_bindings(action: BindingsAction) -> anyhow::Result<()> {
+/// Dispatch the `keys` command group: an offline list plus host-binding
+/// management (the former `bindings` subcommands).
+async fn cmd_keys(action: KeysAction) -> anyhow::Result<()> {
     match action {
-        BindingsAction::List => cmd_bindings_list().await,
-        BindingsAction::Add { key, hosts } => cmd_bindings_add(&key, &hosts).await,
-        BindingsAction::Remove { key, host, all } => {
-            cmd_bindings_remove(&key, host.as_deref(), all).await
-        }
-        BindingsAction::Clear { key } => cmd_bindings_clear(&key).await,
-        BindingsAction::Ui => cmd_control("bind-hosts-dialog").await,
+        KeysAction::List => cmd_keys_list().await,
+        KeysAction::Bind { key, hosts } => cmd_bindings_add(&key, &hosts).await,
+        KeysAction::Unbind { key, host, all } => cmd_keys_unbind(&key, host.as_deref(), all).await,
+        KeysAction::Ui => cmd_control("bind-hosts-dialog").await,
     }
 }
 
-async fn cmd_bindings_list() -> anyhow::Result<()> {
-    let bindings = sshwarden_config::bindings::HostBindingsFile::load()?;
+/// Merge of the former `bindings remove` + `bindings clear`: `--all` clears
+/// every host for the key; otherwise a host pattern is required.
+async fn cmd_keys_unbind(key: &str, host: Option<&str>, all: bool) -> anyhow::Result<()> {
+    if all {
+        cmd_bindings_clear(key).await
+    } else {
+        cmd_bindings_remove(key, host, false).await
+    }
+}
+
+/// Offline unified key view: each cached key with its bound hosts and whether a
+/// public-key selector file exists, plus a one-line ssh-config Include summary
+/// and a best-effort live lock state. Reads only local files (no network); the
+/// daemon is contacted opportunistically and its absence is not an error.
+async fn cmd_keys_list() -> anyhow::Result<()> {
     let cache = sshwarden_config::cache::LocalKeyCacheFile::load()?;
-    let name_for = |id: &str| -> Option<String> {
-        cache.as_ref().and_then(|c| {
-            c.header
-                .keys
-                .iter()
-                .find(|k| k.vault_item_id == id)
-                .map(|k| k.name.clone())
-        })
+    let bindings = sshwarden_config::bindings::HostBindingsFile::load().unwrap_or_default();
+
+    let Some(cache) = cache else {
+        out_line("No keys cached yet. Run `sshwarden login` (or `sshwarden sync`) first.");
+        return Ok(());
+    };
+    if cache.header.keys.is_empty() {
+        out_line(
+            "No SSH keys in the local cache. Add SSH keys in Bitwarden, then `sshwarden sync`.",
+        );
+        return Ok(());
+    }
+
+    // Best-effort live lock state; omit silently when the daemon is down.
+    let locked: Option<bool> =
+        match sshwarden_agent::control::send_control_command("status-json").await {
+            Ok(resp) => resp
+                .details
+                .as_ref()
+                .and_then(|d| d.get("locked"))
+                .and_then(|v| v.as_bool()),
+            Err(_) => None,
+        };
+    let state = match locked {
+        Some(true) => " — vault locked",
+        Some(false) => " — vault unlocked",
+        None => "",
     };
 
-    #[allow(clippy::print_stdout)]
-    {
-        if bindings.bindings.is_empty() {
-            println!("No host bindings configured.");
-            println!(
-                "Use `sshwarden bindings add <key> <host>...` to bind a key to one or more hosts."
-            );
-            return Ok(());
-        }
-        println!("Host bindings ({}):", bindings.bindings.len());
-        for (cipher_id, binding) in &bindings.bindings {
-            let label = name_for(cipher_id)
-                .map(|n| format!("{n} ({cipher_id})"))
-                .unwrap_or_else(|| cipher_id.clone());
-            println!("  • {label}");
-            for host in &binding.hosts {
-                println!("      - {host}");
+    out_line(format!(
+        "Cached SSH keys ({}){}:",
+        cache.header.keys.len(),
+        state
+    ));
+    for key in &cache.header.keys {
+        let selector_ok = selector_path_for_key(&key.name, &key.vault_item_id)
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        out_line(format!(
+            "  • {} ({})  [{}]",
+            key.name,
+            key.vault_item_id,
+            if selector_ok {
+                "selector ready"
+            } else {
+                "selector missing — run `sshwarden ssh-config write`"
             }
+        ));
+        match bindings.bindings.get(&key.vault_item_id) {
+            Some(b) if !b.hosts.is_empty() => {
+                for host in &b.hosts {
+                    out_line(format!("      host: {host}"));
+                }
+            }
+            _ => out_line("      hosts: none — `sshwarden keys bind <key> <host>`".to_string()),
         }
+    }
+
+    // One-line Include summary so the user knows whether `ssh` will route via
+    // these selectors.
+    let include_path = managed_sshwarden_include_path()?;
+    let config_path = user_ssh_config_path()?;
+    let has_include = std::fs::read_to_string(&config_path)
+        .map(|s| {
+            s.lines().any(|l| {
+                sshwarden_config::ssh_config::line_matches_sshwarden_include(l, &include_path)
+            })
+        })
+        .unwrap_or(false);
+    if has_include {
+        out_line("\nssh-config: Include active (ssh will use the bound keys).");
+    } else {
+        out_line(format!(
+            "\nssh-config: not included — run `sshwarden ssh-config write` to wire {}.",
+            config_path.display()
+        ));
     }
     Ok(())
 }
@@ -2337,7 +2599,7 @@ async fn cmd_bindings_add(key: &str, hosts: &[String]) -> anyhow::Result<()> {
     let config_path = user_ssh_config_path()?;
     if let Err(e) = write_sshwarden_include_line(&config_path, &include_path) {
         err_line(format!(
-            "Binding saved, but failed to ensure the Include line in {}: {e}. Run `sshwarden ssh-config install`.",
+            "Binding saved, but failed to ensure the Include line in {}: {e}. Run `sshwarden ssh-config write`.",
             config_path.display()
         ));
     }
@@ -2384,7 +2646,11 @@ async fn cmd_bindings_clear(key: &str) -> anyhow::Result<()> {
     cmd_bindings_remove(key, None, true).await
 }
 
-async fn cmd_sshcfg_install() -> anyhow::Result<()> {
+/// `ssh-config write`: regenerate the managed snippet from the local cache +
+/// bindings and ensure the Include line in ~/.ssh/config (offline). Selector
+/// `.pub` files are written during `login`/`sync`. Merges the former
+/// `ssh-config --write` / `install` / `regenerate`.
+async fn cmd_sshcfg_write() -> anyhow::Result<()> {
     let keys = load_managed_keys_from_cache()?;
     sync_managed_ssh_config_inner(&keys, true)?;
 
@@ -2392,11 +2658,11 @@ async fn cmd_sshcfg_install() -> anyhow::Result<()> {
     let config_path = user_ssh_config_path()?;
     write_sshwarden_include_line(&config_path, &include_path)?;
 
-    #[allow(clippy::print_stdout)]
-    {
-        println!("Managed snippet: {}", include_path.display());
-        println!("Include line ensured in: {}", config_path.display());
-    }
+    out_line(format!("Wrote managed snippet: {}", include_path.display()));
+    out_line(format!(
+        "Include line ensured in: {}",
+        config_path.display()
+    ));
     Ok(())
 }
 
@@ -2474,17 +2740,6 @@ async fn cmd_sshcfg_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_sshcfg_regenerate() -> anyhow::Result<()> {
-    let keys = load_managed_keys_from_cache()?;
-    sync_managed_ssh_config_inner(&keys, true)?;
-    let include_path = managed_sshwarden_include_path()?;
-    #[allow(clippy::print_stdout)]
-    {
-        println!("Regenerated: {}", include_path.display());
-    }
-    Ok(())
-}
-
 async fn cmd_sshcfg_show() -> anyhow::Result<()> {
     let include_path = managed_sshwarden_include_path()?;
     let content = std::fs::read_to_string(&include_path)
@@ -2496,46 +2751,6 @@ async fn cmd_sshcfg_show() -> anyhow::Result<()> {
             println!();
         }
     }
-    Ok(())
-}
-
-/// Keys command: login, sync, and list SSH keys.
-async fn cmd_keys(
-    config: &sshwarden_config::Config,
-    base_url: Option<&str>,
-    email: Option<&str>,
-) -> anyhow::Result<()> {
-    let email = match email {
-        Some(e) => e.to_string(),
-        None if !config.auth.email.is_empty() => config.auth.email.clone(),
-        None => prompt_email("Email: ")?,
-    };
-    let password = prompt_password("Master password: ")?;
-
-    let mut client = create_client(config, base_url);
-
-    info!("Logging in as {}...", email);
-    client.login_password(&email, &password).await?;
-
-    let keys = client.sync_ssh_keys().await?;
-    if keys.is_empty() {
-        out_line("No SSH keys found in vault.");
-    } else {
-        out_line(format!("Found {} SSH key(s):", keys.len()));
-        for key in &keys {
-            // Show first line of PEM to identify key type
-            let key_type = if key.private_key_pem.as_str().contains("ed25519") {
-                "ED25519"
-            } else if key.private_key_pem.as_str().contains("BEGIN RSA") {
-                "RSA"
-            } else {
-                "SSH"
-            };
-            out_line(format!("  [{}] {} ({})", key_type, key.name, key.cipher_id));
-        }
-        out_line("\nNote: this lists vault keys without changing the running agent. Use `sshwarden login` to load them.");
-    }
-
     Ok(())
 }
 
@@ -2816,6 +3031,15 @@ async fn run_foreground(
             // Control commands from IPC
             Some(ctrl_req) = control_rx.recv() => {
                 last_activity = tokio::time::Instant::now();
+                // `stop` shuts the daemon down cleanly: ack, then break the loop
+                // so the cancel-token cleanup below runs (same path as Ctrl-C).
+                if matches!(ctrl_req.action, sshwarden_agent::ControlAction::Stop) {
+                    let _ = ctrl_req
+                        .reply
+                        .send(sshwarden_agent::ControlResponse::ok("Stopping agent"));
+                    info!("Received stop command, shutting down...");
+                    break;
+                }
                 let response = handle_control_command(
                     ctrl_req.action,
                     &mut agent,
@@ -3288,6 +3512,9 @@ async fn handle_control_command(
     use sshwarden_agent::ControlAction;
 
     match action {
+        // `Stop` is intercepted by the run_foreground select! loop (it breaks out
+        // to run the cancel-token cleanup); this arm is only defensive.
+        ControlAction::Stop => sshwarden_agent::ControlResponse::ok("Stopping agent"),
         ControlAction::Lock => {
             if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
                 sshwarden_agent::ControlResponse::ok("Vault is already locked")
@@ -3580,12 +3807,12 @@ async fn handle_control_command(
                     }
                 }
                 return sshwarden_agent::ControlResponse::err(
-                    "Unlock cancelled. Try: unlock --pin or unlock --password",
+                    "Unlock cancelled. Try: sshwarden unlock --method pin (or sshwarden login).",
                 );
             }
 
             sshwarden_agent::ControlResponse::err(
-                "Auto-unlock is disabled. Use: unlock --pin or unlock --password",
+                "Auto-unlock is disabled. Use: sshwarden unlock --method pin (or sshwarden login).",
             )
         }
         ControlAction::UnlockNative => {
@@ -4519,7 +4746,7 @@ async fn do_sync(
     let client_guard = api_client.read().await;
     let client = match *client_guard {
         Some(ref c) => c,
-        None => return Err("Not authenticated. Use 'unlock --password' to login.".to_string()),
+        None => return Err("Not authenticated. Run 'sshwarden login'.".to_string()),
     };
 
     let keys = client
@@ -5834,7 +6061,7 @@ async fn cmd_daemon_install() -> anyhow::Result<()> {
         "$ws = New-Object -ComObject WScript.Shell; \
          $s = $ws.CreateShortcut('{}'); \
          $s.TargetPath = '{}'; \
-         $s.Arguments = 'daemon'; \
+         $s.Arguments = 'run --background'; \
          $s.WorkingDirectory = '{}'; \
          $s.WindowStyle = 7; \
          $s.Description = 'SSHWarden SSH Agent Daemon'; \
@@ -5871,7 +6098,7 @@ async fn cmd_daemon_install() -> anyhow::Result<()> {
 
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
     let content = format!(
-        "[Desktop Entry]\nType=Application\nName=SSHWarden\nComment=SSHWarden SSH Agent Daemon\nExec={} daemon\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        "[Desktop Entry]\nType=Application\nName=SSHWarden\nComment=SSHWarden SSH Agent Daemon\nExec={} run --background\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
         desktop_exec_escape(&exe.display().to_string())
     );
     std::fs::write(&path, content)
@@ -5907,7 +6134,8 @@ async fn cmd_daemon_install() -> anyhow::Result<()> {
     <key>ProgramArguments</key>
     <array>
         <string>{}</string>
-        <string>daemon</string>
+        <string>run</string>
+        <string>--background</string>
     </array>
     <key>WorkingDirectory</key>
     <string>{}</string>
