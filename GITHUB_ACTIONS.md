@@ -7,7 +7,6 @@
 ### 1. Build and Test (`.github/workflows/build.yml`)
 
 **触发条件**:
-- 推送到 `main` 分支
 - 针对 `main` 分支的 Pull Request
 
 **功能**:
@@ -49,13 +48,16 @@
 
 ### 日常开发
 
-每次推送到 `main` 分支或创建 Pull Request 时，会自动触发构建和测试：
+每次创建或更新针对 `main` 分支的 Pull Request 时，会自动触发构建和测试：
 
 ```bash
+git switch -c feature/my-change
 git add .
 git commit -m "feat: add new feature"
-git push origin main
+git push -u origin feature/my-change
 ```
+
+然后在 GitHub 上创建指向 `main` 的 Pull Request。
 
 查看构建状态：
 - 访问 https://github.com/Hureru/SSHWarden/actions
