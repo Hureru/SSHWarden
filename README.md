@@ -167,7 +167,7 @@ sshwarden keys ui                         # 图形绑定管理器（需 agent �
 ```bash
 sshwarden env                 # 打印 shell 环境变量（sh/fish/powershell/cmd）
 sshwarden ssh-config          # 查看托管 snippet 路径与 Include 状态
-sshwarden ssh-config show     # 打印托管 snippet
+sshwarden ssh-config show     # 打印托管 snippet（默认在 exe 同目录，可用 [ssh_config].managed_path 覆盖）
 sshwarden ssh-config write    # 从本地缓存 + 绑定离线重写 snippet 并确保 Include 行
 sshwarden ssh-config remove   # 从 ~/.ssh/config 移除 Include 行
 sshwarden startup enable      # 登录时自启动（需先 `login` 建立 Remembered Device）

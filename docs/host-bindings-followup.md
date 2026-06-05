@@ -129,12 +129,11 @@ Implemented in `docs/adr/0023-host-bindings-and-managed-ssh-config.md`.
 
 - Why local-only `bindings.json` instead of stuffing into Bitwarden vault item
   metadata (avoids backend schema dependency; allows offline use).
-- Why we generate `~/.ssh/sshwarden_config` and inject `Include` rather than
+- Why we generate a managed OpenSSH config snippet and inject `Include` rather than
   filtering at `REQUEST_IDENTITIES` time (protocol-level limitation: agent
   doesn't know target host until sign request).
-- Why we keep the snippet outside `config_dir()` in portable mode (OpenSSH
-  client only reads from fixed paths, so `~/.ssh/config` Include line is
-  unavoidable; we document the one-line footprint).
+- Why `~/.ssh/config` still needs the Include line even though the generated
+  snippet defaults beside the executable and can be configured.
 - Why "Bind & Approve" is one click (UX: avoid double-prompting the user).
 - Why process-peek inference is best-effort (silently falls back).
 
@@ -155,8 +154,9 @@ These are not bugs per se — flag them during a real-world soak.
   writer's read can lose the first writer's add (read-modify-write race).
   Add a file lock (`fs2::FileExt::try_lock_exclusive`) if this becomes a
   real-world problem.
-- **`~/.ssh` permissions on Unix:** fixed for SSHWarden-created `~/.ssh`,
-  `~/.ssh/config`, and `~/.ssh/sshwarden_config` paths.
+- **`~/.ssh` permissions on Unix:** fixed for SSHWarden-created `~/.ssh` and
+  `~/.ssh/config`; the managed snippet file itself is still written private,
+  but arbitrary configured parent directories are not chmodded.
 
 ---
 
@@ -165,7 +165,7 @@ These are not bugs per se — flag them during a real-world soak.
 Currently we have unit tests for:
 
 - `bindings.rs` — 9 tests on the data model
-- `main.rs` — 12 tests on SSH argv parsing
+- `main.rs` — SSH argv parsing plus managed SSH config import/include tests
 
 What's missing: an end-to-end test that goes
 `HostBindingsFile::add_host → sync_managed_ssh_config_inner →

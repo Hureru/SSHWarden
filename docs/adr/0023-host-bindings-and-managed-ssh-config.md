@@ -12,7 +12,7 @@ The SSH agent protocol does not include the destination host in key list request
 
 ## Decision
 
-SSHWarden stores local host bindings in `bindings.json` and generates an OpenSSH-readable managed config file at `~/.ssh/sshwarden_config`. The user's `~/.ssh/config` includes that file through a single SSHWarden-managed Include line.
+SSHWarden stores local host bindings in `bindings.json` and generates an OpenSSH-readable managed config file. The default managed file location is `sshwarden_config` beside the running executable, keeping SSHWarden's generated host-binding details out of the device-wide `.ssh` directory. Users can override the location with `[ssh_config].managed_path`; `~`, `~/...`, and `~\\...` are expanded. The user's `~/.ssh/config` includes the resolved managed file through a single SSHWarden-managed Include line.
 
 Each host binding maps a vault item id to one or more OpenSSH `Host` patterns. The generated block uses a public Key Selector File and `IdentitiesOnly yes`:
 
@@ -33,13 +33,13 @@ SSHWarden best-effort infers the target host by reading the SSH client process c
 - Local `bindings.json` avoids depending on Bitwarden backend schema changes and works with cached/offline key identities.
 - Managed OpenSSH config solves the problem at the SSH client selection layer, before the server counts failed key attempts.
 - Public Key Selector Files do not expose private key material.
-- `~/.ssh/config` remains necessary even in portable mode because OpenSSH reads user configuration from fixed SSH paths, not SSHWarden's config directory.
+- `~/.ssh/config` remains necessary because OpenSSH reads user configuration from fixed SSH paths, but the generated SSHWarden snippet does not need to live under `.ssh`.
 - One-click **Bind & Approve** avoids asking the user to approve the same signing request twice.
 - Process command-line inspection is platform- and permission-dependent, so it must remain best-effort and must not be security-critical.
 
 ## Consequences
 
-- SSHWarden has a small OpenSSH footprint outside its config directory: `~/.ssh/config` and `~/.ssh/sshwarden_config`.
+- SSHWarden's unavoidable OpenSSH footprint is the single Include line in `~/.ssh/config`; the generated managed snippet defaults to the executable directory and can be configured.
 - Bindings are per-device local preferences, not Bitwarden-synced state.
-- SSHWarden must preserve compatibility with older unquoted Include lines and must quote generated paths so spaces in platform-standard directories work.
+- SSHWarden must preserve compatibility with older unquoted Include lines and the previous `~/.ssh/sshwarden_config` default while quoting generated paths so spaces in platform-standard directories work.
 - Users can create broad patterns such as `*`; SSHWarden warns because such patterns can reintroduce `MaxAuthTries` failures.

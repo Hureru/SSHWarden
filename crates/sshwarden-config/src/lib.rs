@@ -30,6 +30,8 @@ pub struct Config {
     #[serde(default)]
     pub socket: SocketConfig,
     #[serde(default)]
+    pub ssh_config: SshConfigConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
 }
 
@@ -242,6 +244,17 @@ pub struct SocketConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SshConfigConfig {
+    /// Optional path for SSHWarden's generated OpenSSH Include snippet.
+    ///
+    /// Supports `~`, `~/...`, and `~\\...`. Relative paths are resolved under
+    /// SSHWarden's config directory. The default is `sshwarden_config` beside
+    /// the running executable, keeping this generated file out of the user's
+    /// device-wide `.ssh` directory unless explicitly configured otherwise.
+    pub managed_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Keep user data beside the executable instead of platform-standard storage.
     #[serde(default)]
@@ -420,6 +433,68 @@ pub fn default_control_socket_path() -> anyhow::Result<PathBuf> {
     }
 }
 
+pub fn managed_ssh_config_path(config: &Config) -> anyhow::Result<PathBuf> {
+    match config.ssh_config.managed_path.as_deref().map(str::trim) {
+        Some("") => anyhow::bail!("ssh_config.managed_path is present but empty"),
+        Some(path) => expand_config_path(path),
+        None => default_managed_ssh_config_path(),
+    }
+}
+
+pub fn default_managed_ssh_config_path() -> anyhow::Result<PathBuf> {
+    Ok(executable_dir()?.join("sshwarden_config"))
+}
+
+/// The historical managed snippet path used before SSHWarden kept the generated
+/// file beside the executable by default. Used only for migration/cleanup.
+pub fn legacy_home_managed_ssh_config_path() -> anyhow::Result<PathBuf> {
+    Ok(home_dir_any()?.join(".ssh").join("sshwarden_config"))
+}
+
+pub fn user_ssh_config_path() -> anyhow::Result<PathBuf> {
+    Ok(home_dir_any()?.join(".ssh").join("config"))
+}
+
+pub fn expand_config_path(path: &str) -> anyhow::Result<PathBuf> {
+    let expanded = expand_home_path(path)?;
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        Ok(config_dir()?.join(expanded))
+    }
+}
+
+pub fn expand_home_path(path: &str) -> anyhow::Result<PathBuf> {
+    expand_home_path_with_home(path, &home_dir_any()?)
+}
+
+fn expand_home_path_with_home(path: &str, home: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("configured path is empty");
+    }
+    if trimmed == "~" {
+        return Ok(home.to_path_buf());
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        return Ok(home.join(rest));
+    }
+    if trimmed.starts_with('~') {
+        anyhow::bail!("only '~' and '~/...' are supported in configured paths: {trimmed:?}");
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+fn home_dir_any() -> anyhow::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .context("HOME or USERPROFILE environment variable not set")
+}
+
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
@@ -473,4 +548,51 @@ fn home_dir() -> anyhow::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME environment variable not set")
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_tilde_paths() {
+        let home = std::path::Path::new("/home/alice");
+        assert_eq!(expand_home_path_with_home("~", home).unwrap(), home);
+        assert_eq!(
+            expand_home_path_with_home("~/sshwarden_config", home).unwrap(),
+            home.join("sshwarden_config")
+        );
+        assert_eq!(
+            expand_home_path_with_home(r"~\sshwarden_config", home).unwrap(),
+            home.join("sshwarden_config")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_managed_ssh_config_path() {
+        let mut config = Config::default();
+        config.ssh_config.managed_path = Some(" \t\n ".to_string());
+
+        let err = managed_ssh_config_path(&config).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("ssh_config.managed_path is present but empty"));
+    }
+
+    #[test]
+    fn rejects_tilde_user_paths() {
+        let home = std::path::Path::new("/home/alice");
+        assert!(expand_home_path_with_home("~bob/sshwarden_config", home).is_err());
+    }
+
+    #[test]
+    fn leaves_non_tilde_paths_unchanged() {
+        let home = std::path::Path::new("/home/alice");
+        assert_eq!(
+            expand_home_path_with_home("relative/sshwarden_config", home).unwrap(),
+            std::path::PathBuf::from("relative/sshwarden_config")
+        );
+    }
 }
