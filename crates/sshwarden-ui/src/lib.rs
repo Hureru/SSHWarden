@@ -2,6 +2,8 @@ pub mod bind_hosts;
 pub mod notify;
 pub mod unlock;
 
+mod window_placement;
+
 use std::collections::BTreeMap;
 
 /// Information about an SSH sign request, used to display to the user.
