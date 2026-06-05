@@ -5217,7 +5217,7 @@ dependencies = [
 
 [[package]]
 name = "sshwarden"
-version = "2.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "base64",
@@ -5246,7 +5246,7 @@ dependencies = [
 
 [[package]]
 name = "sshwarden-agent"
-version = "2.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "base64",
@@ -5269,7 +5269,7 @@ dependencies = [
 
 [[package]]
 name = "sshwarden-api"
-version = "2.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "aes",
  "anyhow",
@@ -5296,7 +5296,7 @@ dependencies = [
 
 [[package]]
 name = "sshwarden-config"
-version = "2.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "serde",
@@ -5307,7 +5307,7 @@ dependencies = [
 
 [[package]]
 name = "sshwarden-ui"
-version = "2.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "scopeguard",
