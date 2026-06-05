@@ -120,7 +120,19 @@ cp ../README.md .
 创建 `scripts/package-windows.ps1`:
 
 ```powershell
-# 构建 release
+# 读取发布版本：CI 设置 SSHWARDEN_VERSION，本地发布可在 vX.Y.Z tag 上运行
+if ($env:SSHWARDEN_VERSION) {
+    $version = $env:SSHWARDEN_VERSION
+} else {
+    $tag = git describe --tags --exact-match --match "v[0-9]*"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Set SSHWARDEN_VERSION or run this script from a vX.Y.Z tag"
+    }
+    $version = $tag.Trim() -replace '^v', ''
+}
+
+# 构建 release；build.rs 会把版本注入二进制
+$env:SSHWARDEN_VERSION = $version
 cargo build --release
 
 # 创建发布目录
@@ -134,7 +146,6 @@ Copy-Item "README.md" -Destination $releaseDir
 Copy-Item "LICENSE" -Destination $releaseDir -ErrorAction SilentlyContinue
 
 # 创建 zip
-$version = "0.1.0"
 $zipName = "sshwarden-$version-windows-x64.zip"
 Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipName -Force
 
@@ -154,7 +165,15 @@ powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 #!/bin/bash
 set -e
 
-# 构建 release
+# 读取发布版本：CI 设置 SSHWARDEN_VERSION，本地发布可在 vX.Y.Z tag 上运行
+VERSION="${SSHWARDEN_VERSION:-}"
+if [ -z "$VERSION" ]; then
+    TAG=$(git describe --tags --exact-match --match 'v[0-9]*')
+    VERSION="${TAG#v}"
+fi
+export SSHWARDEN_VERSION="$VERSION"
+
+# 构建 release；build.rs 会把版本注入二进制
 cargo build --release
 
 # 创建发布目录
@@ -171,7 +190,6 @@ cp README.md "$RELEASE_DIR/"
 chmod +x "$RELEASE_DIR/sshwarden"
 
 # 创建 tar.gz
-VERSION="0.1.0"
 PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 TAR_NAME="sshwarden-$VERSION-$PLATFORM-$ARCH.tar.gz"
@@ -250,61 +268,21 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## 持续集成 (CI)
 
-### GitHub Actions 示例
+### GitHub Actions 发布
 
-创建 `.github/workflows/release.yml`:
+仓库中的 `.github/workflows/release.yml` 已配置 tag 发布：
 
-```yaml
-name: Release
+- 只响应 `vMAJOR.MINOR.PATCH` 格式的 tag，例如 `v0.2.0`。
+- workflow 从 tag 解析版本，并在 release 构建中设置 `SSHWARDEN_VERSION`。
+- `build.rs` 会把该版本注入二进制的 `--version` 输出和 Windows 文件版本信息。
+- 发布包名使用 `sshwarden-{version}-{platform}-{arch}` 格式。
 
-on:
-  push:
-    tags:
-      - 'v*'
+发布时不要修改 `Cargo.toml` 里的版本；创建并推送 tag 即可触发发布：
 
-jobs:
-  build:
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-
-    steps:
-    - uses: actions/checkout@v3
-
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
-
-    - name: Build
-      run: cargo build --release
-
-    - name: Package (Windows)
-      if: matrix.os == 'windows-latest'
-      run: |
-        mkdir release-package
-        cp target/release/sshwarden.exe release-package/
-        cp config.toml.example release-package/
-        cp README.md release-package/
-        Compress-Archive -Path release-package/* -DestinationPath sshwarden-windows-x64.zip
-
-    - name: Package (Unix)
-      if: matrix.os != 'windows-latest'
-      run: |
-        mkdir release-package
-        cp target/release/sshwarden release-package/
-        cp config.toml.example release-package/
-        cp README.md release-package/
-        tar -czf sshwarden-${{ matrix.os }}.tar.gz -C release-package .
-
-    - name: Upload Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          sshwarden-*.zip
-          sshwarden-*.tar.gz
+```bash
+VERSION=0.2.0
+git tag -a "v$VERSION" -m "Release v$VERSION"
+git push origin "v$VERSION"
 ```
 
 ## 故障排除

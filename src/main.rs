@@ -129,7 +129,7 @@ type CachedKeyTuples = Arc<RwLock<SecureKeyCache>>;
 #[derive(Parser)]
 #[command(
     name = "sshwarden",
-    version,
+    version = env!("SSHWARDEN_VERSION"),
     about = "SSH Agent backed by Bitwarden vault"
 )]
 struct Cli {

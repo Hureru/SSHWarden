@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -18,7 +21,14 @@ jobs:
     steps:
       - name: Get version from tag
         id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH, for example v1.2.3" >&2
+            exit 1
+          fi
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         id: create_release
@@ -26,12 +36,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref }}
-          release_name: SSHWarden ${{ steps.get_version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          release_name: SSHWarden v${{ steps.get_version.outputs.version }}
           draft: false
           prerelease: false
           body: |
-            ## SSHWarden ${{ steps.get_version.outputs.version }}
+            ## SSHWarden v${{ steps.get_version.outputs.version }}
 
             ### 下载
 
@@ -52,6 +62,8 @@ jobs:
     name: Build Release - ${{ matrix.os }}
     needs: create-release
     runs-on: ${{ matrix.os }}
+    env:
+      SSHWARDEN_VERSION: ${{ needs.create-release.outputs.version }}
     strategy:
       matrix:
         include:
@@ -84,6 +96,16 @@ jobs:
 
       - name: Build release
         run: cargo build --release --verbose
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          version_output="$(target/release/${{ matrix.artifact_name }} --version)"
+          echo "$version_output"
+          if [[ "$version_output" != *"${SSHWARDEN_VERSION}" ]]; then
+            echo "Expected release version ${SSHWARDEN_VERSION}" >&2
+            exit 1
+          fi
 
       - name: Package release (Windows)
         if: matrix.os == 'windows-latest'

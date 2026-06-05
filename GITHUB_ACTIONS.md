@@ -32,7 +32,7 @@
 ### 2. Release (`.github/workflows/release.yml`)
 
 **触发条件**:
-- 推送以 `v` 开头的 tag（例如 `v0.1.0`）
+- 推送符合 `vMAJOR.MINOR.PATCH` 的 tag（例如 `v0.2.0`）
 
 **功能**:
 - 创建 GitHub Release
@@ -63,40 +63,35 @@ git push origin main
 
 ### 发布新版本
 
-1. **更新版本号**
+发布版本只通过 Git tag 声明；不要为了发布去修改 `Cargo.toml`。仓库中的 Cargo 版本保持 `0.0.0-dev` 作为开发占位值，Release workflow 会从 `vX.Y.Z` tag 注入 `SSHWARDEN_VERSION`，构建出的二进制版本和产物名称都会使用 tag 版本。
 
-编辑 `Cargo.toml`:
-```toml
-[package]
-version = "0.2.0"  # 更新版本号
-```
-
-2. **提交更改**
+1. **确认 main 已准备好发布**
 
 ```bash
-git add Cargo.toml
-git commit -m "chore: bump version to 0.2.0"
-git push origin main
+git switch main
+git pull --ff-only
+cargo test --verbose
 ```
 
-3. **创建并推送 tag**
+2. **创建并推送 tag**
 
 ```bash
-# 创建 tag
-git tag -a v0.2.0 -m "Release version 0.2.0"
+VERSION=0.2.0
 
-# 推送 tag
-git push origin v0.2.0
+git tag -a "v$VERSION" -m "Release v$VERSION"
+git push origin "v$VERSION"
 ```
 
-4. **自动发布**
+3. **自动发布**
 
 推送 tag 后，GitHub Actions 会自动：
+- 校验 tag 是否符合 `vMAJOR.MINOR.PATCH` 格式
+- 将 tag 版本注入 release 构建
 - 在三个平台上构建 release 版本
 - 创建 GitHub Release
-- 上传打包好的二进制文件
+- 上传带版本号的二进制压缩包
 
-5. **编辑 Release Notes（可选）**
+4. **编辑 Release Notes（可选）**
 
 访问 https://github.com/Hureru/SSHWarden/releases，编辑自动创建的 release，添加更新日志。
 
@@ -175,7 +170,13 @@ cargo build --release --verbose
    git push origin :refs/tags/v0.1.0
    ```
 
-2. **权限问题**
+2. **Tag 格式不符合发布规范**
+   ```
+   Release tags must use vMAJOR.MINOR.PATCH, for example v1.2.3
+   ```
+   解决: 使用 `vX.Y.Z` 格式重新创建 tag，例如 `v0.2.0`。
+
+3. **权限问题**
    ```
    Error: Resource not accessible by integration
    ```
