@@ -60,9 +60,7 @@ fn normalize_version(value: &str) -> Option<String> {
 }
 
 fn is_semver_like(version: &str) -> bool {
-    let core_end = version
-        .find(|character| character == '-' || character == '+')
-        .unwrap_or(version.len());
+    let core_end = version.find(['-', '+']).unwrap_or(version.len());
     let core = &version[..core_end];
     let suffix = &version[core_end..];
 
