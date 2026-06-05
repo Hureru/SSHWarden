@@ -8,10 +8,17 @@ OpenSSH asks the configured SSH agent for identities and may try several keys be
 
 ## How SSHWarden solves it
 
-SSHWarden writes public **Key Selector Files** for vault keys and can generate a managed SSH config file at:
+SSHWarden writes public **Key Selector Files** for vault keys and can generate a managed SSH config file. By default this file is kept beside the running executable:
 
 ```text
-~/.ssh/sshwarden_config
+<exe-dir>/sshwarden_config
+```
+
+You can override it in `config.toml`; `~`, `~/...`, and `~\\...` are expanded:
+
+```toml
+[ssh_config]
+managed_path = "~/private/sshwarden_config"
 ```
 
 For every host binding, the managed config contains a `Host` block like:
@@ -28,10 +35,10 @@ SSHWarden also adds one Include line to the user's SSH config:
 
 ```sshconfig
 # SSHWarden managed key selector snippets
-Include "~/.ssh/sshwarden_config"
+Include "<resolved-managed-path>"
 ```
 
-The managed file is regenerated from local bindings and the local key cache.
+The managed file is regenerated from local bindings and the local key cache. You may edit the `Host` lines inside SSHWarden key blocks; SSHWarden imports those host patterns before regenerating the file. Other lines are treated as generated output.
 
 ## Quickstart
 
@@ -68,10 +75,10 @@ Saving from this flow also approves the original signing request.
 
 - `bindings.json` — local mapping from vault item id to host patterns, stored under SSHWarden's configuration directory.
 - `keys/*.pub` — public Key Selector Files, stored under SSHWarden's configuration directory.
-- `~/.ssh/sshwarden_config` — OpenSSH-readable managed config generated from bindings.
+- `<exe-dir>/sshwarden_config` by default, or `[ssh_config].managed_path` when configured — OpenSSH-readable managed config generated from bindings.
 - `~/.ssh/config` — contains one SSHWarden Include line.
 
-In portable mode, SSHWarden's own config and selector files move to the portable directory, but OpenSSH still reads user config from fixed SSH paths. Therefore `~/.ssh/config` and `~/.ssh/sshwarden_config` remain the unavoidable OpenSSH footprint.
+OpenSSH still reads the user's main config from fixed SSH paths, so `~/.ssh/config` remains the unavoidable OpenSSH footprint. The generated SSHWarden snippet no longer defaults to the device-wide `.ssh` directory.
 
 ## Uninstalling
 
@@ -81,7 +88,7 @@ Remove the Include line:
 sshwarden ssh-config remove
 ```
 
-This preserves `~/.ssh/sshwarden_config` and `bindings.json`. Delete them manually if you want a fully clean setup.
+This preserves the managed snippet and `bindings.json`. Delete them manually if you want a fully clean setup.
 
 ## Troubleshooting
 

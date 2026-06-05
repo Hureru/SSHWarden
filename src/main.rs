@@ -1257,11 +1257,11 @@ async fn cmd_doctor(
 
             if fix && !has_include {
                 if let Some(parent) = include_path.parent() {
-                    if let Err(e) = create_private_dir(parent) {
+                    if let Err(e) = create_parent_dir(parent) {
                         checks.push(DoctorCheck::warn(
                             "doctor.fix.ssh_config_dir",
                             format!(
-                                "Failed to create SSH config directory {}: {e}",
+                                "Failed to create managed SSH config directory {}: {e}",
                                 parent.display()
                             ),
                         ));
@@ -1765,14 +1765,122 @@ impl ManagedKey {
     }
 }
 
+const SSHWARDEN_KEY_MARKER_PREFIX: &str = "# sshwarden:key ";
+
+fn load_host_bindings_importing_managed(
+    keys: &[ManagedKey],
+) -> anyhow::Result<sshwarden_config::bindings::HostBindingsFile> {
+    let mut bindings = sshwarden_config::bindings::HostBindingsFile::load()?;
+    if keys.is_empty() {
+        return Ok(bindings);
+    }
+
+    let include_path = managed_sshwarden_include_path()?;
+    if import_host_bindings_from_managed_file(&include_path, keys, &mut bindings)? {
+        bindings
+            .save()
+            .context("Failed to save host bindings imported from managed SSH config")?;
+    }
+    Ok(bindings)
+}
+
+fn import_host_bindings_from_managed_file(
+    path: &std::path::Path,
+    keys: &[ManagedKey],
+    bindings: &mut sshwarden_config::bindings::HostBindingsFile,
+) -> anyhow::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read managed SSH config: {}", path.display()))?;
+    let known_ids: std::collections::HashSet<&str> =
+        keys.iter().map(|key| key.cipher_id.as_str()).collect();
+    let mut pending_cipher_id: Option<String> = None;
+    let mut changed = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(cipher_id) = sshwarden_key_marker_cipher_id(trimmed)
+            .or_else(|| legacy_key_comment_cipher_id(trimmed))
+            .filter(|id| known_ids.contains(id.as_str()))
+        {
+            pending_cipher_id = Some(cipher_id);
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let Some(directive) = parts.next() else {
+            continue;
+        };
+        if !directive.eq_ignore_ascii_case("Host") {
+            continue;
+        }
+        let Some(cipher_id) = pending_cipher_id.take() else {
+            continue;
+        };
+
+        let hosts: Vec<String> = parts
+            .filter(|host| *host != "<host>")
+            .map(str::to_string)
+            .collect();
+        if hosts.is_empty() {
+            continue;
+        }
+        let mut valid_hosts = true;
+        for host in &hosts {
+            if let Err(e) = sshwarden_config::bindings::validate_host_pattern(host) {
+                tracing::warn!(
+                    path = %path.display(),
+                    host = %host,
+                    error = %e,
+                    "Ignoring invalid manually edited SSHWarden Host pattern"
+                );
+                valid_hosts = false;
+                break;
+            }
+        }
+        if !valid_hosts {
+            continue;
+        }
+
+        let current = bindings
+            .bindings
+            .get(&cipher_id)
+            .map(|binding| binding.hosts.as_slice());
+        if current != Some(hosts.as_slice()) {
+            bindings.set_hosts(&cipher_id, hosts)?;
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+fn sshwarden_key_marker_cipher_id(line: &str) -> Option<String> {
+    line.strip_prefix(SSHWARDEN_KEY_MARKER_PREFIX)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+}
+
+fn legacy_key_comment_cipher_id(line: &str) -> Option<String> {
+    let comment = line.strip_prefix("# ")?;
+    let (_, suffix) = comment.rsplit_once(" (")?;
+    suffix.strip_suffix(')').map(String::from)
+}
+
 fn ssh_config_snippet_with_bindings(
     keys: &[ManagedKey],
     bindings: &sshwarden_config::bindings::HostBindingsFile,
 ) -> anyhow::Result<String> {
     let mut lines = vec![
-        "# SSHWarden managed SSH config — DO NOT EDIT".to_string(),
-        "# This file is regenerated on every vault sync.".to_string(),
-        "# Manage bindings via `sshwarden keys bind/unbind ...`.".to_string(),
+        "# SSHWarden managed SSH config".to_string(),
+        "# You may edit Host lines in SSHWarden key blocks; they are imported before regeneration."
+            .to_string(),
+        "# Other lines are regenerated. Manage bindings via `sshwarden keys bind/unbind ...`."
+            .to_string(),
         String::new(),
     ];
 
@@ -1791,6 +1899,7 @@ fn ssh_config_snippet_with_bindings(
             .bindings
             .get(&key.cipher_id)
             .expect("bound_keys filtered for presence");
+        lines.push(format!("{}{}", SSHWARDEN_KEY_MARKER_PREFIX, key.cipher_id));
         lines.push(format!("# {} ({})", key.name, key.cipher_id));
         lines.push(format!("Host {}", binding.hosts.join(" ")));
         lines.push(format!(
@@ -1806,6 +1915,7 @@ fn ssh_config_snippet_with_bindings(
         lines.push(String::new());
         for key in &unbound_keys {
             let path = selector_path_for_key(&key.name, &key.cipher_id)?;
+            lines.push(format!("{}{}", SSHWARDEN_KEY_MARKER_PREFIX, key.cipher_id));
             lines.push(format!("# {} ({})", key.name, key.cipher_id));
             lines.push("# Host <host>".to_string());
             lines.push(format!(
@@ -1838,8 +1948,8 @@ fn sync_managed_ssh_config_with_bindings(
 /// Inner sync: optionally force write even when no bindings + no existing file
 /// (used by `ssh-config write`).
 fn sync_managed_ssh_config_inner(keys: &[ManagedKey], force_write: bool) -> anyhow::Result<()> {
-    let mut bindings = sshwarden_config::bindings::HostBindingsFile::load()
-        .context("Failed to load host bindings")?;
+    let mut bindings =
+        load_host_bindings_importing_managed(keys).context("Failed to load host bindings")?;
     // UX-7/data-safety: an empty key set means we have no cache metadata to
     // classify orphans against — e.g. binding ahead of first sync (see
     // resolve_cipher_id), or the local key cache isn't loaded. Pruning against an
@@ -1873,30 +1983,59 @@ fn sync_managed_ssh_config_inner(keys: &[ManagedKey], force_write: bool) -> anyh
 }
 
 fn managed_sshwarden_include_path() -> anyhow::Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .context("Could not determine home directory")?;
-    Ok(home.join(".ssh").join("sshwarden_config"))
+    let config = sshwarden_config::Config::load()?;
+    let path = sshwarden_config::managed_ssh_config_path(&config)?;
+    let user_config = user_ssh_config_path()?;
+    ensure_managed_ssh_config_path_is_safe(&path, &user_config)?;
+    Ok(path)
 }
 
 fn user_ssh_config_path() -> anyhow::Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .context("Could not determine home directory")?;
-    Ok(home.join(".ssh").join("config"))
+    sshwarden_config::user_ssh_config_path()
+}
+
+fn ensure_managed_ssh_config_path_is_safe(
+    managed_path: &std::path::Path,
+    user_config_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    if paths_equivalent_for_safety(managed_path, user_config_path) {
+        anyhow::bail!(
+            "managed SSH config path must not be the user's main SSH config: {}",
+            managed_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn paths_equivalent_for_safety(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize()) {
+        return a == b;
+    }
+    #[cfg(windows)]
+    {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+fn create_parent_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)?;
+    Ok(())
 }
 
 fn create_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(path)?;
+    create_parent_dir(path)?;
     sshwarden_config::ssh_config::ensure_ssh_dir_permissions(path)?;
     Ok(())
 }
 
 fn write_private_file(path: &std::path::Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        create_private_dir(parent)?;
+        create_parent_dir(parent)?;
     }
     std::fs::write(path, content)?;
     sshwarden_config::ssh_config::ensure_private_file_permissions(path)?;
@@ -1918,21 +2057,82 @@ fn write_sshwarden_include_line(
 
     let include_line = sshwarden_config::ssh_config::include_line(include_path);
     let existing = std::fs::read_to_string(config_path).unwrap_or_default();
-    if !existing.lines().any(|line| {
+    if existing.lines().any(|line| {
         sshwarden_config::ssh_config::line_matches_sshwarden_include(line, include_path)
     }) {
-        let mut new_config = existing;
+        return Ok(());
+    }
+
+    const MARKER: &str = sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER;
+    let mut rewritten: Vec<String> = Vec::with_capacity(existing.lines().count() + 2);
+    let mut marker_waiting_for_include = false;
+    let mut replaced_marked_include = false;
+
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed == MARKER {
+            marker_waiting_for_include = true;
+            rewritten.push(line.to_string());
+            continue;
+        }
+        if marker_waiting_for_include {
+            if trimmed.is_empty() {
+                rewritten.push(line.to_string());
+                continue;
+            }
+            if is_ssh_include_directive(trimmed)
+                || line_matches_current_or_legacy_sshwarden_include(trimmed, include_path)
+            {
+                rewritten.push(include_line.clone());
+                marker_waiting_for_include = false;
+                replaced_marked_include = true;
+                continue;
+            }
+            marker_waiting_for_include = false;
+        }
+        rewritten.push(line.to_string());
+    }
+
+    if replaced_marked_include {
+        let mut new_config = rewritten.join("\n");
         if !new_config.is_empty() && !new_config.ends_with('\n') {
             new_config.push('\n');
         }
-        new_config.push_str("\n# SSHWarden managed key selector snippets\n");
-        new_config.push_str(&include_line);
-        new_config.push('\n');
         write_private_file(config_path, &new_config)
             .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
+        return Ok(());
     }
 
+    let mut new_config = existing;
+    if !new_config.is_empty() && !new_config.ends_with('\n') {
+        new_config.push('\n');
+    }
+    new_config.push_str("\n# SSHWarden managed key selector snippets\n");
+    new_config.push_str(&include_line);
+    new_config.push('\n');
+    write_private_file(config_path, &new_config)
+        .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
+
     Ok(())
+}
+
+fn is_ssh_include_directive(line: &str) -> bool {
+    line.split_whitespace()
+        .next()
+        .map(|directive| directive.eq_ignore_ascii_case("Include"))
+        .unwrap_or(false)
+}
+
+fn line_matches_current_or_legacy_sshwarden_include(
+    line: &str,
+    include_path: &std::path::Path,
+) -> bool {
+    if sshwarden_config::ssh_config::line_matches_sshwarden_include(line, include_path) {
+        return true;
+    }
+    sshwarden_config::legacy_home_managed_ssh_config_path()
+        .map(|legacy| sshwarden_config::ssh_config::line_matches_sshwarden_include(line, &legacy))
+        .unwrap_or(false)
 }
 
 /// Remove the sshwarden `Include` line and its preceding marker comment from
@@ -1959,7 +2159,9 @@ fn remove_sshwarden_include_line(
             kept.push(line);
             continue;
         }
-        if sshwarden_config::ssh_config::line_matches_sshwarden_include(trimmed, include_path) {
+        if line_matches_current_or_legacy_sshwarden_include(trimmed, include_path)
+            || (skip_marker_for_next_include && is_ssh_include_directive(trimmed))
+        {
             // Drop the include line and retroactively drop the marker if it was the previous kept entry.
             if skip_marker_for_next_include {
                 while let Some(last) = kept.last() {
@@ -1990,6 +2192,14 @@ fn remove_sshwarden_include_line(
     let mut new_config = kept.join("\n");
     if !new_config.is_empty() && !new_config.ends_with('\n') {
         new_config.push('\n');
+    }
+    if let Some(parent) = config_path.parent() {
+        create_private_dir(parent).with_context(|| {
+            format!(
+                "Failed to prepare SSH config directory: {}",
+                parent.display()
+            )
+        })?;
     }
     write_private_file(config_path, &new_config)
         .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
@@ -2492,7 +2702,6 @@ async fn cmd_keys_unbind(key: &str, host: Option<&str>, all: bool) -> anyhow::Re
 /// daemon is contacted opportunistically and its absence is not an error.
 async fn cmd_keys_list() -> anyhow::Result<()> {
     let cache = sshwarden_config::cache::LocalKeyCacheFile::load()?;
-    let bindings = sshwarden_config::bindings::HostBindingsFile::load().unwrap_or_default();
 
     let Some(cache) = cache else {
         out_line("No keys cached yet. Run `sshwarden login` (or `sshwarden sync`) first.");
@@ -2504,6 +2713,12 @@ async fn cmd_keys_list() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+
+    let managed_keys = ManagedKey::from_cache_header(&cache.header.keys);
+    let bindings = load_host_bindings_importing_managed(&managed_keys).unwrap_or_else(|e| {
+        tracing::warn!("Failed to load host bindings: {}", e);
+        sshwarden_config::bindings::HostBindingsFile::default()
+    });
 
     // Best-effort live lock state; omit silently when the daemon is down.
     let locked: Option<bool> =
@@ -2574,7 +2789,8 @@ async fn cmd_keys_list() -> anyhow::Result<()> {
 
 async fn cmd_bindings_add(key: &str, hosts: &[String]) -> anyhow::Result<()> {
     let cipher_id = resolve_cipher_id(key)?;
-    let mut bindings = sshwarden_config::bindings::HostBindingsFile::load()?;
+    let keys = load_managed_keys_from_cache().unwrap_or_default();
+    let mut bindings = load_host_bindings_importing_managed(&keys)?;
     for host in hosts {
         if is_catch_all_host_pattern(host) {
             tracing::warn!(
@@ -2586,7 +2802,6 @@ async fn cmd_bindings_add(key: &str, hosts: &[String]) -> anyhow::Result<()> {
     }
     bindings.save()?;
 
-    let keys = load_managed_keys_from_cache().unwrap_or_default();
     // UX-7: a failed snippet regeneration means `ssh host` would route to the
     // wrong key (or none), so fail loudly rather than warn-and-continue.
     sync_managed_ssh_config_inner(&keys, true)
@@ -2618,7 +2833,8 @@ fn is_catch_all_host_pattern(host: &str) -> bool {
 
 async fn cmd_bindings_remove(key: &str, host: Option<&str>, all: bool) -> anyhow::Result<()> {
     let cipher_id = resolve_cipher_id(key)?;
-    let mut bindings = sshwarden_config::bindings::HostBindingsFile::load()?;
+    let keys = load_managed_keys_from_cache().unwrap_or_default();
+    let mut bindings = load_host_bindings_importing_managed(&keys)?;
 
     let changed = match (host, all) {
         (Some(_), true) => anyhow::bail!("Pass either a host argument or `--all`, not both."),
@@ -2634,7 +2850,6 @@ async fn cmd_bindings_remove(key: &str, host: Option<&str>, all: bool) -> anyhow
     }
     bindings.save()?;
 
-    let keys = load_managed_keys_from_cache().unwrap_or_default();
     sync_managed_ssh_config_inner(&keys, true)
         .context("Bindings saved but managed snippet regeneration failed")?;
 
@@ -2692,8 +2907,13 @@ async fn cmd_sshcfg_uninstall() -> anyhow::Result<()> {
 async fn cmd_sshcfg_status() -> anyhow::Result<()> {
     let include_path = managed_sshwarden_include_path()?;
     let config_path = user_ssh_config_path()?;
-    let bindings = sshwarden_config::bindings::HostBindingsFile::load().unwrap_or_default();
     let cache = sshwarden_config::cache::LocalKeyCacheFile::load()?;
+    let bindings = cache
+        .as_ref()
+        .map(|cache| ManagedKey::from_cache_header(&cache.header.keys))
+        .map(|keys| load_host_bindings_importing_managed(&keys))
+        .transpose()?
+        .unwrap_or_default();
 
     let user_config_has_include = std::fs::read_to_string(&config_path)
         .map(|s| {
@@ -5651,7 +5871,10 @@ async fn run_bind_hosts_flow(
             return false;
         }
     };
-    let bindings = sshwarden_config::bindings::HostBindingsFile::load().unwrap_or_default();
+    let bindings = load_host_bindings_importing_managed(&keys).unwrap_or_else(|e| {
+        tracing::warn!("Failed to load host bindings: {}", e);
+        sshwarden_config::bindings::HostBindingsFile::default()
+    });
     let entries: Vec<sshwarden_ui::BindHostsKeyEntry> = keys
         .iter()
         .map(|k| sshwarden_ui::BindHostsKeyEntry {
@@ -5725,13 +5948,13 @@ async fn persist_bind_payload(
 ) -> anyhow::Result<()> {
     let payload = payload.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let mut bindings = sshwarden_config::bindings::HostBindingsFile::load()?;
+        let keys = load_managed_keys_from_cache().unwrap_or_default();
+        let mut bindings = load_host_bindings_importing_managed(&keys)?;
         for (cipher_id, hosts) in &payload {
             bindings.set_hosts(cipher_id, hosts.clone())?;
         }
         bindings.save()?;
 
-        let keys = load_managed_keys_from_cache().unwrap_or_default();
         sync_managed_ssh_config_inner(&keys, true)?;
 
         // CFG-2: a binding is inert unless ~/.ssh/config Includes the managed
@@ -5757,7 +5980,10 @@ async fn dispatch_standalone_bind_hosts_dialog(
     ui_request_tx: &UIRequestTx,
 ) -> anyhow::Result<bool> {
     let keys = load_managed_keys_from_cache()?;
-    let bindings = sshwarden_config::bindings::HostBindingsFile::load().unwrap_or_default();
+    let bindings = load_host_bindings_importing_managed(&keys).unwrap_or_else(|e| {
+        tracing::warn!("Failed to load host bindings: {}", e);
+        sshwarden_config::bindings::HostBindingsFile::default()
+    });
     let entries: Vec<sshwarden_ui::BindHostsKeyEntry> = keys
         .iter()
         .map(|k| sshwarden_ui::BindHostsKeyEntry {
@@ -6408,5 +6634,87 @@ mod tests {
             infer_from_argv(&["ssh", "weird@user@host.example"]).as_deref(),
             Some("host.example")
         );
+    }
+
+    fn temp_test_path(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sshwarden-test-{}-{}-{name}",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    #[test]
+    fn imports_manually_edited_host_lines_from_managed_file() {
+        let path = temp_test_path("managed.conf");
+        let content = "# SSHWarden managed SSH config\n\
+# sshwarden:key id-1\n\
+# Github (id-1)\n\
+Host github.com gitlab.com\n\
+    IdentityFile \"/tmp/github.pub\"\n\
+    IdentitiesOnly yes\n";
+        std::fs::write(&path, content).unwrap();
+
+        let keys = vec![ManagedKey {
+            name: "Github".to_string(),
+            cipher_id: "id-1".to_string(),
+        }];
+        let mut bindings = sshwarden_config::bindings::HostBindingsFile::default();
+        let changed = import_host_bindings_from_managed_file(&path, &keys, &mut bindings).unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            bindings.bindings.get("id-1").unwrap().hosts,
+            vec!["github.com".to_string(), "gitlab.com".to_string()]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn include_write_replaces_marked_include_line() {
+        let dir = temp_test_path("include-replace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        let include_path = dir.join("sshwarden_config");
+        std::fs::write(
+            &config_path,
+            "Host *\n    AddKeysToAgent yes\n\n# SSHWarden managed key selector snippets\nInclude \"/old/sshwarden_config\"\n",
+        )
+        .unwrap();
+
+        write_sshwarden_include_line(&config_path, &include_path).unwrap();
+        let updated = std::fs::read_to_string(&config_path).unwrap();
+
+        assert!(updated.contains(&sshwarden_config::ssh_config::include_line(&include_path)));
+        assert!(!updated.contains("/old/sshwarden_config"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn include_remove_drops_marked_include_line() {
+        let dir = temp_test_path("include-remove");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        let include_path = dir.join("sshwarden_config");
+        let include_line = sshwarden_config::ssh_config::include_line(&include_path);
+        std::fs::write(
+            &config_path,
+            format!(
+                "Host *\n    AddKeysToAgent yes\n\n# SSHWarden managed key selector snippets\n{include_line}\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(remove_sshwarden_include_line(&config_path, &include_path).unwrap());
+        let updated = std::fs::read_to_string(&config_path).unwrap();
+
+        assert!(updated.contains("Host *"));
+        assert!(!updated.contains("SSHWarden managed key selector snippets"));
+        assert!(!updated.contains(&include_line));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

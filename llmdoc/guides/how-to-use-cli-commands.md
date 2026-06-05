@@ -40,7 +40,7 @@ SSHWarden 提供一个 SSH Agent 守护进程和一组 CLI 子命令。守护进
 
 13. **Shell 环境:** `sshwarden env [--shell sh|fish|powershell|cmd]` 打印 agent 发现用的环境变量导出。
 
-14. **SSH config:** `sshwarden ssh-config` 显示托管 snippet 路径与 Include 状态；`ssh-config show` 打印 snippet；`ssh-config write` 从本地缓存 + 绑定离线重写 snippet 并确保 Include 行；`ssh-config remove` 移除 Include 行（snippet 文件保留）。
+14. **SSH config:** `sshwarden ssh-config` 显示托管 snippet 路径与 Include 状态；`ssh-config show` 打印 snippet；`ssh-config write` 从本地缓存 + 绑定离线重写 snippet 并确保 Include 行；`ssh-config remove` 移除 Include 行（snippet 文件保留）。snippet 默认写在 exe 同目录的 `sshwarden_config`，可用 `config.toml` 的 `[ssh_config].managed_path` 覆盖，支持 `~` 展开。
 
 15. **开机自启动:** `sshwarden startup enable` 安装平台自启动项（Windows 启动文件夹 .lnk、Linux XDG autostart、macOS LaunchAgent），目标为 `<exe> run --background`，WorkingDirectory 设为 exe 同目录；若本机尚无 Remembered Device 会拒绝并提示先 `login`。`sshwarden startup disable` 移除自启动项。
 
