@@ -4249,11 +4249,17 @@ async fn handle_control_command(
                     if let Err(e) = sync_managed_ssh_config_with_bindings(&keys) {
                         tracing::warn!("Failed to sync managed SSH config: {}", e);
                     }
-                    public_key_identity_tuples
-                        .write()
-                        .await
-                        .set(key_tuples.clone());
-                    cached_key_tuples.write().await.set(key_tuples.clone());
+                    reconcile_synced_key_state(
+                        &key_tuples,
+                        cached_key_tuples,
+                        public_key_identity_tuples,
+                        local_key_cache_data,
+                        local_cache_key_state,
+                        authorization_memory,
+                        key_material_fingerprints,
+                        notification_state,
+                    )
+                    .await;
 
                     // Update key_names
                     {
@@ -4728,6 +4734,64 @@ async fn try_restore_api_session_hello(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_synced_key_state(
+    key_tuples: &[(String, String, String)],
+    cached_key_tuples: &CachedKeyTuples,
+    public_key_identity_tuples: &CachedKeyTuples,
+    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    local_cache_key_state: &LocalCacheKeyHandle,
+    authorization_memory: &AuthorizationMemorySet,
+    key_material_fingerprints: &KeyMaterialFingerprints,
+    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
+) {
+    let old_fingerprints = key_material_fingerprints.read().await.clone();
+    let (cleared_memory, new_fingerprints) = clear_authorization_memory_for_changed_keys_async(
+        &old_fingerprints,
+        key_tuples,
+        authorization_memory,
+    )
+    .await;
+    if cleared_memory > 0 {
+        tracing::info!(
+            count = cleared_memory,
+            "Cleared authorization memory after key material change"
+        );
+    }
+
+    public_key_identity_tuples
+        .write()
+        .await
+        .set(key_tuples.to_vec());
+    cached_key_tuples.write().await.set(key_tuples.to_vec());
+    *key_material_fingerprints.write().await = new_fingerprints;
+
+    if let (Some(existing_cache), Some(local_cache_key)) = (
+        local_key_cache_data.read().await.as_ref().cloned(),
+        local_cache_key_state.read().await.clone_key(),
+    ) {
+        match refresh_envelope_local_key_cache(key_tuples, &existing_cache, &local_cache_key) {
+            Ok(cache) => {
+                *local_key_cache_data.write().await = Some(cache);
+                local_cache_key_state.write().await.set(local_cache_key);
+                tracing::info!("Local key cache refreshed after sync");
+            }
+            Err(e) => {
+                let error = e.to_string();
+                {
+                    let mut state = notification_state.write().await;
+                    state.stale_cache = true;
+                    state.stale_cache_error = Some(error.clone());
+                }
+                tracing::warn!(
+                    "Sync succeeded but local key cache refresh failed: {}",
+                    error
+                );
+            }
+        }
+    }
+}
+
 /// Sync SSH keys from the Bitwarden API and reload into the agent.
 #[allow(clippy::too_many_arguments)]
 async fn do_sync(
@@ -4778,50 +4842,17 @@ async fn do_sync(
     if let Err(e) = sync_managed_ssh_config_with_bindings(&keys) {
         tracing::warn!("Failed to sync managed SSH config: {}", e);
     }
-    let old_fingerprints = key_material_fingerprints.read().await.clone();
-    let (cleared_memory, new_fingerprints) = clear_authorization_memory_for_changed_keys_async(
-        &old_fingerprints,
+    reconcile_synced_key_state(
         &key_tuples,
+        cached_key_tuples,
+        public_key_identity_tuples,
+        local_key_cache_data,
+        local_cache_key_state,
         authorization_memory,
+        key_material_fingerprints,
+        notification_state,
     )
     .await;
-    if cleared_memory > 0 {
-        tracing::info!(
-            count = cleared_memory,
-            "Cleared authorization memory after key material change"
-        );
-    }
-
-    public_key_identity_tuples
-        .write()
-        .await
-        .set(key_tuples.clone());
-    cached_key_tuples.write().await.set(key_tuples.clone());
-    *key_material_fingerprints.write().await = new_fingerprints;
-
-    if let (Some(existing_cache), Some(local_cache_key)) = (
-        local_key_cache_data.read().await.as_ref().cloned(),
-        local_cache_key_state.read().await.clone_key(),
-    ) {
-        match refresh_envelope_local_key_cache(&key_tuples, &existing_cache, &local_cache_key) {
-            Ok(cache) => {
-                *local_key_cache_data.write().await = Some(cache);
-                tracing::info!("Local key cache refreshed after sync");
-            }
-            Err(e) => {
-                let error = e.to_string();
-                {
-                    let mut state = notification_state.write().await;
-                    state.stale_cache = true;
-                    state.stale_cache_error = Some(error.clone());
-                }
-                tracing::warn!(
-                    "Sync succeeded but local key cache refresh failed: {}",
-                    error
-                );
-            }
-        }
-    }
 
     // Update key_names
     {
