@@ -2009,8 +2009,51 @@ fn ensure_managed_ssh_config_path_is_safe(
 
 fn paths_equivalent_for_safety(a: &std::path::Path, b: &std::path::Path) -> bool {
     if let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize()) {
-        return a == b;
+        return path_values_equal_for_safety(&a, &b);
     }
+
+    let a = normalized_absolute_path_for_safety(a);
+    let b = normalized_absolute_path_for_safety(b);
+    path_values_equal_for_safety(&a, &b)
+}
+
+fn normalized_absolute_path_for_safety(path: &std::path::Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    normalize_path_components_for_safety(&absolute)
+}
+
+fn normalize_path_components_for_safety(path: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !path.is_absolute() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn path_values_equal_for_safety(a: &std::path::Path, b: &std::path::Path) -> bool {
     #[cfg(windows)]
     {
         a.to_string_lossy()
@@ -6672,6 +6715,18 @@ Host github.com gitlab.com\n\
             vec!["github.com".to_string(), "gitlab.com".to_string()]
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_ssh_config_safety_rejects_nonexistent_alias_of_user_config() {
+        let dir = temp_test_path("managed-safety-alias");
+        let ssh_dir = dir.join(".ssh");
+        let user_config = ssh_dir.join("config");
+        let managed_path = ssh_dir.join("..").join(".ssh").join("config");
+
+        assert!(paths_equivalent_for_safety(&managed_path, &user_config));
+        assert!(ensure_managed_ssh_config_path_is_safe(&managed_path, &user_config).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

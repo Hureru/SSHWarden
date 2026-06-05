@@ -434,13 +434,8 @@ pub fn default_control_socket_path() -> anyhow::Result<PathBuf> {
 }
 
 pub fn managed_ssh_config_path(config: &Config) -> anyhow::Result<PathBuf> {
-    match config
-        .ssh_config
-        .managed_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    match config.ssh_config.managed_path.as_deref().map(str::trim) {
+        Some("") => anyhow::bail!("ssh_config.managed_path is present but empty"),
         Some(path) => expand_config_path(path),
         None => default_managed_ssh_config_path(),
     }
@@ -572,6 +567,18 @@ mod tests {
             expand_home_path_with_home(r"~\sshwarden_config", home).unwrap(),
             home.join("sshwarden_config")
         );
+    }
+
+    #[test]
+    fn rejects_empty_managed_ssh_config_path() {
+        let mut config = Config::default();
+        config.ssh_config.managed_path = Some(" \t\n ".to_string());
+
+        let err = managed_ssh_config_path(&config).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("ssh_config.managed_path is present but empty"));
     }
 
     #[test]
