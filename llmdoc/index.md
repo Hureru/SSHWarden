@@ -48,6 +48,7 @@
 | "make_pin_validator 和 decrypted_cache 如何避免重复 KDF？" | `architecture/sshwarden-windows-hello-unlock.md` (3.2 节) + `architecture/sshwarden-pin-encryption.md` (3.2 节) |
 | "Slint PIN 对话框如何跨线程调度？" | `architecture/sshwarden-windows-hello-unlock.md` (3.2 节) + `architecture/sshwarden-main-loop.md` (3.1 节) |
 | "Slint 授权对话框如何工作？" | `architecture/slint-authorization-dialog.md` |
+| "授权弹窗多屏幕如何定位？" | `architecture/slint-authorization-dialog.md` (3.3 节) |
 | "UIRequest 枚举如何统一 UI 请求？" | `architecture/sshwarden-main-loop.md` (2 节 UIRequest) + `architecture/slint-authorization-dialog.md` (3.2 节) |
 | "PIN 加解密如何实现？" | `architecture/sshwarden-pin-encryption.md` |
 | "vault.enc 持久化如何工作？" | `architecture/sshwarden-pin-encryption.md` (3.1 步骤 6-7) |
@@ -82,7 +83,7 @@
 
 #### 3. `architecture/slint-authorization-dialog.md`
 **身份**: Slint 跨平台授权对话框
-**内容**: SSH 签名请求授权 UI（替代原 Windows Toast 通知 + TaskDialog/MessageBox）、AuthDialog 窗口组件（进程名/密钥名/操作类型/代理转发警告/Approve+Deny）、UIRequest::AuthDialog 跨线程调度（request_authorization -> bridge -> show_auth_dialog）、3 处调用点（Hello 签名路径后/PIN 解锁后/正常签名）
+**内容**: SSH 签名请求授权 UI（替代原 Windows Toast 通知 + TaskDialog/MessageBox）、AuthDialog 窗口组件（进程名/密钥名/操作类型/代理转发警告/Approve+Deny）、UIRequest::AuthDialog 跨线程调度（request_authorization -> bridge -> show_auth_dialog）、多屏窗口定位+聚焦、3 处调用点（Hello 签名路径后/PIN 解锁后/正常签名）
 **适用角色**: UI 开发、授权流程开发
 
 #### 4. `architecture/sshwarden-windows-hello-unlock.md`
@@ -168,7 +169,13 @@
 
 ## 文档更新日志
 
-**最后更新**: 2026-03-15
+**最后更新**: 2026-06-05
+
+### 授权弹窗多屏适配
+- UPDATE `architecture/slint-authorization-dialog.md` - 授权弹窗定位改为 `window_placement::center_on_active_monitor_and_focus()`：Windows 优先使用鼠标所在显示器的工作区居中，非 Windows 或平台 API 失败时回退到 winit monitor，并继续调用 `focus_window()` 前置。
+- UPDATE `architecture/sshwarden-windows-hello-unlock.md` - 记录 PIN/授权/绑定主机等 Slint transient dialog 复用统一多屏定位 helper。
+- UPDATE `overview/project-overview.md` - UI 技术栈和关键设计决策更新为多屏窗口定位+聚焦，不再依赖 `slint_center_win`。
+- UPDATE `llmdoc/index.md` - 查询表新增授权弹窗多屏定位入口，文档描述和更新日志同步。
 
 ### 安全重构: 内存敏感数据自动擦零（对标 Bitwarden Desktop 安全模型）
 - UPDATE `overview/project-overview.md` - Crypto 层新增 zeroize，sshwarden-api crate 新增 zeroize 擦零描述，Key Design Decisions 新增"内存敏感数据自动擦零"完整条目

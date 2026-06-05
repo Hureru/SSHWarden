@@ -53,4 +53,4 @@
 - **签名路径优先:** 自动解锁优先签名路径（无需交互），失败后降级到 PIN 对话框（需用户输入）。
 - **Focus helper:** 签名路径使用后台线程持续调用 focus helper，确保安全提示窗口前置。
 - **spawn_blocking:** WinRT 同步 API 不能在 tokio 异步运行时中直接调用。
-- **跨平台窗口居中+聚焦:** `center_and_focus_dialog()` 移除了 `#[cfg(windows)]` 条件编译，通过 Slint `unstable-winit-030` feature 暴露的 `WinitWindowAccessor` 获取底层 winit 窗口并调用 `focus_window()`，在所有 winit 支持的平台工作。
+- **多屏窗口定位+聚焦:** PIN/授权/绑定主机等 Slint transient dialog 复用 `window_placement::center_on_active_monitor_and_focus()`。Windows 上优先居中到鼠标所在显示器的工作区，适配多屏用户；其他平台或 Windows API 失败时回退到 winit current/primary/available monitor。定位后通过 `focus_window()` 前置激活。

@@ -139,13 +139,7 @@ pub struct AuthDialogRequest {
 }
 
 fn center_and_focus_dialog(dialog: &AuthDialog) {
-    let window = dialog.window();
-    slint_center_win::center_window(window);
-    use slint::winit_030::WinitWindowAccessor;
-    let _ = window.with_winit_window(|winit_window: &slint::winit_030::winit::window::Window| {
-        winit_window.focus_window();
-        None::<()>
-    });
+    crate::window_placement::center_on_active_monitor_and_focus(dialog.window());
 }
 
 pub fn show_auth_dialog(request: AuthDialogRequest) {
