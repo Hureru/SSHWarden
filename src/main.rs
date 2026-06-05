@@ -4206,9 +4206,7 @@ async fn handle_control_command(
         }
         ControlAction::UnlockPassword { password } => {
             let password = zeroize::Zeroizing::new(password);
-            if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
-                return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
-            }
+            let was_locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
 
             // Get email from vault file or config
             let email = {
@@ -4306,11 +4304,13 @@ async fn handle_control_command(
                     )
                     .await;
 
-                    info!("Vault unlocked via master password, {} keys loaded", count);
-                    sshwarden_agent::ControlResponse::ok(&format!(
-                        "Vault unlocked, {} SSH keys loaded",
-                        count
-                    ))
+                    let message = if was_locked {
+                        format!("Vault unlocked, {} SSH keys loaded", count)
+                    } else {
+                        format!("Bitwarden session refreshed, {} SSH keys loaded", count)
+                    };
+                    info!("{}", message);
+                    sshwarden_agent::ControlResponse::ok(&message)
                 }
                 Err(e) => sshwarden_agent::ControlResponse::err(&format!(
                     "Sync failed after login: {}",
@@ -4748,6 +4748,13 @@ async fn do_sync(
         Some(ref c) => c,
         None => return Err("Not authenticated. Run 'sshwarden login'.".to_string()),
     };
+
+    if !client.has_user_key() {
+        return Err(
+            "Bitwarden session cannot decrypt vault data. Run `sshwarden login` to re-authenticate with your master password."
+                .to_string(),
+        );
+    }
 
     let keys = client
         .sync_ssh_keys()
