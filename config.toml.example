@@ -129,6 +129,28 @@ auto_unlock_on_request = true
 portable = false
 # portable_dir = "./sshwarden-data"
 
+# 多设备共享模式（适合把 SSHWarden 放在 OneDrive/Dropbox 等同步目录中）：
+#   - 共享：config.toml、local-key-cache.json、bindings.json、keys/、sshwarden_config
+#   - 每设备独立：session、pid、log、runtime socket、Windows Hello/native unlock slot
+# 这样两台机器可以共享同一份 Bitwarden SSH key 本地投影和 Host 绑定，
+# 但不会互相覆盖运行态文件。
+# 若启用，建议同时设置 [ssh_config].path_style = "home_relative"，避免
+# C:\Users\zheng 与 C:\Users\Administrator 这样的用户名差异写入绝对路径。
+multi_device = false
+# device_id = "auto"          # 默认 auto；也可用 SSHWARDEN_DEVICE_ID 覆盖
+
+# ============================================
+# SSH config / Host binding 生成配置
+# ============================================
+[ssh_config]
+# 托管 snippet 路径。留空时：普通模式默认 exe 同目录；multi_device=true 时默认共享目录下的 sshwarden_config。
+# managed_path = "sshwarden_config"
+
+# 写入 ~/.ssh/config Include 和托管 snippet 中 IdentityFile 的路径风格：
+#   - "absolute": 写绝对路径（默认）
+#   - "home_relative": 对用户 home 下路径写成 ~/...，适合 OneDrive 跨 Windows 用户名共享
+path_style = "absolute"
+
 # ============================================
 # Socket 配置（高级）
 # ============================================

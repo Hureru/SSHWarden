@@ -234,7 +234,13 @@ pub enum ControlAction {
     SetPin {
         pin: String,
     },
-    Forget,
+    Forget {
+        /// In multi-device storage mode, also remove shared remembered-secret
+        /// cache files (`local-key-cache.json` and legacy `vault.enc`). Plain
+        /// `forget` is device-only there; on legacy storage this flag is
+        /// effectively always true for backwards compatibility.
+        shared: bool,
+    },
     /// Cleanly shut down the daemon: cancel the main loop, stop the agent and
     /// control server, and remove the PID file. Used by `stop` / `restart`.
     Stop,
@@ -360,7 +366,8 @@ async fn dispatch_control_command(
         "status" => ControlAction::Status { json: false },
         "status-json" => ControlAction::Status { json: true },
         "sync" => ControlAction::Sync,
-        "forget" => ControlAction::Forget,
+        "forget" => ControlAction::Forget { shared: false },
+        "forget-shared" => ControlAction::Forget { shared: true },
         "stop" => ControlAction::Stop,
         "bind-hosts-dialog" => ControlAction::BindHostsDialog,
         s if s.starts_with("unlock-pin:") => {

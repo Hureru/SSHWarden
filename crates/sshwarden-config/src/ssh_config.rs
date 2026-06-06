@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::SshConfigPathStyle;
 
 pub const SSHWARDEN_INCLUDE_MARKER: &str = "# SSHWarden managed key selector snippets";
 
@@ -28,8 +30,22 @@ pub fn path_arg(path: &Path) -> String {
     quote_ssh_config_arg(&path.to_string_lossy())
 }
 
+pub fn path_arg_with_style(path: &Path, style: SshConfigPathStyle) -> String {
+    let display_path = match style {
+        SshConfigPathStyle::Absolute => path.to_path_buf(),
+        SshConfigPathStyle::HomeRelative => {
+            home_relative_path(path).unwrap_or_else(|| path.to_path_buf())
+        }
+    };
+    quote_ssh_config_arg(&display_path.to_string_lossy())
+}
+
 pub fn include_line(include_path: &Path) -> String {
     format!("Include {}", path_arg(include_path))
+}
+
+pub fn include_line_with_style(include_path: &Path, style: SshConfigPathStyle) -> String {
+    format!("Include {}", path_arg_with_style(include_path, style))
 }
 
 pub fn legacy_unquoted_include_line(include_path: &Path) -> String {
@@ -40,7 +56,9 @@ pub fn legacy_unquoted_include_line(include_path: &Path) -> String {
 /// written by earlier SSHWarden builds.
 pub fn line_matches_sshwarden_include(line: &str, include_path: &Path) -> bool {
     let trimmed = line.trim();
-    trimmed == include_line(include_path) || trimmed == legacy_unquoted_include_line(include_path)
+    trimmed == include_line(include_path)
+        || trimmed == include_line_with_style(include_path, SshConfigPathStyle::HomeRelative)
+        || trimmed == legacy_unquoted_include_line(include_path)
 }
 
 pub fn ensure_ssh_dir_permissions(path: &Path) -> anyhow::Result<()> {
@@ -82,6 +100,17 @@ fn normalize_ssh_config_path(value: &str) -> String {
     {
         value.to_string()
     }
+}
+
+fn home_relative_path(path: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    let relative = path.strip_prefix(&home).ok()?;
+    if relative.as_os_str().is_empty() {
+        return Some(PathBuf::from("~"));
+    }
+    Some(PathBuf::from("~").join(relative))
 }
 
 #[cfg(test)]
