@@ -2593,12 +2593,21 @@ fn current_hello_challenge_b64() -> Option<String> {
     if multi_device_mode() {
         device_challenge
     } else {
-        device_challenge.or_else(|| {
-            sshwarden_config::vault::VaultFile::load()
-                .ok()
-                .flatten()
-                .and_then(|vault| vault.hello_challenge)
-        })
+        device_challenge
+            .or_else(|| {
+                // After set-pin / envelope migration the Hello challenge lives in
+                // the envelope cache (local-key-cache.json), not vault.enc.
+                sshwarden_config::cache::LocalKeyCacheFile::load()
+                    .ok()
+                    .flatten()
+                    .and_then(|cache| cache.local_cache_key.hello_challenge)
+            })
+            .or_else(|| {
+                sshwarden_config::vault::VaultFile::load()
+                    .ok()
+                    .flatten()
+                    .and_then(|vault| vault.hello_challenge)
+            })
     }
 }
 
@@ -6184,6 +6193,11 @@ async fn handle_ui_request(
                     if let Some(kh) = lck_holder {
                         let maybe_lck = kh.lock().unwrap().take();
                         if let Some(lck) = maybe_lck {
+                            // Multi-device: seed this device's own platform unlock
+                            // slot from the freshly recovered key, mirroring the
+                            // explicit unlock-pin control path (no-op in
+                            // single-device mode or if a slot already exists).
+                            enroll_device_platform_slots_if_missing(&lck);
                             local_cache_key_state.write().await.set(lck);
                         }
                     }

@@ -31,23 +31,29 @@ pub fn path_arg(path: &Path) -> String {
 }
 
 pub fn path_arg_with_style(path: &Path, style: SshConfigPathStyle) -> String {
+    if matches!(style, SshConfigPathStyle::HomeRelative) && home_relative_path(path).is_none() {
+        // Fell back to the absolute path: on Windows this embeds the concrete
+        // `C:\Users\<name>` and will not be shareable across accounts via a
+        // synced snippet. Warn only here, on the write path — never from the
+        // match helpers below, which would otherwise log on every comparison
+        // while parsing ~/.ssh/config.
+        tracing::warn!(
+            "ssh_config path_style=home_relative but {} is not under the user home; \
+             writing an absolute path that may embed a username",
+            path.display()
+        );
+    }
+    path_arg_with_style_quiet(path, style)
+}
+
+/// Like [`path_arg_with_style`] but never logs. Used by include-line matching so
+/// that parsing `~/.ssh/config` does not emit a warning on every comparison.
+fn path_arg_with_style_quiet(path: &Path, style: SshConfigPathStyle) -> String {
     let display_path = match style {
         SshConfigPathStyle::Absolute => path.to_path_buf(),
-        SshConfigPathStyle::HomeRelative => match home_relative_path(path) {
-            Some(relative) => relative,
-            None => {
-                // Not under the user's home, so it cannot be made portable. Fall
-                // back to the absolute path, but warn: on Windows this embeds the
-                // concrete `C:\Users\<name>` and will not be shareable across
-                // accounts via a synced snippet.
-                tracing::warn!(
-                    "ssh_config path_style=home_relative but {} is not under the user home; \
-                     writing an absolute path that may embed a username",
-                    path.display()
-                );
-                path.to_path_buf()
-            }
-        },
+        SshConfigPathStyle::HomeRelative => {
+            home_relative_path(path).unwrap_or_else(|| path.to_path_buf())
+        }
     };
     quote_ssh_config_arg(&display_path.to_string_lossy())
 }
@@ -57,7 +63,7 @@ pub fn include_line(include_path: &Path) -> String {
 }
 
 pub fn include_line_with_style(include_path: &Path, style: SshConfigPathStyle) -> String {
-    format!("Include {}", path_arg_with_style(include_path, style))
+    format!("Include {}", path_arg_with_style_quiet(include_path, style))
 }
 
 pub fn legacy_unquoted_include_line(include_path: &Path) -> String {

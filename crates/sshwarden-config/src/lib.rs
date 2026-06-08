@@ -741,7 +741,7 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 /// collision to a recoverable file-level event instead of truncating the only
 /// copy in place.
 pub(crate) fn write_owner_only_file(path: &Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
-    let tmp = path.with_extension("json.tmp");
+    let tmp = with_suffix(path, ".tmp");
     std::fs::write(&tmp, content)
         .with_context(|| format!("Failed to write tmp file: {}", tmp.display()))?;
     #[cfg(unix)]
@@ -752,7 +752,7 @@ pub(crate) fn write_owner_only_file(path: &Path, content: impl AsRef<[u8]>) -> a
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         if path.exists() {
-            let backup = path.with_extension("json.bak");
+            let backup = with_suffix(path, ".bak");
             let _ = std::fs::remove_file(&backup);
             std::fs::rename(path, &backup).with_context(|| {
                 format!(
@@ -772,6 +772,15 @@ pub(crate) fn write_owner_only_file(path: &Path, content: impl AsRef<[u8]>) -> a
         }
     }
     Ok(())
+}
+
+/// Append `suffix` to the full file name. Unlike [`Path::with_extension`] this
+/// preserves the original extension, so `session-x.enc` becomes
+/// `session-x.enc.tmp` rather than `session-x.tmp`.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 #[cfg(test)]

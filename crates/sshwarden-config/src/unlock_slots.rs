@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -41,26 +41,42 @@ impl UnlockSlotsFile {
 
     pub fn load() -> anyhow::Result<Option<Self>> {
         let path = Self::path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read unlock slots file: {}", path.display()))?;
+        // Read directly and match the error kind instead of an exists() pre-check,
+        // which would race if the file is removed/renamed between the two calls.
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "Failed to read unlock slots file: {}",
+                    path.display()
+                )))
+            }
+        };
         let slots: UnlockSlotsFile = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse unlock slots file: {}", path.display()))?;
-        if !Self::SUPPORTED_VERSIONS.contains(&slots.version) {
+        Self::ensure_supported_version(slots.version, &path)?;
+        Ok(Some(slots))
+    }
+
+    /// Reject versions this build cannot round-trip. Used by both `load` and
+    /// `save` so we never persist a file we would later refuse to read back.
+    fn ensure_supported_version(version: u32, path: &Path) -> anyhow::Result<()> {
+        if !Self::SUPPORTED_VERSIONS.contains(&version) {
             anyhow::bail!(
                 "Unsupported unlock slots version {} (supported: {:?}): {}",
-                slots.version,
+                version,
                 Self::SUPPORTED_VERSIONS,
                 path.display()
             );
         }
-        Ok(Some(slots))
+        Ok(())
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::path()?;
+        // Refuse to persist a version we could not read back (mirrors `load`).
+        Self::ensure_supported_version(self.version, &path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -78,11 +94,15 @@ impl UnlockSlotsFile {
 
     pub fn delete() -> anyhow::Result<()> {
         let path = Self::path()?;
-        if path.exists() {
-            std::fs::remove_file(&path).with_context(|| {
-                format!("Failed to delete unlock slots file: {}", path.display())
-            })?;
+        // Remove directly and tolerate NotFound rather than exists()-then-remove,
+        // which can race with concurrent removal/sync.
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::Error::from(e).context(format!(
+                "Failed to delete unlock slots file: {}",
+                path.display()
+            ))),
         }
-        Ok(())
     }
 }
