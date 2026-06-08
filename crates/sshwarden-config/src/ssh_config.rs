@@ -33,9 +33,21 @@ pub fn path_arg(path: &Path) -> String {
 pub fn path_arg_with_style(path: &Path, style: SshConfigPathStyle) -> String {
     let display_path = match style {
         SshConfigPathStyle::Absolute => path.to_path_buf(),
-        SshConfigPathStyle::HomeRelative => {
-            home_relative_path(path).unwrap_or_else(|| path.to_path_buf())
-        }
+        SshConfigPathStyle::HomeRelative => match home_relative_path(path) {
+            Some(relative) => relative,
+            None => {
+                // Not under the user's home, so it cannot be made portable. Fall
+                // back to the absolute path, but warn: on Windows this embeds the
+                // concrete `C:\Users\<name>` and will not be shareable across
+                // accounts via a synced snippet.
+                tracing::warn!(
+                    "ssh_config path_style=home_relative but {} is not under the user home; \
+                     writing an absolute path that may embed a username",
+                    path.display()
+                );
+                path.to_path_buf()
+            }
+        },
     };
     quote_ssh_config_arg(&display_path.to_string_lossy())
 }
@@ -106,11 +118,53 @@ fn home_relative_path(path: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)?;
-    let relative = path.strip_prefix(&home).ok()?;
-    if relative.as_os_str().is_empty() {
-        return Some(PathBuf::from("~"));
+    home_relative_path_with_home(path, &home)
+}
+
+/// Rewrite `path` as `~/...` when it lives under `home`.
+///
+/// On Windows the comparison is case-insensitive: the OneDrive key paths and the
+/// `USERPROFILE` casing Windows reports can differ (drive-letter or profile-folder
+/// case), and a byte-exact `strip_prefix` would otherwise silently fall back to an
+/// absolute, username-bearing path and defeat cross-account sharing.
+fn home_relative_path_with_home(path: &Path, home: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(home) {
+        return Some(tilde_join(relative));
     }
-    Some(PathBuf::from("~").join(relative))
+    #[cfg(windows)]
+    {
+        if let Some(relative) = strip_prefix_case_insensitive(path, home) {
+            return Some(tilde_join(&relative));
+        }
+    }
+    None
+}
+
+fn tilde_join(relative: &Path) -> PathBuf {
+    if relative.as_os_str().is_empty() {
+        PathBuf::from("~")
+    } else {
+        PathBuf::from("~").join(relative)
+    }
+}
+
+/// Strip `prefix` from `path`, comparing each component case-insensitively.
+/// Used on Windows, whose filesystem is case-insensitive.
+#[cfg(windows)]
+fn strip_prefix_case_insensitive(path: &Path, prefix: &Path) -> Option<PathBuf> {
+    let mut path_components = path.components();
+    for prefix_component in prefix.components() {
+        let next = path_components.next()?;
+        let actual = next.as_os_str().to_string_lossy().to_lowercase();
+        let expected = prefix_component
+            .as_os_str()
+            .to_string_lossy()
+            .to_lowercase();
+        if actual != expected {
+            return None;
+        }
+    }
+    Some(path_components.as_path().to_path_buf())
 }
 
 #[cfg(test)]
@@ -146,5 +200,48 @@ mod tests {
             "Include /tmp/other_config",
             path
         ));
+    }
+
+    #[test]
+    fn home_relative_rewrites_paths_under_home() {
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            home_relative_path_with_home(Path::new("/home/alice/OneDrive/keys/id.pub"), home),
+            Some(PathBuf::from("~/OneDrive/keys/id.pub"))
+        );
+    }
+
+    #[test]
+    fn home_relative_path_equal_to_home_is_tilde() {
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            home_relative_path_with_home(Path::new("/home/alice"), home),
+            Some(PathBuf::from("~"))
+        );
+    }
+
+    #[test]
+    fn home_relative_path_outside_home_is_none() {
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            home_relative_path_with_home(Path::new("/etc/ssh/keys/id.pub"), home),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_relative_path_is_case_insensitive_on_windows() {
+        // USERPROFILE casing as Windows reports it differs from the on-disk path
+        // casing; the rewrite must still succeed instead of leaking an absolute,
+        // username-bearing path into a shared snippet.
+        let home = Path::new(r"C:\users\administrator");
+        assert_eq!(
+            home_relative_path_with_home(
+                Path::new(r"C:\Users\Administrator\OneDrive\keys\id.pub"),
+                home
+            ),
+            Some(PathBuf::from(r"~\OneDrive\keys\id.pub"))
+        );
     }
 }

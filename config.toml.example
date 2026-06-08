@@ -134,6 +134,10 @@ portable = false
 #   - 每设备独立：session、pid、log、runtime socket、Windows Hello/native unlock slot
 # 这样两台机器可以共享同一份 Bitwarden SSH key 本地投影和 Host 绑定，
 # 但不会互相覆盖运行态文件。
+# 重要：multi_device 本身不改变数据根目录的位置，只在已有数据目录下拆分
+# 共享/设备文件。要让数据真正落在同步目录，仍需用 portable=true（配合
+# portable_dir）或 SSHWARDEN_HOME / SSHWARDEN_PORTABLE 把数据根指向该
+# OneDrive/Dropbox 目录；否则数据仍在平台默认目录（如 %APPDATA%）而不会被共享。
 # 若启用，建议同时设置 [ssh_config].path_style = "home_relative"，避免
 # C:\Users\zheng 与 C:\Users\Administrator 这样的用户名差异写入绝对路径。
 multi_device = false

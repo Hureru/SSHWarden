@@ -1,7 +1,4 @@
-use std::path::{Path, PathBuf};
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -86,7 +83,7 @@ impl LocalKeyCacheFile {
         }
         let content =
             serde_json::to_string_pretty(self).context("Failed to serialize local key cache")?;
-        write_owner_only_file(&path, content)
+        crate::write_owner_only_file(&path, content)
             .with_context(|| format!("Failed to write local key cache: {}", path.display()))?;
         Ok(())
     }
@@ -99,11 +96,4 @@ impl LocalKeyCacheFile {
         }
         Ok(())
     }
-}
-
-fn write_owner_only_file(path: &Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
-    std::fs::write(path, content)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
 }

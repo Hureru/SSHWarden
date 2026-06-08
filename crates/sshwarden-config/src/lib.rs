@@ -5,7 +5,7 @@ pub mod ssh_config;
 pub mod unlock_slots;
 pub mod vault;
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Context;
@@ -23,6 +23,17 @@ static RESOLVED_SHARED_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// mode this is `{shared_data_dir}/devices/{device-id}`; otherwise it is the
 /// shared directory for backwards compatibility.
 static RESOLVED_DEVICE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Cached `[storage] multi_device` decision and resolved device id.
+///
+/// Resolved once from the first successful [`Config::load`] and reused for the
+/// process lifetime. This keeps every caller in agreement about the active
+/// storage layout and, crucially, prevents a transient `config.toml` parse
+/// failure (e.g. an OneDrive conflict copy appearing mid-run) from flipping
+/// `multi_device` and mis-routing device-local unlock material into the shared
+/// cache or deleting a shared cache other devices still depend on.
+static RESOLVED_MULTI_DEVICE: OnceLock<bool> = OnceLock::new();
+static RESOLVED_DEVICE_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -288,8 +299,8 @@ pub struct StorageConfig {
     ///
     /// In this mode `config.toml`, `local-key-cache.json`, `bindings.json`,
     /// `keys/`, and (by default) `sshwarden_config` remain in the shared data
-    /// directory, while `session.enc`, `sshwarden.pid`, `sshwarden.log`, and
-    /// runtime sockets are stored under `devices/<device-id>/`.
+    /// directory, while `session-<hostname>.enc`, `sshwarden.pid`,
+    /// `sshwarden.log`, and runtime sockets are stored under `devices/<device-id>/`.
     #[serde(default)]
     pub multi_device: bool,
     /// Explicit per-device directory name. Leave empty or set to `auto` to use
@@ -372,11 +383,24 @@ pub fn device_data_dir() -> anyhow::Result<PathBuf> {
         return Ok(dir.clone());
     }
     let shared = shared_data_dir()?;
-    let config = Config::load()?;
-    let resolved = if config.storage.multi_device {
-        shared
-            .join("devices")
-            .join(current_device_id_from_config(&config)?)
+    let resolved = if multi_device_enabled()? {
+        let device_id = current_device_id()?;
+        // Defense in depth: the device id must be exactly one normal path
+        // segment so `{shared}/devices/{id}` can never escape the devices/
+        // subtree (a ".."/"." id would otherwise collapse device-local secrets
+        // back onto the shared, cloud-synced root). `sanitize_device_id` already
+        // rejects "."/".."; this guard ensures a future change cannot silently
+        // reintroduce traversal.
+        let mut components = Path::new(&device_id).components();
+        let single_segment =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        if !single_segment {
+            anyhow::bail!(
+                "Invalid device id {device_id:?}: must be a single path segment \
+                 without separators or '.'/'..'"
+            );
+        }
+        shared.join("devices").join(&device_id)
     } else {
         shared
     };
@@ -385,12 +409,22 @@ pub fn device_data_dir() -> anyhow::Result<PathBuf> {
 }
 
 pub fn current_device_id() -> anyhow::Result<String> {
+    if let Some(id) = RESOLVED_DEVICE_ID.get() {
+        return Ok(id.clone());
+    }
     let config = Config::load()?;
-    current_device_id_from_config(&config)
+    let id = current_device_id_from_config(&config)?;
+    let _ = RESOLVED_DEVICE_ID.set(id.clone());
+    Ok(id)
 }
 
 pub fn multi_device_enabled() -> anyhow::Result<bool> {
-    Ok(Config::load()?.storage.multi_device)
+    if let Some(value) = RESOLVED_MULTI_DEVICE.get() {
+        return Ok(*value);
+    }
+    let value = Config::load()?.storage.multi_device;
+    let _ = RESOLVED_MULTI_DEVICE.set(value);
+    Ok(value)
 }
 
 fn resolve_shared_data_dir() -> anyhow::Result<PathBuf> {
@@ -630,7 +664,12 @@ fn sanitize_device_id(value: &str) -> String {
         }
     }
     let sanitized = out.trim_matches('-');
-    if sanitized.is_empty() {
+    // Reject path-relative segments ("." / ".." / any all-dots value): joined
+    // under `{shared}/devices/`, these would resolve back onto the shared root
+    // or its parent and defeat device isolation. `.` stays allowed inside a
+    // normal id (e.g. a `host.domain` name) but a segment that is *only* dots is
+    // never a valid device directory name.
+    if sanitized.is_empty() || sanitized.chars().all(|c| c == '.') {
         "device".to_string()
     } else {
         sanitized.to_string()
@@ -692,6 +731,49 @@ fn home_dir() -> anyhow::Result<PathBuf> {
         .context("HOME environment variable not set")
 }
 
+/// Atomically write `content` to `path` with owner-only permissions.
+///
+/// Serializes to a temp file (set to mode `0600` before promotion on unix, so
+/// the bytes are never briefly group/world-readable), then renames it over the
+/// destination. On Windows, where renaming over an existing file can fail, this
+/// falls back to the same rollback-safe backup+promote flow used by
+/// [`bindings::HostBindingsFile::save`]. This bounds a crash or cloud-sync
+/// collision to a recoverable file-level event instead of truncating the only
+/// copy in place.
+pub(crate) fn write_owner_only_file(path: &Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("Failed to write tmp file: {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on tmp file: {}", tmp.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        if path.exists() {
+            let backup = path.with_extension("json.bak");
+            let _ = std::fs::remove_file(&backup);
+            std::fs::rename(path, &backup).with_context(|| {
+                format!(
+                    "Failed to back up {} after rename error: {e}",
+                    path.display()
+                )
+            })?;
+            if let Err(promote_err) = std::fs::rename(&tmp, path) {
+                let _ = std::fs::rename(&backup, path);
+                return Err(anyhow::Error::from(promote_err)
+                    .context(format!("Failed to replace file: {}", path.display())));
+            }
+            let _ = std::fs::remove_file(&backup);
+        } else {
+            return Err(anyhow::Error::from(e)
+                .context(format!("Failed to rename tmp file: {}", path.display())));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -736,5 +818,29 @@ mod tests {
             expand_home_path_with_home("relative/sshwarden_config", home).unwrap(),
             std::path::PathBuf::from("relative/sshwarden_config")
         );
+    }
+
+    #[test]
+    fn sanitize_device_id_normalizes_and_collapses() {
+        assert_eq!(sanitize_device_id("My-Host_01"), "my-host_01");
+        assert_eq!(sanitize_device_id("Host PC@home"), "host-pc-home");
+        assert_eq!(sanitize_device_id("  spaced  "), "spaced");
+        assert_eq!(sanitize_device_id("a///b"), "a-b");
+        assert_eq!(sanitize_device_id("--lead-trail--"), "lead-trail");
+        assert_eq!(sanitize_device_id("desktop.example"), "desktop.example");
+    }
+
+    #[test]
+    fn sanitize_device_id_rejects_path_traversal() {
+        // A segment that is only dots must never become a device directory name,
+        // or `{shared}/devices/{id}` would escape the devices/ subtree.
+        assert_eq!(sanitize_device_id("."), "device");
+        assert_eq!(sanitize_device_id(".."), "device");
+        assert_eq!(sanitize_device_id("..."), "device");
+        assert_eq!(sanitize_device_id(""), "device");
+        assert_eq!(sanitize_device_id("///"), "device");
+        // Separators are neutralized to '-', so traversal characters cannot form
+        // a real parent reference even when mixed with dots.
+        assert_eq!(sanitize_device_id("../.."), "..-..");
     }
 }
