@@ -1,20 +1,19 @@
-use std::path::{Path, PathBuf};
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-/// Device-specific session file stored alongside the executable.
+/// Device-specific session file.
 ///
-/// Each device gets its own session file (`session-{hostname}.enc`) so that
-/// multiple machines sharing the same exe directory via OneDrive do not
-/// interfere with each other.
+/// In multi-device storage mode this lives under
+/// `{shared_data_dir}/devices/<device-id>/session-{hostname}.enc` so two
+/// OneDrive-synced machines do not overwrite each other's Bitwarden refresh
+/// token/session state. Without multi-device mode it remains in the historical
+/// shared data directory.
 ///
-/// The session file stores an encrypted refresh token that allows the daemon
-/// to restore a Bitwarden API session after a PIN/Hello unlock without
-/// requiring the master password.
+/// The session file stores an encrypted refresh token that allows the daemon to
+/// restore a Bitwarden API session after a PIN/Hello unlock without requiring
+/// the master password.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionFile {
     /// File format version (currently 1).
@@ -35,18 +34,35 @@ impl SessionFile {
     /// Supported on-disk format versions for the device session file.
     const SUPPORTED_VERSIONS: &'static [u32] = &[1];
 
-    /// Path to the session file: `{config_dir}/session-{hostname}.enc`
+    /// Path to the current device's session file.
     pub fn path() -> anyhow::Result<PathBuf> {
+        Ok(crate::device_data_dir()?.join(Self::file_name()))
+    }
+
+    /// Historical path used before multi-device runtime/session state was
+    /// separated. Used as a best-effort read/delete fallback for migration.
+    fn legacy_path() -> anyhow::Result<PathBuf> {
+        Ok(crate::shared_data_dir()?.join(Self::file_name()))
+    }
+
+    fn file_name() -> String {
         let hostname = hostname();
-        Ok(crate::config_dir()?.join(format!("session-{hostname}.enc")))
+        format!("session-{hostname}.enc")
     }
 
     /// Load the session file from disk. Returns `None` if the file does not exist.
     pub fn load() -> anyhow::Result<Option<Self>> {
         let path = Self::path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
+        let path = if path.exists() {
+            path
+        } else {
+            let legacy = Self::legacy_path()?;
+            if legacy.exists() {
+                legacy
+            } else {
+                return Ok(None);
+            }
+        };
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read session file: {}", path.display()))?;
         let session: SessionFile = serde_json::from_str(&content)
@@ -72,7 +88,7 @@ impl SessionFile {
         }
         let content =
             serde_json::to_string_pretty(self).context("Failed to serialize session file")?;
-        write_owner_only_file(&path, content)
+        crate::write_owner_only_file(&path, content)
             .with_context(|| format!("Failed to write session file: {}", path.display()))?;
         Ok(())
     }
@@ -84,15 +100,14 @@ impl SessionFile {
             std::fs::remove_file(&path)
                 .with_context(|| format!("Failed to delete session file: {}", path.display()))?;
         }
+        let legacy = Self::legacy_path()?;
+        if legacy.exists() && legacy != path {
+            std::fs::remove_file(&legacy).with_context(|| {
+                format!("Failed to delete legacy session file: {}", legacy.display())
+            })?;
+        }
         Ok(())
     }
-}
-
-fn write_owner_only_file(path: &Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
-    std::fs::write(path, content)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
 }
 
 /// Get the machine hostname, sanitised for use in file names.

@@ -2,20 +2,38 @@ pub mod bindings;
 pub mod cache;
 pub mod session;
 pub mod ssh_config;
+pub mod unlock_slots;
 pub mod vault;
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-/// Cached resolution of the data directory, populated on first call to [`config_dir`].
+/// Cached resolution of the shared storage root, populated on first call to
+/// [`config_dir`] / [`shared_data_dir`].
 ///
 /// All callers share a single resolution outcome for the lifetime of the process —
 /// this prevents flapping when, for example, a portable probe file is written
 /// after some path has already been computed.
-static RESOLVED_DIR: OnceLock<PathBuf> = OnceLock::new();
+static RESOLVED_SHARED_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Cached resolution of the current device's data directory. In multi-device
+/// mode this is `{shared_data_dir}/devices/{device-id}`; otherwise it is the
+/// shared directory for backwards compatibility.
+static RESOLVED_DEVICE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Cached `[storage] multi_device` decision and resolved device id.
+///
+/// Resolved once from the first successful [`Config::load`] and reused for the
+/// process lifetime. This keeps every caller in agreement about the active
+/// storage layout and, crucially, prevents a transient `config.toml` parse
+/// failure (e.g. an OneDrive conflict copy appearing mid-run) from flipping
+/// `multi_device` and mis-routing device-local unlock material into the shared
+/// cache or deleting a shared cache other devices still depend on.
+static RESOLVED_MULTI_DEVICE: OnceLock<bool> = OnceLock::new();
+static RESOLVED_DEVICE_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -243,15 +261,31 @@ pub struct SocketConfig {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SshConfigPathStyle {
+    /// Always write absolute paths into generated OpenSSH config.
+    #[default]
+    Absolute,
+    /// Prefer `~/...` for paths under the current user's home directory. This
+    /// lets one shared OneDrive-managed snippet work across Windows accounts
+    /// whose paths differ only by `C:\\Users\\<name>`.
+    HomeRelative,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SshConfigConfig {
     /// Optional path for SSHWarden's generated OpenSSH Include snippet.
     ///
     /// Supports `~`, `~/...`, and `~\\...`. Relative paths are resolved under
-    /// SSHWarden's config directory. The default is `sshwarden_config` beside
-    /// the running executable, keeping this generated file out of the user's
-    /// device-wide `.ssh` directory unless explicitly configured otherwise.
+    /// SSHWarden's shared data directory. The default is `sshwarden_config`
+    /// in the shared data directory when multi-device mode is enabled, otherwise
+    /// beside the running executable for backwards compatibility.
     pub managed_path: Option<String>,
+    /// Formatting style for paths written into `~/.ssh/config` and the managed
+    /// snippet. `home_relative` is recommended for OneDrive multi-device use.
+    #[serde(default)]
+    pub path_style: SshConfigPathStyle,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -261,6 +295,23 @@ pub struct StorageConfig {
     pub portable: bool,
     /// Optional explicit portable directory. Used only when portable is true.
     pub portable_dir: Option<String>,
+    /// Enable shared portable data with per-device runtime/session state.
+    ///
+    /// In this mode `config.toml`, `local-key-cache.json`, `bindings.json`,
+    /// `keys/`, and (by default) `sshwarden_config` remain in the shared data
+    /// directory, while `session-<hostname>.enc`, `sshwarden.pid`,
+    /// `sshwarden.log`, and runtime sockets are stored under `devices/<device-id>/`.
+    #[serde(default)]
+    pub multi_device: bool,
+    /// Explicit per-device directory name. Leave empty or set to `auto` to use
+    /// a stable ID derived from host/user information; can also be overridden by
+    /// `SSHWARDEN_DEVICE_ID`.
+    #[serde(default = "default_device_id")]
+    pub device_id: String,
+}
+
+fn default_device_id() -> String {
+    "auto".to_string()
 }
 
 impl Config {
@@ -290,7 +341,7 @@ impl Config {
     }
 }
 
-/// Get the base directory for persistent SSHWarden configuration/data files.
+/// Get the shared base directory for persistent SSHWarden configuration/data.
 ///
 /// Resolution priority (highest first):
 /// 1. `SSHWARDEN_HOME=<dir>` environment variable (explicit override).
@@ -300,21 +351,83 @@ impl Config {
 ///    executable's directory.
 /// 4. Platform-standard config directory (e.g. `%APPDATA%\SSHWarden` on Windows).
 ///
-/// The resolution is cached in [`RESOLVED_DIR`] on first call, so subsequent calls
-/// from any module return the same path even if the probe file is added or removed
-/// mid-run.
-pub fn config_dir() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = RESOLVED_DIR.get() {
+/// In multi-device mode this is the OneDrive-synced shared directory containing
+/// `config.toml`, `local-key-cache.json`, `bindings.json`, and `keys/`.
+pub fn shared_data_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = RESOLVED_SHARED_DIR.get() {
         return Ok(dir.clone());
     }
-    let resolved = resolve_data_dir()?;
+    let resolved = resolve_shared_data_dir()?;
     // Ignore the race-loser case where another caller populated the cache first;
     // both callers would have computed the same value.
-    let _ = RESOLVED_DIR.set(resolved.clone());
+    let _ = RESOLVED_SHARED_DIR.set(resolved.clone());
     Ok(resolved)
 }
 
-fn resolve_data_dir() -> anyhow::Result<PathBuf> {
+/// Backwards-compatible name for the shared data directory.
+///
+/// New code that stores runtime/session state should use [`device_data_dir`]
+/// instead. Shared Bitwarden-projection files continue to use this directory.
+pub fn config_dir() -> anyhow::Result<PathBuf> {
+    shared_data_dir()
+}
+
+/// Current device's private data directory.
+///
+/// When `[storage] multi_device = true`, runtime/session/native-unlock files are
+/// stored under `{shared_data_dir}/devices/{device-id}` while vault projection
+/// files remain shared. Without multi-device mode this returns the shared data
+/// directory for full backwards compatibility.
+pub fn device_data_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = RESOLVED_DEVICE_DIR.get() {
+        return Ok(dir.clone());
+    }
+    let shared = shared_data_dir()?;
+    let resolved = if multi_device_enabled()? {
+        let device_id = current_device_id()?;
+        // Defense in depth: the device id must be exactly one normal path
+        // segment so `{shared}/devices/{id}` can never escape the devices/
+        // subtree (a ".."/"." id would otherwise collapse device-local secrets
+        // back onto the shared, cloud-synced root). `sanitize_device_id` already
+        // rejects "."/".."; this guard ensures a future change cannot silently
+        // reintroduce traversal.
+        let mut components = Path::new(&device_id).components();
+        let single_segment =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        if !single_segment {
+            anyhow::bail!(
+                "Invalid device id {device_id:?}: must be a single path segment \
+                 without separators or '.'/'..'"
+            );
+        }
+        shared.join("devices").join(&device_id)
+    } else {
+        shared
+    };
+    let _ = RESOLVED_DEVICE_DIR.set(resolved.clone());
+    Ok(resolved)
+}
+
+pub fn current_device_id() -> anyhow::Result<String> {
+    if let Some(id) = RESOLVED_DEVICE_ID.get() {
+        return Ok(id.clone());
+    }
+    let config = Config::load()?;
+    let id = current_device_id_from_config(&config)?;
+    let _ = RESOLVED_DEVICE_ID.set(id.clone());
+    Ok(id)
+}
+
+pub fn multi_device_enabled() -> anyhow::Result<bool> {
+    if let Some(value) = RESOLVED_MULTI_DEVICE.get() {
+        return Ok(*value);
+    }
+    let value = Config::load()?.storage.multi_device;
+    let _ = RESOLVED_MULTI_DEVICE.set(value);
+    Ok(value)
+}
+
+fn resolve_shared_data_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = env_path("SSHWARDEN_HOME") {
         return Ok(dir);
     }
@@ -377,7 +490,7 @@ fn probe_portable_from_exe() -> Option<PathBuf> {
 }
 
 pub fn config_path() -> anyhow::Result<PathBuf> {
-    Ok(config_dir()?.join("config.toml"))
+    Ok(shared_data_dir()?.join("config.toml"))
 }
 
 pub fn runtime_dir() -> anyhow::Result<PathBuf> {
@@ -387,7 +500,7 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
 
     #[cfg(windows)]
     {
-        Ok(config_dir()?.join("run"))
+        Ok(device_data_dir()?.join("run"))
     }
 
     #[cfg(target_os = "linux")]
@@ -395,17 +508,17 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
         if let Some(dir) = env_path("XDG_RUNTIME_DIR") {
             return Ok(dir.join("sshwarden"));
         }
-        Ok(config_dir()?.join("run"))
+        Ok(device_data_dir()?.join("run"))
     }
 
     #[cfg(target_os = "macos")]
     {
-        Ok(config_dir()?.join("run"))
+        Ok(device_data_dir()?.join("run"))
     }
 
     #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
     {
-        Ok(config_dir()?.join("run"))
+        Ok(device_data_dir()?.join("run"))
     }
 }
 
@@ -437,6 +550,7 @@ pub fn managed_ssh_config_path(config: &Config) -> anyhow::Result<PathBuf> {
     match config.ssh_config.managed_path.as_deref().map(str::trim) {
         Some("") => anyhow::bail!("ssh_config.managed_path is present but empty"),
         Some(path) => expand_config_path(path),
+        None if config.storage.multi_device => Ok(shared_data_dir()?.join("sshwarden_config")),
         None => default_managed_ssh_config_path(),
     }
 }
@@ -460,7 +574,7 @@ pub fn expand_config_path(path: &str) -> anyhow::Result<PathBuf> {
     if expanded.is_absolute() {
         Ok(expanded)
     } else {
-        Ok(config_dir()?.join(expanded))
+        Ok(shared_data_dir()?.join(expanded))
     }
 }
 
@@ -493,6 +607,73 @@ fn home_dir_any() -> anyhow::Result<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .context("HOME or USERPROFILE environment variable not set")
+}
+
+fn current_device_id_from_config(config: &Config) -> anyhow::Result<String> {
+    if let Some(id) = std::env::var_os("SSHWARDEN_DEVICE_ID")
+        .and_then(|value| value.into_string().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(sanitize_device_id(&id));
+    }
+
+    let configured = config.storage.device_id.trim();
+    if !configured.is_empty() && !configured.eq_ignore_ascii_case("auto") {
+        return Ok(sanitize_device_id(configured));
+    }
+
+    Ok(auto_device_id())
+}
+
+fn auto_device_id() -> String {
+    let host = hostname_for_device_id();
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".to_string());
+    sanitize_device_id(&format!("{host}-{user}"))
+}
+
+fn hostname_for_device_id() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "device".to_string())
+        })
+}
+
+fn sanitize_device_id(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.trim().chars().flat_map(char::to_lowercase) {
+        let allowed = ch.is_ascii_alphanumeric() || ch == '_' || ch == '.';
+        if allowed {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let sanitized = out.trim_matches('-');
+    // Reject path-relative segments ("." / ".." / any all-dots value): joined
+    // under `{shared}/devices/`, these would resolve back onto the shared root
+    // or its parent and defeat device isolation. `.` stays allowed inside a
+    // normal id (e.g. a `host.domain` name) but a segment that is *only* dots is
+    // never a valid device directory name.
+    if sanitized.is_empty() || sanitized.chars().all(|c| c == '.') {
+        "device".to_string()
+    } else {
+        sanitized.to_string()
+    }
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -550,6 +731,58 @@ fn home_dir() -> anyhow::Result<PathBuf> {
         .context("HOME environment variable not set")
 }
 
+/// Atomically write `content` to `path` with owner-only permissions.
+///
+/// Serializes to a temp file (set to mode `0600` before promotion on unix, so
+/// the bytes are never briefly group/world-readable), then renames it over the
+/// destination. On Windows, where renaming over an existing file can fail, this
+/// falls back to the same rollback-safe backup+promote flow used by
+/// [`bindings::HostBindingsFile::save`]. This bounds a crash or cloud-sync
+/// collision to a recoverable file-level event instead of truncating the only
+/// copy in place.
+pub(crate) fn write_owner_only_file(path: &Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
+    let tmp = with_suffix(path, ".tmp");
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("Failed to write tmp file: {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on tmp file: {}", tmp.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        if path.exists() {
+            let backup = with_suffix(path, ".bak");
+            let _ = std::fs::remove_file(&backup);
+            std::fs::rename(path, &backup).with_context(|| {
+                format!(
+                    "Failed to back up {} after rename error: {e}",
+                    path.display()
+                )
+            })?;
+            if let Err(promote_err) = std::fs::rename(&tmp, path) {
+                let _ = std::fs::rename(&backup, path);
+                return Err(anyhow::Error::from(promote_err)
+                    .context(format!("Failed to replace file: {}", path.display())));
+            }
+            let _ = std::fs::remove_file(&backup);
+        } else {
+            return Err(anyhow::Error::from(e)
+                .context(format!("Failed to rename tmp file: {}", path.display())));
+        }
+    }
+    Ok(())
+}
+
+/// Append `suffix` to the full file name. Unlike [`Path::with_extension`] this
+/// preserves the original extension, so `session-x.enc` becomes
+/// `session-x.enc.tmp` rather than `session-x.tmp`.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -594,5 +827,29 @@ mod tests {
             expand_home_path_with_home("relative/sshwarden_config", home).unwrap(),
             std::path::PathBuf::from("relative/sshwarden_config")
         );
+    }
+
+    #[test]
+    fn sanitize_device_id_normalizes_and_collapses() {
+        assert_eq!(sanitize_device_id("My-Host_01"), "my-host_01");
+        assert_eq!(sanitize_device_id("Host PC@home"), "host-pc-home");
+        assert_eq!(sanitize_device_id("  spaced  "), "spaced");
+        assert_eq!(sanitize_device_id("a///b"), "a-b");
+        assert_eq!(sanitize_device_id("--lead-trail--"), "lead-trail");
+        assert_eq!(sanitize_device_id("desktop.example"), "desktop.example");
+    }
+
+    #[test]
+    fn sanitize_device_id_rejects_path_traversal() {
+        // A segment that is only dots must never become a device directory name,
+        // or `{shared}/devices/{id}` would escape the devices/ subtree.
+        assert_eq!(sanitize_device_id("."), "device");
+        assert_eq!(sanitize_device_id(".."), "device");
+        assert_eq!(sanitize_device_id("..."), "device");
+        assert_eq!(sanitize_device_id(""), "device");
+        assert_eq!(sanitize_device_id("///"), "device");
+        // Separators are neutralized to '-', so traversal characters cannot form
+        // a real parent reference even when mixed with dots.
+        assert_eq!(sanitize_device_id("../.."), "..-..");
     }
 }

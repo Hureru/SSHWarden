@@ -175,8 +175,12 @@ enum Commands {
     },
     /// Sync keys from Bitwarden into the running agent. [needs running agent + Bitwarden]
     Sync,
-    /// Forget remembered device material (local cache, session, PIN). [needs running agent]
-    Forget,
+    /// Forget remembered device material. In multi-device mode this is device-only by default. [needs running agent]
+    Forget {
+        /// Also remove the shared Local Key Cache / legacy vault cache.
+        #[arg(long)]
+        shared_cache: bool,
+    },
     /// Lock the vault (clear private keys from memory). [needs running agent]
     Lock,
     /// Unlock the vault. [needs running agent]
@@ -436,7 +440,13 @@ fn main() -> anyhow::Result<()> {
                 }
                 Some(Commands::SetPin) => cmd_set_pin().await,
                 Some(Commands::Sync) => cmd_control("sync").await,
-                Some(Commands::Forget) => cmd_control("forget").await,
+                Some(Commands::Forget { shared_cache }) => {
+                    if shared_cache {
+                        cmd_control("forget-shared").await
+                    } else {
+                        cmd_control("forget").await
+                    }
+                }
                 Some(Commands::Env { shell }) => cmd_env(&config, &shell),
             }
         })
@@ -1875,6 +1885,7 @@ fn ssh_config_snippet_with_bindings(
     keys: &[ManagedKey],
     bindings: &sshwarden_config::bindings::HostBindingsFile,
 ) -> anyhow::Result<String> {
+    let path_style = sshwarden_config::Config::load()?.ssh_config.path_style;
     let mut lines = vec![
         "# SSHWarden managed SSH config".to_string(),
         "# You may edit Host lines in SSHWarden key blocks; they are imported before regeneration."
@@ -1904,7 +1915,7 @@ fn ssh_config_snippet_with_bindings(
         lines.push(format!("Host {}", binding.hosts.join(" ")));
         lines.push(format!(
             "    IdentityFile {}",
-            sshwarden_config::ssh_config::path_arg(&path)
+            sshwarden_config::ssh_config::path_arg_with_style(&path, path_style)
         ));
         lines.push("    IdentitiesOnly yes".to_string());
         lines.push(String::new());
@@ -1920,7 +1931,7 @@ fn ssh_config_snippet_with_bindings(
             lines.push("# Host <host>".to_string());
             lines.push(format!(
                 "#     IdentityFile {}",
-                sshwarden_config::ssh_config::path_arg(&path)
+                sshwarden_config::ssh_config::path_arg_with_style(&path, path_style)
             ));
             lines.push("#     IdentitiesOnly yes".to_string());
             lines.push(String::new());
@@ -2098,11 +2109,16 @@ fn write_sshwarden_include_line(
         })?;
     }
 
-    let include_line = sshwarden_config::ssh_config::include_line(include_path);
+    let include_line = sshwarden_config::ssh_config::include_line_with_style(
+        include_path,
+        sshwarden_config::Config::load()?.ssh_config.path_style,
+    );
     let existing = std::fs::read_to_string(config_path).unwrap_or_default();
-    if existing.lines().any(|line| {
-        sshwarden_config::ssh_config::line_matches_sshwarden_include(line, include_path)
-    }) {
+    // Return only when the desired line is already present. A legacy absolute
+    // line may still "match" SSHWarden's include semantically, but in
+    // home-relative multi-device mode we want the marked block below to rewrite
+    // it so a synced ~/.ssh/config works across different Windows usernames.
+    if existing.lines().any(|line| line.trim() == include_line) {
         return Ok(());
     }
 
@@ -2110,6 +2126,7 @@ fn write_sshwarden_include_line(
     let mut rewritten: Vec<String> = Vec::with_capacity(existing.lines().count() + 2);
     let mut marker_waiting_for_include = false;
     let mut replaced_marked_include = false;
+    let mut dropped_unmarked_include = false;
 
     for line in existing.lines() {
         let trimmed = line.trim();
@@ -2133,6 +2150,13 @@ fn write_sshwarden_include_line(
             }
             marker_waiting_for_include = false;
         }
+        if line_matches_current_or_legacy_sshwarden_include(trimmed, include_path) {
+            // Drop unmarked older SSHWarden Include lines. A fresh marked line
+            // with the desired path style is appended below if no marked block
+            // was rewritten.
+            dropped_unmarked_include = true;
+            continue;
+        }
         rewritten.push(line.to_string());
     }
 
@@ -2146,7 +2170,11 @@ fn write_sshwarden_include_line(
         return Ok(());
     }
 
-    let mut new_config = existing;
+    let mut new_config = if dropped_unmarked_include {
+        rewritten.join("\n")
+    } else {
+        existing
+    };
     if !new_config.is_empty() && !new_config.ends_with('\n') {
         new_config.push('\n');
     }
@@ -2380,31 +2408,44 @@ fn write_envelope_local_key_cache(
     sshwarden_api::crypto::SymmetricKey,
 )> {
     let local_cache_key = sshwarden_api::crypto::random_symmetric_key();
-    let (pin_encrypted, pin_salt) = encrypt_local_cache_key_with_pin(&local_cache_key, pin)?;
+    write_envelope_local_key_cache_with_key(keys, email, server_url, pin, &local_cache_key)
+}
+
+fn write_envelope_local_key_cache_with_key(
+    keys: &[(String, String, String)],
+    email: &str,
+    server_url: &str,
+    pin: &str,
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+) -> anyhow::Result<(
+    sshwarden_config::cache::LocalKeyCacheFile,
+    sshwarden_api::crypto::SymmetricKey,
+)> {
+    let (pin_encrypted, pin_salt) = encrypt_local_cache_key_with_pin(local_cache_key, pin)?;
     let mut cache = build_envelope_local_key_cache(
         keys,
         email,
         server_url,
-        &local_cache_key,
+        local_cache_key,
         Some(pin_encrypted),
         Some(pin_salt),
         None,
         None,
         None,
     )?;
-    if let Err(e) = enroll_native_for_local_key_cache(&mut cache, &local_cache_key) {
+    if let Err(e) = enroll_native_for_local_key_cache(&mut cache, local_cache_key) {
         tracing::debug!("Native unlock enrollment skipped: {}", e);
     }
     #[cfg(windows)]
     {
         if sshwarden_ui::unlock::hello_crypto::hello_available() {
-            if let Err(e) = enroll_hello_for_local_key_cache(&mut cache, &local_cache_key) {
+            if let Err(e) = enroll_hello_for_local_key_cache(&mut cache, local_cache_key) {
                 tracing::warn!("Failed to enroll Windows Hello for local key cache: {}", e);
             }
         }
     }
     cache.save()?;
-    Ok((cache, local_cache_key))
+    Ok((cache, local_cache_key.clone()))
 }
 
 fn refresh_envelope_local_key_cache(
@@ -2412,6 +2453,7 @@ fn refresh_envelope_local_key_cache(
     existing: &sshwarden_config::cache::LocalKeyCacheFile,
     local_cache_key: &sshwarden_api::crypto::SymmetricKey,
 ) -> anyhow::Result<sshwarden_config::cache::LocalKeyCacheFile> {
+    let keep_platform_slots_in_shared_cache = !multi_device_mode();
     let cache = build_envelope_local_key_cache(
         keys,
         &existing.header.email,
@@ -2419,12 +2461,154 @@ fn refresh_envelope_local_key_cache(
         local_cache_key,
         existing.local_cache_key.pin_encrypted.clone(),
         existing.local_cache_key.pin_salt.clone(),
-        existing.local_cache_key.hello_challenge.clone(),
-        existing.local_cache_key.hello_encrypted.clone(),
-        existing.local_cache_key.native_encrypted.clone(),
+        keep_platform_slots_in_shared_cache
+            .then(|| existing.local_cache_key.hello_challenge.clone())
+            .flatten(),
+        keep_platform_slots_in_shared_cache
+            .then(|| existing.local_cache_key.hello_encrypted.clone())
+            .flatten(),
+        keep_platform_slots_in_shared_cache
+            .then(|| existing.local_cache_key.native_encrypted.clone())
+            .flatten(),
     )?;
     cache.save()?;
     Ok(cache)
+}
+
+fn multi_device_mode() -> bool {
+    match sshwarden_config::multi_device_enabled() {
+        Ok(value) => value,
+        Err(e) => {
+            // The decision is cached after the first successful Config::load, so
+            // this only fires if config is unreadable very early. Warn instead of
+            // silently assuming single-device, which would otherwise mis-route
+            // device-local unlock material into the shared cache.
+            tracing::warn!(
+                "Could not determine multi-device mode (assuming disabled): {}",
+                e
+            );
+            false
+        }
+    }
+}
+
+fn load_device_unlock_slots() -> Option<sshwarden_config::unlock_slots::UnlockSlotsFile> {
+    match sshwarden_config::unlock_slots::UnlockSlotsFile::load() {
+        Ok(slots) => slots,
+        Err(e) => {
+            // Distinguish a corrupt/torn slots file from a missing one: log loudly
+            // so a truncated unlock-slots.json is not silently treated as "no
+            // platform unlock" without any signal.
+            tracing::warn!(
+                "Failed to load device unlock slots (treating as none): {}",
+                e
+            );
+            None
+        }
+    }
+}
+
+fn current_native_unlock_slot(
+    cache: &sshwarden_config::cache::LocalKeyCacheFile,
+) -> Option<String> {
+    let device_slot = load_device_unlock_slots().and_then(|slots| slots.native_encrypted);
+    if multi_device_mode() {
+        device_slot
+    } else {
+        device_slot.or_else(|| cache.local_cache_key.native_encrypted.clone())
+    }
+}
+
+fn persist_device_unlock_slots_from_cache(
+    cache: &sshwarden_config::cache::LocalKeyCacheFile,
+) -> anyhow::Result<()> {
+    if !multi_device_mode() {
+        return Ok(());
+    }
+
+    let mut slots = load_device_unlock_slots().unwrap_or_default();
+    let mut changed = false;
+    if slots.native_encrypted.is_none() && cache.local_cache_key.native_encrypted.is_some() {
+        slots.native_encrypted = cache.local_cache_key.native_encrypted.clone();
+        changed = true;
+    }
+    if slots.hello_challenge.is_none() && cache.local_cache_key.hello_challenge.is_some() {
+        slots.hello_challenge = cache.local_cache_key.hello_challenge.clone();
+        changed = true;
+    }
+    if slots.hello_encrypted.is_none() && cache.local_cache_key.hello_encrypted.is_some() {
+        slots.hello_encrypted = cache.local_cache_key.hello_encrypted.clone();
+        changed = true;
+    }
+    if changed {
+        slots.save()?;
+    }
+    Ok(())
+}
+
+async fn reload_shared_local_cache_from_disk_if_multi_device(
+    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+) {
+    if !multi_device_mode() {
+        return;
+    }
+    match sshwarden_config::cache::LocalKeyCacheFile::load() {
+        Ok(Some(cache)) => {
+            if let Err(e) = persist_device_unlock_slots_from_cache(&cache) {
+                tracing::warn!("Failed to persist device unlock slots: {}", e);
+            }
+            *local_key_cache_data.write().await = Some(cache);
+        }
+        Ok(None) => {
+            // The shared cache is momentarily absent (e.g. an in-flight OneDrive
+            // rename or conflict-copy swap). Keep the valid in-memory copy rather
+            // than dropping it, which would make the next unlock fail spuriously.
+            tracing::debug!("Shared local key cache not found on reload; keeping in-memory copy");
+        }
+        Err(e) => tracing::warn!("Failed to reload shared local key cache: {}", e),
+    }
+}
+
+#[cfg(windows)]
+fn current_hello_unlock_info(
+    cache: &sshwarden_config::cache::LocalKeyCacheFile,
+) -> Option<(String, String)> {
+    let device_slot = load_device_unlock_slots()
+        .and_then(|slots| Some((slots.hello_challenge?, slots.hello_encrypted?)));
+    if multi_device_mode() {
+        device_slot
+    } else {
+        device_slot.or_else(|| {
+            Some((
+                cache.local_cache_key.hello_challenge.clone()?,
+                cache.local_cache_key.hello_encrypted.clone()?,
+            ))
+        })
+    }
+}
+
+#[cfg(windows)]
+fn current_hello_challenge_b64() -> Option<String> {
+    let device_challenge = load_device_unlock_slots().and_then(|slots| slots.hello_challenge);
+    if multi_device_mode() {
+        device_challenge
+    } else {
+        device_challenge
+            .or_else(|| {
+                // After set-pin / envelope migration the Hello challenge lives in
+                // the envelope cache (local-key-cache.json), not vault.enc.
+                sshwarden_config::cache::LocalKeyCacheFile::load()
+                    .ok()
+                    .flatten()
+                    .and_then(|cache| cache.local_cache_key.hello_challenge)
+            })
+            .or_else(|| {
+                sshwarden_config::vault::VaultFile::load()
+                    .ok()
+                    .flatten()
+                    .and_then(|vault| vault.hello_challenge)
+            })
+    }
 }
 
 fn enroll_native_for_local_key_cache(
@@ -2434,10 +2618,16 @@ fn enroll_native_for_local_key_cache(
     if !sshwarden_ui::unlock::native::native_available() {
         anyhow::bail!("native unlock is not available");
     }
-    let encoded_local_cache_key = sshwarden_api::crypto::encode_symmetric_key(local_cache_key);
-    let native_slot =
-        sshwarden_ui::unlock::native::native_encrypt_local_cache_key(&encoded_local_cache_key)?;
-    cache.local_cache_key.native_encrypted = Some(native_slot);
+    if multi_device_mode() {
+        // Device-local slot only; keep platform material out of the shared cache.
+        native_encrypt_device_slot(local_cache_key)?;
+        cache.local_cache_key.native_encrypted = None;
+    } else {
+        let encoded_local_cache_key = sshwarden_api::crypto::encode_symmetric_key(local_cache_key);
+        let native_slot =
+            sshwarden_ui::unlock::native::native_encrypt_local_cache_key(&encoded_local_cache_key)?;
+        cache.local_cache_key.native_encrypted = Some(native_slot);
+    }
     Ok(())
 }
 
@@ -2446,12 +2636,73 @@ fn enroll_hello_for_local_key_cache(
     cache: &mut sshwarden_config::cache::LocalKeyCacheFile,
     local_cache_key: &sshwarden_api::crypto::SymmetricKey,
 ) -> anyhow::Result<()> {
+    if multi_device_mode() {
+        // Device-local slot only; keep platform material out of the shared cache.
+        hello_encrypt_device_slot(local_cache_key)?;
+        cache.local_cache_key.hello_challenge = None;
+        cache.local_cache_key.hello_encrypted = None;
+    } else {
+        let challenge: [u8; 16] = rand::random();
+        let hello_encrypted = encrypt_local_cache_key_with_hello(local_cache_key, &challenge)?;
+        let hello_challenge = base64::engine::general_purpose::STANDARD.encode(challenge);
+        cache.local_cache_key.hello_challenge = Some(hello_challenge);
+        cache.local_cache_key.hello_encrypted = Some(hello_encrypted);
+    }
+    Ok(())
+}
+
+/// Native-encrypt the Local Cache Key into THIS device's `unlock-slots.json`.
+fn native_encrypt_device_slot(
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+) -> anyhow::Result<()> {
+    let encoded_local_cache_key = sshwarden_api::crypto::encode_symmetric_key(local_cache_key);
+    let native_slot =
+        sshwarden_ui::unlock::native::native_encrypt_local_cache_key(&encoded_local_cache_key)?;
+    let mut slots = load_device_unlock_slots().unwrap_or_default();
+    slots.native_encrypted = Some(native_slot);
+    slots.save()
+}
+
+/// Windows Hello-encrypt the Local Cache Key into THIS device's `unlock-slots.json`.
+#[cfg(windows)]
+fn hello_encrypt_device_slot(
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+) -> anyhow::Result<()> {
     let challenge: [u8; 16] = rand::random();
     let hello_encrypted = encrypt_local_cache_key_with_hello(local_cache_key, &challenge)?;
-    cache.local_cache_key.hello_challenge =
-        Some(base64::engine::general_purpose::STANDARD.encode(challenge));
-    cache.local_cache_key.hello_encrypted = Some(hello_encrypted);
-    Ok(())
+    let hello_challenge = base64::engine::general_purpose::STANDARD.encode(challenge);
+    let mut slots = load_device_unlock_slots().unwrap_or_default();
+    slots.hello_challenge = Some(hello_challenge);
+    slots.hello_encrypted = Some(hello_encrypted);
+    slots.save()
+}
+
+/// Multi-device: after a successful PIN unlock, make sure THIS device has its own
+/// platform unlock slot. The shared cache no longer carries Hello/native slots
+/// (refresh strips them in multi-device mode), so a device that joins later would
+/// otherwise be stuck PIN-only forever. Best-effort: failures are logged but never
+/// surfaced, and a slot that already exists is left untouched.
+fn enroll_device_platform_slots_if_missing(local_cache_key: &sshwarden_api::crypto::SymmetricKey) {
+    if !multi_device_mode() {
+        return;
+    }
+    let slots = load_device_unlock_slots().unwrap_or_default();
+    if slots.native_encrypted.is_none() && sshwarden_ui::unlock::native::native_available() {
+        match native_encrypt_device_slot(local_cache_key) {
+            Ok(()) => info!("Enrolled this device's native unlock slot"),
+            Err(e) => tracing::warn!("Failed to enroll device native unlock slot: {}", e),
+        }
+    }
+    #[cfg(windows)]
+    {
+        if slots.hello_encrypted.is_none() && sshwarden_ui::unlock::hello_crypto::hello_available()
+        {
+            match hello_encrypt_device_slot(local_cache_key) {
+                Ok(()) => info!("Enrolled this device's Windows Hello unlock slot"),
+                Err(e) => tracing::warn!("Failed to enroll device Hello unlock slot: {}", e),
+            }
+        }
+    }
 }
 
 /// Encrypt the local cache key with a PIN, generating a fresh random salt.
@@ -2493,12 +2744,9 @@ fn decrypt_envelope_payload(
 fn decrypt_envelope_local_key_cache_with_native(
     cache: &sshwarden_config::cache::LocalKeyCacheFile,
 ) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
-    let native_slot = cache
-        .local_cache_key
-        .native_encrypted
-        .as_deref()
-        .context("Local key cache has no native unlock slot")?;
-    let encoded_lck = sshwarden_ui::unlock::native::native_decrypt_local_cache_key(native_slot)
+    let native_slot =
+        current_native_unlock_slot(cache).context("Local key cache has no native unlock slot")?;
+    let encoded_lck = sshwarden_ui::unlock::native::native_decrypt_local_cache_key(&native_slot)
         .context("Failed to unlock Local Cache Key with native unlock")?;
     let local_cache_key = sshwarden_api::crypto::decode_symmetric_key(&encoded_lck)
         .context("Failed to decode Local Cache Key")?;
@@ -2588,25 +2836,17 @@ fn migrate_pin_salt_to_v3(
 fn decrypt_envelope_local_key_cache_with_hello(
     cache: &sshwarden_config::cache::LocalKeyCacheFile,
 ) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
-    let challenge_b64 = cache
-        .local_cache_key
-        .hello_challenge
-        .as_deref()
-        .context("Local key cache has no Windows Hello challenge")?;
-    let hello_encrypted = cache
-        .local_cache_key
-        .hello_encrypted
-        .as_deref()
-        .context("Local key cache has no Windows Hello unlock slot")?;
+    let (challenge_b64, hello_encrypted) = current_hello_unlock_info(cache)
+        .context("Local key cache has no Windows Hello unlock slot for this device")?;
     let challenge_bytes = base64::engine::general_purpose::STANDARD
-        .decode(challenge_b64)
+        .decode(&challenge_b64)
         .context("Failed to decode Windows Hello challenge")?;
     if challenge_bytes.len() != 16 {
         anyhow::bail!("Invalid Windows Hello challenge length");
     }
     let mut challenge = [0u8; 16];
     challenge.copy_from_slice(&challenge_bytes);
-    let encoded_lck = try_hello_unlock(&challenge, hello_encrypted)
+    let encoded_lck = try_hello_unlock(&challenge, &hello_encrypted)
         .context("Failed to unlock Local Cache Key with Windows Hello")?;
     let local_cache_key = sshwarden_api::crypto::decode_symmetric_key(&encoded_lck)
         .context("Failed to decode Local Cache Key")?;
@@ -3025,10 +3265,20 @@ async fn run_foreground(
     info!("Server: {}", config.server.base_url);
 
     // Check for persisted cache/vault files BEFORE prompting for master password.
-    let local_key_cache = sshwarden_config::cache::LocalKeyCacheFile::load().unwrap_or_else(|e| {
-        tracing::warn!("Failed to load local key cache: {}", e);
-        None
-    });
+    let local_key_cache = sshwarden_config::cache::LocalKeyCacheFile::load()
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to load local key cache: {}", e);
+            None
+        })
+        .inspect(|cache| {
+            // Multi-device migration aid: if an older shared cache still carries
+            // platform unlock slots, copy them into this device's private
+            // unlock-slots file. Future cache writes strip platform slots from
+            // the shared file so devices stop overwriting each other.
+            if let Err(e) = persist_device_unlock_slots_from_cache(cache) {
+                tracing::warn!("Failed to persist device unlock slots: {}", e);
+            }
+        });
     let vault_file = sshwarden_config::vault::VaultFile::load().unwrap_or_else(|e| {
         tracing::warn!("Failed to load vault file: {}", e);
         None
@@ -3678,11 +3928,24 @@ async fn build_status_response(
     let authenticated = api_client.read().await.is_some();
     let pending = pending_sync.load(std::sync::atomic::Ordering::Relaxed);
     let notification = notification_state.read().await.clone();
-    // P1-3: surface the resolved data directory so users can tell where their
-    // secrets actually live (docs historically disagreed on this).
-    let data_dir = sshwarden_config::config_dir()
+    // P1-3 / multi-device: surface both the shared Bitwarden-projection
+    // directory and this device's runtime/session directory so users can tell
+    // exactly which OneDrive files are shared and which are device-local.
+    let shared_data_dir = sshwarden_config::shared_data_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unresolved>".to_string());
+    let device_data_dir = sshwarden_config::device_data_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unresolved>".to_string());
+    let device_id =
+        sshwarden_config::current_device_id().unwrap_or_else(|_| "<unresolved>".to_string());
+    let multi_device = sshwarden_config::multi_device_enabled().unwrap_or(false);
+    let ssh_config_path_style = sshwarden_config::Config::load()
+        .map(|config| match config.ssh_config.path_style {
+            sshwarden_config::SshConfigPathStyle::Absolute => "absolute",
+            sshwarden_config::SshConfigPathStyle::HomeRelative => "home_relative",
+        })
+        .unwrap_or("absolute");
 
     let details = serde_json::json!({
         "locked": locked,
@@ -3695,7 +3958,12 @@ async fn build_status_response(
         "legacy_migration_available": has_vault && !has_local_key_cache,
         "authenticated": authenticated,
         "pending_sync": pending,
-        "data_dir": data_dir,
+        "data_dir": device_data_dir,
+        "shared_data_dir": shared_data_dir,
+        "device_data_dir": device_data_dir,
+        "device_id": device_id,
+        "multi_device": multi_device,
+        "ssh_config_path_style": ssh_config_path_style,
         "notification": notification.to_json(),
     });
 
@@ -3725,6 +3993,9 @@ async fn build_status_response(
     }
     if authenticated {
         extras.push("API session restored");
+    }
+    if multi_device {
+        extras.push("multi-device storage");
     }
     if pending {
         extras.push("pending sync");
@@ -3773,6 +4044,17 @@ async fn handle_control_command(
     pin_failures: &PinFailureHandle,
 ) -> sshwarden_agent::ControlResponse {
     use sshwarden_agent::ControlAction;
+
+    if matches!(
+        &action,
+        ControlAction::Unlock
+            | ControlAction::UnlockNative
+            | ControlAction::UnlockHello
+            | ControlAction::UnlockPin { .. }
+            | ControlAction::Sync
+    ) {
+        reload_shared_local_cache_from_disk_if_multi_device(local_key_cache_data).await;
+    }
 
     match action {
         // `Stop` is intercepted by the run_foreground select! loop (it breaks out
@@ -4321,6 +4603,12 @@ async fn handle_control_command(
                                     }
                                 }
                             }
+                            // Multi-device: seed THIS device's own platform unlock
+                            // slot from the freshly recovered key, so a later-joining
+                            // device isn't stuck PIN-only after the shared cache is
+                            // stripped of platform slots. No-op in single-device mode
+                            // or when a slot already exists.
+                            enroll_device_platform_slots_if_missing(&local_cache_key);
                             local_cache_key_state.write().await.set(local_cache_key);
                             let resp = finish_unlock_with_json(
                                 &keys_json,
@@ -4593,6 +4881,26 @@ async fn handle_control_command(
             // Report that honestly and mark a pending sync so the next unlock
             // applies the keys, instead of claiming the running agent was updated.
             let was_locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
+            // Only multi-device mode needs the shared cache reconciled before a
+            // manual sync. Gating this avoids a NEW PIN prompt (and a hard failure
+            // on cancel) for legacy single-device users whose unlock path did not
+            // keep the Local Cache Key in memory.
+            if !was_locked && multi_device_mode() {
+                // If this unlocked session was restored without keeping the Local
+                // Cache Key in memory, a plain sync would update the live agent but
+                // leave `sshwarden keys` showing the old cache header. Prompt for
+                // PIN first so the synced key set can be persisted atomically.
+                if let Err(e) = ensure_local_cache_key_for_manual_sync(
+                    local_key_cache_data,
+                    local_cache_key_state,
+                    ui_request_tx,
+                    pin_failures,
+                )
+                .await
+                {
+                    return sshwarden_agent::ControlResponse::err(&e);
+                }
+            }
             match do_sync(
                 api_client,
                 cached_key_tuples,
@@ -4621,42 +4929,47 @@ async fn handle_control_command(
                 Err(e) => sshwarden_agent::ControlResponse::err(&e),
             }
         }
-        ControlAction::Forget => {
+        ControlAction::Forget { shared } => {
             // EH-06: accumulate failures to delete on-disk material so a
             // revocation that left secrets on disk is not reported as success.
             let mut failures: Vec<String> = Vec::new();
-            if let Err(e) = sshwarden_config::cache::LocalKeyCacheFile::delete() {
-                tracing::warn!("Failed to delete local key cache: {}", e);
-                failures.push(format!("local key cache ({e})"));
+            let multi_device = multi_device_mode();
+            let remove_shared_cache = shared || !multi_device;
+
+            if remove_shared_cache {
+                if let Err(e) = sshwarden_config::cache::LocalKeyCacheFile::delete() {
+                    tracing::warn!("Failed to delete local key cache: {}", e);
+                    failures.push(format!("local key cache ({e})"));
+                }
+                if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
+                    tracing::warn!("Failed to delete legacy vault file: {}", e);
+                    failures.push(format!("legacy vault file ({e})"));
+                }
             }
-            if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
-                tracing::warn!("Failed to delete legacy vault file: {}", e);
-                failures.push(format!("legacy vault file ({e})"));
-            }
+
             let native_slot = local_key_cache_data
                 .read()
                 .await
                 .as_ref()
-                .and_then(|cache| cache.local_cache_key.native_encrypted.clone());
+                .and_then(current_native_unlock_slot);
             if let Err(e) =
                 sshwarden_ui::unlock::native::native_delete_local_cache_key(native_slot.as_deref())
             {
                 tracing::warn!("Failed to delete native unlock material: {}", e);
                 failures.push(format!("native unlock material ({e})"));
             }
+            if let Err(e) = sshwarden_config::unlock_slots::UnlockSlotsFile::delete() {
+                tracing::warn!("Failed to delete device unlock slots file: {}", e);
+                failures.push(format!("device unlock slots file ({e})"));
+            }
             if let Err(e) = sshwarden_config::session::SessionFile::delete() {
                 tracing::warn!("Failed to delete device session file: {}", e);
                 failures.push(format!("device session file ({e})"));
             }
 
-            *local_key_cache_data.write().await = None;
-            *vault_file_data.write().await = None;
-            *pin_encrypted_keys.write().await = None;
             local_cache_key_state.write().await.clear();
             authorization_memory.write().await.clear();
             cached_key_tuples.write().await.clear();
-            public_key_identity_tuples.write().await.clear();
-            key_names.write().await.clear();
             *api_client.write().await = None;
             pending_sync.store(false, std::sync::atomic::Ordering::Relaxed);
             {
@@ -4668,13 +4981,62 @@ async fn handle_control_command(
                 client.stop();
             }
             *notification_rx = None;
-            let _ = agent.clear_keys();
             vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
 
+            if remove_shared_cache {
+                *local_key_cache_data.write().await = None;
+                *vault_file_data.write().await = None;
+                *pin_encrypted_keys.write().await = None;
+                public_key_identity_tuples.write().await.clear();
+                key_names.write().await.clear();
+                let _ = agent.clear_keys();
+            } else {
+                // Multi-device plain `forget` is device-only: remove this
+                // device's API session/native unlock material, but keep the
+                // shared key cache listable and PIN-unlockable for all devices.
+                let cache = sshwarden_config::cache::LocalKeyCacheFile::load()
+                    .ok()
+                    .flatten();
+                *local_key_cache_data.write().await = cache.clone();
+                *vault_file_data.write().await =
+                    sshwarden_config::vault::VaultFile::load().ok().flatten();
+                *pin_encrypted_keys.write().await = vault_file_data
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|v| v.pin_encrypted.clone());
+                public_key_identity_tuples.write().await.clear();
+                // Clear unconditionally (mirroring the shared-cache branch): if the
+                // shared cache fails to reload below, stale labels from the
+                // just-forgotten session must not linger in memory.
+                key_names.write().await.clear();
+                let _ = agent.clear_keys();
+                if let Some(cache) = cache {
+                    let identities = key_tuples_from_cache_header(&cache);
+                    if let Err(e) = agent.set_public_identities(identities.clone()) {
+                        tracing::warn!(
+                            "Failed to reload public identities after device forget: {}",
+                            e
+                        );
+                    }
+                    public_key_identity_tuples
+                        .write()
+                        .await
+                        .set(identities.clone());
+                    let mut names = key_names.write().await;
+                    for (_, name, vault_item_id) in identities {
+                        names.insert(vault_item_id, name);
+                    }
+                }
+            }
+
             if failures.is_empty() {
-                sshwarden_agent::ControlResponse::ok(
-                    "Forgot local key cache, legacy vault file, and device session material",
-                )
+                let message = if remove_shared_cache {
+                    "Forgot shared local key cache, legacy vault file, and device session material"
+                } else {
+                    "Forgot this device's session and native unlock material; shared key cache was kept"
+                };
+                sshwarden_agent::ControlResponse::ok(message)
             } else {
                 sshwarden_agent::ControlResponse::err(&format!(
                     "Cleared in-memory state, but FAILED to delete on-disk material: {}. \
@@ -4697,7 +5059,18 @@ async fn handle_control_command(
             let email = config.auth.email.clone();
             let server_url = config.server.base_url.clone();
 
-            match write_envelope_local_key_cache(&keys, &email, &server_url, &pin) {
+            let cache_write_result = match local_cache_key_state.read().await.clone_key() {
+                Some(local_cache_key) => write_envelope_local_key_cache_with_key(
+                    &keys,
+                    &email,
+                    &server_url,
+                    &pin,
+                    &local_cache_key,
+                ),
+                None => write_envelope_local_key_cache(&keys, &email, &server_url, &pin),
+            };
+
+            match cache_write_result {
                 Ok((cache, local_cache_key)) => {
                     *local_key_cache_data.write().await = Some(cache);
                     local_cache_key_state.write().await.set(local_cache_key);
@@ -4900,6 +5273,75 @@ fn gate_pin_validator(inner: PinValidator, pin_failures: &PinFailureHandle) -> P
     })
 }
 
+/// Manual `sync` is user-initiated and should not leave the live agent newer
+/// than the encrypted Local Key Cache when the vault is already unlocked. If the
+/// daemon has private keys loaded but no in-memory Local Cache Key, recover that
+/// key via the user's PIN before syncing so `do_sync()` can refresh
+/// `local-key-cache.json` with the newly pulled key set.
+async fn ensure_local_cache_key_for_manual_sync(
+    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    local_cache_key_state: &LocalCacheKeyHandle,
+    ui_request_tx: &UIRequestTx,
+    pin_failures: &PinFailureHandle,
+) -> Result<(), String> {
+    if multi_device_mode() {
+        reload_shared_local_cache_from_disk_if_multi_device(local_key_cache_data).await;
+    }
+
+    let cache = match local_key_cache_data.read().await.as_ref().cloned() {
+        Some(cache) => cache,
+        None => return Ok(()),
+    };
+
+    if let Some(local_cache_key) = local_cache_key_state.read().await.clone_key() {
+        if decrypt_envelope_payload(&cache, local_cache_key.clone()).is_ok() {
+            return Ok(());
+        }
+        tracing::warn!(
+            "In-memory Local Cache Key no longer decrypts the shared cache; PIN is required"
+        );
+        local_cache_key_state.write().await.clear();
+    }
+
+    if cache.local_cache_key.pin_encrypted.is_none() {
+        return Ok(());
+    }
+
+    info!("Manual sync needs PIN to refresh the Local Key Cache");
+    let key_holder: Arc<std::sync::Mutex<Option<sshwarden_api::crypto::SymmetricKey>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let key_holder_inner = key_holder.clone();
+    let validator: PinValidator = Arc::new(move |pin: &str| -> bool {
+        match decrypt_envelope_local_key_cache_with_pin(&cache, pin) {
+            Ok((_keys_json, local_cache_key)) => {
+                *key_holder_inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(local_cache_key);
+                true
+            }
+            Err(_) => false,
+        }
+    });
+    let validator = gate_pin_validator(validator, pin_failures);
+
+    match sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator).await {
+        Some(_) => {
+            // Take the recovered key OUT of the guard before awaiting, so no
+            // std::sync::MutexGuard is held across the .await (clippy::await_holding_lock).
+            let recovered = key_holder.lock().unwrap_or_else(|e| e.into_inner()).take();
+            match recovered {
+                Some(local_cache_key) => {
+                    local_cache_key_state.write().await.set(local_cache_key);
+                    Ok(())
+                }
+                None => Err("PIN accepted but the Local Cache Key was not recovered".to_string()),
+            }
+        }
+        None => Err(
+            "Sync cancelled: PIN is required to refresh the Local Key Cache for this unlocked session"
+                .to_string(),
+        ),
+    }
+}
+
 /// Try to restore an API session from the device session file after Hello unlock.
 ///
 /// Uses the Hello-encrypted refresh token stored in the session file.
@@ -4920,7 +5362,7 @@ async fn try_restore_api_session_hello(
         _ => return,
     };
 
-    // Need hello_encrypted_token and the vault's hello_challenge
+    // Need hello_encrypted_token and this device's Hello challenge.
     let hello_enc_token = match session.hello_encrypted_token {
         Some(ref t) => t.clone(),
         None => {
@@ -4929,14 +5371,8 @@ async fn try_restore_api_session_hello(
         }
     };
 
-    // Get challenge from vault file
-    let vault_file = match sshwarden_config::vault::VaultFile::load() {
-        Ok(Some(v)) => v,
-        _ => return,
-    };
-
-    let challenge_b64 = match vault_file.hello_challenge {
-        Some(ref c) => c.clone(),
+    let challenge_b64 = match current_hello_challenge_b64() {
+        Some(c) => c,
         None => return,
     };
 
@@ -5342,11 +5778,7 @@ fn create_or_preserve_hello_encrypted_token(
 ) -> Option<String> {
     #[cfg(windows)]
     {
-        let vault = match sshwarden_config::vault::VaultFile::load() {
-            Ok(Some(v)) => v,
-            _ => return existing,
-        };
-        let challenge_b64 = match vault.hello_challenge {
+        let challenge_b64 = match current_hello_challenge_b64() {
             Some(challenge) => challenge,
             None => return existing,
         };
@@ -5530,8 +5962,7 @@ async fn handle_ui_request(
         //    No UI prompt; if the slot is present and unlock succeeds, use it.
         {
             let cache_opt = local_key_cache_data.read().await.clone();
-            if let Some(cache) = cache_opt.filter(|c| c.local_cache_key.native_encrypted.is_some())
-            {
+            if let Some(cache) = cache_opt.filter(|c| current_native_unlock_slot(c).is_some()) {
                 let cache_for_unlock = cache.clone();
                 let native_result = tokio::task::spawn_blocking(move || {
                     decrypt_envelope_local_key_cache_with_native(&cache_for_unlock)
@@ -5582,7 +6013,7 @@ async fn handle_ui_request(
         {
             // 2a. Envelope-based Hello unlock from local-key-cache.json.
             let cache_opt = local_key_cache_data.read().await.clone();
-            if let Some(cache) = cache_opt.filter(|c| c.local_cache_key.hello_encrypted.is_some()) {
+            if let Some(cache) = cache_opt.filter(|c| current_hello_unlock_info(c).is_some()) {
                 let cache_for_unlock = cache.clone();
                 let hello_result = tokio::task::spawn_blocking(move || {
                     decrypt_envelope_local_key_cache_with_hello(&cache_for_unlock)
@@ -5762,6 +6193,11 @@ async fn handle_ui_request(
                     if let Some(kh) = lck_holder {
                         let maybe_lck = kh.lock().unwrap().take();
                         if let Some(lck) = maybe_lck {
+                            // Multi-device: seed this device's own platform unlock
+                            // slot from the freshly recovered key, mirroring the
+                            // explicit unlock-pin control path (no-op in
+                            // single-device mode or if a slot already exists).
+                            enroll_device_platform_slots_if_missing(&lck);
                             local_cache_key_state.write().await.set(lck);
                         }
                     }
@@ -6202,7 +6638,7 @@ async fn prompt_setup_pin(
 
 /// Get the runtime data directory for SSHWarden (same as exe directory for portability).
 fn data_dir() -> anyhow::Result<std::path::PathBuf> {
-    sshwarden_config::config_dir()
+    sshwarden_config::device_data_dir()
 }
 
 /// Get the PID file path.
