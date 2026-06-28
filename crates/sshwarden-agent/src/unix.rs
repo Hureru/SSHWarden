@@ -20,6 +20,7 @@ impl SshWardenAgent {
 
         let socket_path = get_socket_path(endpoint)?;
 
+        ensure_socket_parent_dir(&socket_path)?;
         remove_path(&socket_path)?;
 
         info!(?socket_path, "Starting SSH Agent server");
@@ -77,7 +78,7 @@ fn get_default_socket_path() -> Result<PathBuf, anyhow::Error> {
     sshwarden_config::default_agent_socket_path()
 }
 
-fn set_user_permissions(path: &PathBuf) -> Result<(), anyhow::Error> {
+fn ensure_socket_parent_dir(path: &PathBuf) -> Result<(), anyhow::Error> {
     if let Some(parent) = path.parent() {
         let parent_existed = parent.exists();
         std::fs::create_dir_all(parent)
@@ -88,6 +89,10 @@ fn set_user_permissions(path: &PathBuf) -> Result<(), anyhow::Error> {
             })?;
         }
     }
+    Ok(())
+}
+
+fn set_user_permissions(path: &PathBuf) -> Result<(), anyhow::Error> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|e| anyhow!("Could not set socket permissions for {path:?}: {e}"))
 }
