@@ -9,7 +9,8 @@ use crate::cli::KeysAction;
 use crate::control::cmd_control;
 use crate::sshconfig::{
     load_host_bindings_importing_managed, managed_sshwarden_include_path, selector_path_for_key,
-    sync_managed_ssh_config_inner, user_ssh_config_path, write_sshwarden_include_line, ManagedKey,
+    sync_managed_ssh_config_inner, user_ssh_config_path, with_host_bindings_locked,
+    write_sshwarden_include_line, ManagedKey,
 };
 use crate::{err_line, out_line};
 /// Resolve a user-supplied `key` argument to a cipher_uuid.
@@ -162,17 +163,20 @@ pub(crate) async fn cmd_keys_list() -> anyhow::Result<()> {
 pub(crate) async fn cmd_bindings_add(key: &str, hosts: &[String]) -> anyhow::Result<()> {
     let cipher_id = resolve_cipher_id(key)?;
     let keys = load_managed_keys_from_cache().unwrap_or_default();
-    let mut bindings = load_host_bindings_importing_managed(&keys)?;
-    for host in hosts {
-        if is_catch_all_host_pattern(host) {
-            tracing::warn!(
-                "Binding a key to '{}' may cause SSH to offer this key for many hosts and can reintroduce MaxAuthTries failures.",
-                host
-            );
+    // CONC: read-modify-write under a file lock so a concurrent `keys bind`
+    // (or sign-flow binding) cannot clobber this update.
+    with_host_bindings_locked(&keys, |bindings| {
+        for host in hosts {
+            if is_catch_all_host_pattern(host) {
+                tracing::warn!(
+                    "Binding a key to '{}' may cause SSH to offer this key for many hosts and can reintroduce MaxAuthTries failures.",
+                    host
+                );
+            }
+            bindings.add_host(&cipher_id, host)?;
         }
-        bindings.add_host(&cipher_id, host)?;
-    }
-    bindings.save()?;
+        Ok(())
+    })?;
 
     // UX-7: a failed snippet regeneration means `ssh host` would route to the
     // wrong key (or none), so fail loudly rather than warn-and-continue.
@@ -210,21 +214,22 @@ pub(crate) async fn cmd_bindings_remove(
 ) -> anyhow::Result<()> {
     let cipher_id = resolve_cipher_id(key)?;
     let keys = load_managed_keys_from_cache().unwrap_or_default();
-    let mut bindings = load_host_bindings_importing_managed(&keys)?;
 
-    let changed = match (host, all) {
-        (Some(_), true) => anyhow::bail!("Pass either a host argument or `--all`, not both."),
-        (None, false) => anyhow::bail!(
-            "Specify a host pattern to remove, or pass `--all` to clear every host for this key."
-        ),
-        (None, true) => bindings.clear_key(&cipher_id),
-        (Some(h), false) => bindings.remove_host(&cipher_id, h),
-    };
+    // CONC: hold the bindings file lock across the read-modify-write.
+    let changed = with_host_bindings_locked(&keys, |bindings| {
+        Ok(match (host, all) {
+            (Some(_), true) => anyhow::bail!("Pass either a host argument or `--all`, not both."),
+            (None, false) => anyhow::bail!(
+                "Specify a host pattern to remove, or pass `--all` to clear every host for this key."
+            ),
+            (None, true) => bindings.clear_key(&cipher_id),
+            (Some(h), false) => bindings.remove_host(&cipher_id, h),
+        })
+    })?;
 
     if !changed {
         anyhow::bail!("No matching host binding found for key {}", cipher_id);
     }
-    bindings.save()?;
 
     sync_managed_ssh_config_inner(&keys, true)
         .context("Bindings saved but managed snippet regeneration failed")?;

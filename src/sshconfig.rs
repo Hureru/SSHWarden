@@ -129,6 +129,27 @@ pub(crate) fn load_host_bindings_importing_managed(
     Ok(bindings)
 }
 
+/// Run a read-modify-write cycle on `bindings.json` under an exclusive file
+/// lock, first seeding any bindings recovered from the managed SSH config.
+///
+/// This is the concurrency-safe counterpart to
+/// [`load_host_bindings_importing_managed`] + `save`: concurrent
+/// `sshwarden keys bind` / sign-flow binding writes are serialised so the last
+/// writer cannot discard the earlier one's update.
+pub(crate) fn with_host_bindings_locked<T, F>(keys: &[ManagedKey], mutate: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&mut sshwarden_config::bindings::HostBindingsFile) -> anyhow::Result<T>,
+{
+    let path = sshwarden_config::bindings::HostBindingsFile::path()?;
+    sshwarden_config::bindings::HostBindingsFile::update_locked(&path, |bindings| {
+        if !keys.is_empty() {
+            let include_path = managed_sshwarden_include_path()?;
+            import_host_bindings_from_managed_file(&include_path, keys, bindings)?;
+        }
+        mutate(bindings)
+    })
+}
+
 pub(crate) fn import_host_bindings_from_managed_file(
     path: &std::path::Path,
     keys: &[ManagedKey],

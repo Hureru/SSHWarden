@@ -7,7 +7,8 @@ use crate::infer_ssh_target_from_pid;
 use crate::runtime::UIRequestTx;
 use crate::sshconfig::{
     load_host_bindings_importing_managed, managed_sshwarden_include_path,
-    sync_managed_ssh_config_inner, user_ssh_config_path, write_sshwarden_include_line,
+    sync_managed_ssh_config_inner, user_ssh_config_path, with_host_bindings_locked,
+    write_sshwarden_include_line,
 };
 /// Prompt the user to authorize a sign request, supporting the
 /// "Bind & Approve…" secondary action. Returns true if the request was
@@ -124,11 +125,14 @@ pub(crate) async fn persist_bind_payload(
     let payload = payload.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let keys = load_managed_keys_from_cache().unwrap_or_default();
-        let mut bindings = load_host_bindings_importing_managed(&keys)?;
-        for (cipher_id, hosts) in &payload {
-            bindings.set_hosts(cipher_id, hosts.clone())?;
-        }
-        bindings.save()?;
+        // CONC: read-modify-write under the bindings file lock so a concurrent
+        // CLI `keys bind` cannot clobber the dialog's decisions (or vice versa).
+        with_host_bindings_locked(&keys, |bindings| {
+            for (cipher_id, hosts) in &payload {
+                bindings.set_hosts(cipher_id, hosts.clone())?;
+            }
+            Ok(())
+        })?;
 
         sync_managed_ssh_config_inner(&keys, true)?;
 

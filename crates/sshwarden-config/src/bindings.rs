@@ -48,11 +48,18 @@ impl HostBindingsFile {
     }
 
     pub fn load() -> anyhow::Result<Self> {
-        let path = Self::path()?;
+        Self::load_from(&Self::path()?)
+    }
+
+    /// Load from an explicit path.
+    ///
+    /// Split out from [`load`] so the locked read-modify-write helper (and
+    /// tests) can operate on a caller-supplied path.
+    pub fn load_from(path: &std::path::Path) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(&path)
+        let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read bindings file: {}", path.display()))?;
         let file: HostBindingsFile = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse bindings file: {}", path.display()))?;
@@ -60,7 +67,11 @@ impl HostBindingsFile {
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = Self::path()?;
+        self.save_to(&Self::path()?)
+    }
+
+    /// Atomically write to an explicit path.
+    pub fn save_to(&self, path: &std::path::Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create bindings directory: {}", parent.display())
@@ -73,17 +84,17 @@ impl HostBindingsFile {
             .with_context(|| format!("Failed to write bindings tmp file: {}", tmp.display()))?;
         // Best-effort atomic replace: on Windows `rename` over an existing file
         // can fail, so fall back to a rollback-safe backup+promote flow.
-        if let Err(e) = std::fs::rename(&tmp, &path) {
+        if let Err(e) = std::fs::rename(&tmp, path) {
             if path.exists() {
                 let backup = path.with_extension("json.bak");
                 let _ = std::fs::remove_file(&backup);
-                std::fs::rename(&path, &backup).with_context(|| {
+                std::fs::rename(path, &backup).with_context(|| {
                     format!(
                         "Failed to move existing bindings file to backup after rename error: {e}"
                     )
                 })?;
-                if let Err(promote_err) = std::fs::rename(&tmp, &path) {
-                    let _ = std::fs::rename(&backup, &path);
+                if let Err(promote_err) = std::fs::rename(&tmp, path) {
+                    let _ = std::fs::rename(&backup, path);
                     return Err(anyhow::Error::from(promote_err).context(format!(
                         "Failed to replace bindings file: {}",
                         path.display()
@@ -98,6 +109,76 @@ impl HostBindingsFile {
             }
         }
         Ok(())
+    }
+
+    /// Run `mutate` on the bindings file at `path` under an exclusive advisory
+    /// lock, reloading under the lock so concurrent writers cannot clobber each
+    /// other's updates (the read-modify-write race behind
+    /// `docs/host-bindings-followup.md` #6.4).
+    ///
+    /// The lock is a `flock`/`LockFileEx` on a sibling `*.lock` file, so it also
+    /// serialises callers before the bindings file itself exists.
+    pub fn update_locked<T, F>(path: &std::path::Path, mutate: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&mut Self) -> anyhow::Result<T>,
+    {
+        let lock = Self::acquire_lock(path)?;
+        let result = (|| {
+            let mut file = Self::load_from(path)?;
+            let value = mutate(&mut file)?;
+            file.save_to(path)?;
+            Ok(value)
+        })();
+        // Release the advisory lock even when the critical section errored.
+        let _ = lock.unlock();
+        result
+    }
+
+    /// Acquire an exclusive advisory lock guarding read-modify-write on `path`.
+    ///
+    /// Retries briefly on contention, then fails with an actionable message
+    /// rather than blocking a user's shell indefinitely.
+    fn acquire_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+        const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        const LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+        let lock_path = path.with_extension("json.lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create bindings directory: {}", parent.display())
+            })?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("Failed to open bindings lock file: {}", lock_path.display())
+            })?;
+
+        let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "Another sshwarden process is updating host bindings; timed out \
+                             waiting for the lock ({})",
+                            lock_path.display()
+                        );
+                    }
+                    std::thread::sleep(LOCK_RETRY_INTERVAL);
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "Failed to lock bindings file: {}",
+                        lock_path.display()
+                    )));
+                }
+            }
+        }
     }
 
     pub fn delete() -> anyhow::Result<()> {
@@ -328,5 +409,47 @@ mod tests {
         assert!(err.is_err());
         // Entry must not be partially created on validation failure.
         assert!(!file.bindings.contains_key("id-1"));
+    }
+
+    #[test]
+    fn concurrent_updates_do_not_lose_writes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "sshwarden-bindings-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bindings.json");
+
+        // Simulate two processes racing `keys bind`: every writer must see the
+        // others' updates because the read-modify-write runs under the file lock.
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                HostBindingsFile::update_locked(&path, |bindings| {
+                    bindings
+                        .add_host(&format!("id-{i}"), &format!("host-{i}.example"))
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let file = HostBindingsFile::load_from(&path).unwrap();
+        assert_eq!(
+            file.bindings.len(),
+            8,
+            "concurrent updates must not clobber each other"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
