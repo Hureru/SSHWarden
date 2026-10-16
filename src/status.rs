@@ -3,13 +3,14 @@
 //!
 //! Moved out of `main.rs` as part of the incremental module split (M1 step 5b).
 
+use crate::commands::login::create_client;
 use crate::path_util::{create_parent_dir, write_private_file};
 use crate::process::running_agent_pid;
 use crate::sshconfig::{
     key_selector_dir, managed_sshwarden_include_path, user_ssh_config_path,
     write_sshwarden_include_line,
 };
-use crate::{create_client, has_remembered_device_on_disk, out_line};
+use crate::{has_remembered_device_on_disk, out_line};
 /// `status`: a legible one-screen summary plus a suggested next step. With
 /// `--json`, prints the agent's raw machine-readable status. Works even when the
 /// agent is down (falls back to local file inspection).

@@ -18,6 +18,7 @@ use crate::cache::{
     needs_pin_salt_migration, reload_shared_local_cache_from_disk_if_multi_device,
     write_envelope_local_key_cache, write_envelope_local_key_cache_with_key,
 };
+use crate::commands::login::create_client;
 use crate::notifications::connect_notification_client;
 use crate::process::{is_daemon_running, spawn_background_agent};
 use crate::runtime::{
@@ -33,7 +34,7 @@ use crate::unlock::{
 };
 #[cfg(windows)]
 use crate::unlock::{try_hello_unlock, try_restore_api_session_hello};
-use crate::{create_client, dispatch_standalone_bind_hosts_dialog, err_line, out_line};
+use crate::{dispatch_standalone_bind_hosts_dialog, err_line, out_line};
 #[cfg(windows)]
 use base64::Engine;
 pub(crate) async fn cmd_control(cmd: &str) -> anyhow::Result<()> {

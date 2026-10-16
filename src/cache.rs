@@ -13,7 +13,7 @@ use crate::runtime::{AuthorizationMemorySet, CachedKeyTuples, LocalCacheKeyHandl
 use crate::sshconfig::ManagedKey;
 use crate::unlock::finish_unlock_with_json;
 #[cfg(windows)]
-use crate::{try_hello_encrypt, try_hello_unlock};
+use crate::unlock::{try_hello_encrypt, try_hello_unlock};
 pub(crate) fn key_identities_from_tuples(
     keys: &[(String, String, String)],
 ) -> Vec<sshwarden_config::cache::KeyIdentity> {
