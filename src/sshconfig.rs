@@ -242,6 +242,23 @@ pub(crate) fn ssh_config_snippet_with_bindings(
     bindings: &sshwarden_config::bindings::HostBindingsFile,
 ) -> anyhow::Result<String> {
     let path_style = sshwarden_config::Config::load()?.ssh_config.path_style;
+    Ok(ssh_config_snippet_with_bindings_in(
+        keys,
+        bindings,
+        &key_selector_dir()?,
+        path_style,
+    ))
+}
+
+/// Pure snippet builder behind [`ssh_config_snippet_with_bindings`]: the
+/// selector directory and path style are injected so the generated content can
+/// be asserted in tests without touching the real config directory.
+fn ssh_config_snippet_with_bindings_in(
+    keys: &[ManagedKey],
+    bindings: &sshwarden_config::bindings::HostBindingsFile,
+    selector_dir: &std::path::Path,
+    path_style: sshwarden_config::SshConfigPathStyle,
+) -> String {
     let mut lines = vec![
         "# SSHWarden managed SSH config".to_string(),
         "# You may edit Host lines in SSHWarden key blocks; they are imported before regeneration."
@@ -261,7 +278,7 @@ pub(crate) fn ssh_config_snippet_with_bindings(
     }
 
     for key in &bound_keys {
-        let path = selector_path_for_key(&key.name, &key.cipher_id)?;
+        let path = selector_dir.join(selector_file_name(&key.name, &key.cipher_id));
         let binding = bindings
             .bindings
             .get(&key.cipher_id)
@@ -281,7 +298,7 @@ pub(crate) fn ssh_config_snippet_with_bindings(
         lines.push("# --- Unbound keys (uncomment + edit to use) ---".to_string());
         lines.push(String::new());
         for key in &unbound_keys {
-            let path = selector_path_for_key(&key.name, &key.cipher_id)?;
+            let path = selector_dir.join(selector_file_name(&key.name, &key.cipher_id));
             lines.push(format!("{}{}", SSHWARDEN_KEY_MARKER_PREFIX, key.cipher_id));
             lines.push(format!("# {} ({})", key.name, key.cipher_id));
             lines.push("# Host <host>".to_string());
@@ -294,7 +311,7 @@ pub(crate) fn ssh_config_snippet_with_bindings(
         }
     }
 
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
 /// Refresh the managed `sshwarden_config` file from current vault keys + bindings.
@@ -543,4 +560,107 @@ pub(crate) fn remove_sshwarden_include_line(
     write_private_file(config_path, &new_config)
         .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
     Ok(true)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::path_util::write_private_file;
+    use sshwarden_config::bindings::HostBindingsFile;
+    use sshwarden_config::SshConfigPathStyle;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sshwarden-snippet-test-{}-{unique}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// End-to-end: bind a host via `HostBindingsFile::add_host`, generate the
+    /// managed snippet, write it to disk the way the sync path does, then read it
+    /// back and assert the generated content.
+    #[test]
+    fn managed_snippet_reflects_bindings_round_tripped_through_disk() {
+        let dir = temp_dir("snippet");
+        let selector_dir = dir.join("keys");
+
+        let keys = vec![
+            ManagedKey {
+                name: "Github".to_string(),
+                cipher_id: "id-1".to_string(),
+            },
+            ManagedKey {
+                name: "Server".to_string(),
+                cipher_id: "id-2".to_string(),
+            },
+        ];
+        let mut bindings = HostBindingsFile::default();
+        bindings.add_host("id-1", "github.com").unwrap();
+        bindings.add_host("id-1", "gitlab.com").unwrap();
+
+        let snippet = ssh_config_snippet_with_bindings_in(
+            &keys,
+            &bindings,
+            &selector_dir,
+            SshConfigPathStyle::Absolute,
+        );
+
+        let managed_path = dir.join("sshwarden_config");
+        write_private_file(&managed_path, &snippet).unwrap();
+        let written = std::fs::read_to_string(&managed_path).unwrap();
+
+        assert!(written.contains("# sshwarden:key id-1"));
+        assert!(written.contains("Host github.com gitlab.com"));
+        assert!(written.contains("    IdentitiesOnly yes"));
+
+        let bound_selector = selector_dir.join(selector_file_name("Github", "id-1"));
+        let expected_identity = format!(
+            "    IdentityFile {}",
+            sshwarden_config::ssh_config::path_arg_with_style(
+                &bound_selector,
+                SshConfigPathStyle::Absolute
+            )
+        );
+        assert!(
+            written.contains(&expected_identity),
+            "bound key should point at its selector file; snippet was:\n{written}"
+        );
+
+        // The unbound key appears only as a commented template.
+        assert!(written.contains("# --- Unbound keys (uncomment + edit to use) ---"));
+        assert!(written.contains("# sshwarden:key id-2"));
+        assert!(written.contains("# Host <host>"));
+        assert!(!written.lines().any(|line| line == "Host id-2"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn managed_snippet_empty_bindings_only_lists_unbound_templates() {
+        let dir = temp_dir("snippet-empty");
+        let keys = vec![ManagedKey {
+            name: "Github".to_string(),
+            cipher_id: "id-1".to_string(),
+        }];
+        let bindings = HostBindingsFile::default();
+
+        let snippet = ssh_config_snippet_with_bindings_in(
+            &keys,
+            &bindings,
+            &dir,
+            SshConfigPathStyle::Absolute,
+        );
+
+        assert!(snippet.contains("# sshwarden:key id-1"));
+        assert!(snippet.contains("# Host <host>"));
+        assert!(!snippet.lines().any(|line| line.starts_with("Host ")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

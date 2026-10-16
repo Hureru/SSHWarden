@@ -14,6 +14,9 @@ vault.enc
 *.swo
 *~
 
+# Claude Code 本地设置（不入库）
+.claude/settings.local.json
+
 # 操作系统文件
 .DS_Store
 Thumbs.db

@@ -55,3 +55,12 @@ This roadmap tracks implementation work needed to align the codebase with the cu
 - Migrate Windows Hello to envelope encryption.
 - Add macOS Keychain + user presence / Touch ID native unlock.
 - Add Linux Secret Service-compatible native unlock.
+
+## Known issues
+
+- **Linux dialog is rendered at 800×600 with content in the top-left 380×230
+  area** on Wayland (observed on niri) when Slint uses the femtovg renderer.
+  Root cause is a window min/max-size constraint being overwritten inside the
+  Slint winit backend; see `docs/linux-dialog-size-investigation.md` and the
+  repro at `crates/sshwarden-ui/examples/repro_linux_dialog.rs`. Not fixed
+  upstream as of Slint 1.15; candidate fixes are noted in that document.
