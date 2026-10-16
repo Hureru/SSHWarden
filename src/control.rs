@@ -9,6 +9,7 @@ use anyhow::Context;
 use tokio::sync::RwLock;
 use tracing::info;
 
+use crate::bindings_cli::dispatch_standalone_bind_hosts_dialog;
 #[cfg(windows)]
 use crate::cache::decrypt_envelope_local_key_cache_with_hello;
 use crate::cache::{
@@ -34,7 +35,7 @@ use crate::unlock::{
 };
 #[cfg(windows)]
 use crate::unlock::{try_hello_unlock, try_restore_api_session_hello};
-use crate::{dispatch_standalone_bind_hosts_dialog, err_line, out_line};
+use crate::{err_line, out_line};
 #[cfg(windows)]
 use base64::Engine;
 pub(crate) async fn cmd_control(cmd: &str) -> anyhow::Result<()> {

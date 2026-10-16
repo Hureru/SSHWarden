@@ -23,10 +23,10 @@ use crate::runtime::{
 };
 use crate::sshconfig::{sync_managed_ssh_config_with_bindings, write_key_selector_files};
 use crate::sync::{do_sync, resolve_pending_sync};
+use crate::ui::{fetch_vault_keys_with_client, handle_ui_request, prompt_setup_pin};
 #[cfg(windows)]
 use crate::unlock::try_restore_api_session_hello;
 use crate::unlock::{save_device_session, try_restore_api_session};
-use crate::{fetch_vault_keys_with_client, handle_ui_request, prompt_setup_pin};
 
 pub(crate) async fn run_foreground(
     mut config: sshwarden_config::Config,
