@@ -7,6 +7,19 @@ use tokio::sync::RwLock;
 use tracing::info;
 use zeroize::Zeroize;
 
+mod naming;
+mod path_util;
+mod shell;
+mod ssh_target;
+
+use naming::{selector_file_name, vault_item_id_prefix};
+use path_util::{
+    create_parent_dir, create_private_dir, ensure_managed_ssh_config_path_is_safe,
+    write_private_file,
+};
+use shell::{powershell_single_quote, shell_single_quote};
+use ssh_target::{parse_ssh_target, SSH_VALUE_TAKING_FLAGS};
+
 #[derive(Clone, Debug)]
 struct NotificationRuntimeState {
     state: NotificationConnectionState,
@@ -1569,13 +1582,6 @@ fn key_selector_dir() -> anyhow::Result<std::path::PathBuf> {
     Ok(sshwarden_config::config_dir()?.join("keys"))
 }
 
-/// Short single-character SSH flags that consume the next argv element as a value.
-///
-/// Reference: `ssh(1)` OPTIONS section. We intentionally over-approximate to be
-/// safe — any unknown flag is treated as value-taking only if the character
-/// matches this set.
-const SSH_VALUE_TAKING_FLAGS: &str = "BbcDEeFIiJLlmOopQRSWw";
-
 /// Inspect the argv of the process at `pid` and, if it looks like an SSH client
 /// command, extract the target host (without `user@` prefix).
 ///
@@ -1635,53 +1641,6 @@ fn infer_ssh_target_from_pid(pid: u32) -> Option<String> {
     }
     tracing::debug!(pid, process = %basename, "Unable to infer SSH target: no positional target found");
     None
-}
-
-fn parse_ssh_target(arg: &str) -> String {
-    match arg.rsplit_once('@') {
-        Some((_, host)) => host.to_string(),
-        None => arg.to_string(),
-    }
-}
-
-fn slugify_key_name(name: &str) -> String {
-    let mut slug = String::new();
-    let mut last_dash = false;
-
-    for ch in name.chars().flat_map(char::to_lowercase) {
-        let is_allowed = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
-        if is_allowed {
-            slug.push(ch);
-            last_dash = false;
-        } else if !last_dash {
-            slug.push('-');
-            last_dash = true;
-        }
-    }
-
-    let slug = slug.trim_matches('-');
-    if slug.is_empty() {
-        "ssh-key".to_string()
-    } else {
-        slug.to_string()
-    }
-}
-
-fn vault_item_id_prefix(cipher_id: &str) -> String {
-    cipher_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(8)
-        .collect::<String>()
-}
-
-fn selector_file_name(key_name: &str, cipher_id: &str) -> String {
-    let prefix = vault_item_id_prefix(cipher_id);
-    if prefix.is_empty() {
-        format!("{}.pub", slugify_key_name(key_name))
-    } else {
-        format!("{}--{}.pub", slugify_key_name(key_name), prefix)
-    }
 }
 
 fn selector_path_for_key(key_name: &str, cipher_id: &str) -> anyhow::Result<std::path::PathBuf> {
@@ -2005,97 +1964,6 @@ fn user_ssh_config_path() -> anyhow::Result<std::path::PathBuf> {
     sshwarden_config::user_ssh_config_path()
 }
 
-fn ensure_managed_ssh_config_path_is_safe(
-    managed_path: &std::path::Path,
-    user_config_path: &std::path::Path,
-) -> anyhow::Result<()> {
-    if paths_equivalent_for_safety(managed_path, user_config_path) {
-        anyhow::bail!(
-            "managed SSH config path must not be the user's main SSH config: {}",
-            managed_path.display()
-        );
-    }
-    Ok(())
-}
-
-fn paths_equivalent_for_safety(a: &std::path::Path, b: &std::path::Path) -> bool {
-    if let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize()) {
-        return path_values_equal_for_safety(&a, &b);
-    }
-
-    let a = normalized_absolute_path_for_safety(a);
-    let b = normalized_absolute_path_for_safety(b);
-    path_values_equal_for_safety(&a, &b)
-}
-
-fn normalized_absolute_path_for_safety(path: &std::path::Path) -> std::path::PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else if let Ok(cwd) = std::env::current_dir() {
-        cwd.join(path)
-    } else {
-        path.to_path_buf()
-    };
-
-    normalize_path_components_for_safety(&absolute)
-}
-
-fn normalize_path_components_for_safety(path: &std::path::Path) -> std::path::PathBuf {
-    let mut normalized = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                normalized.push(component.as_os_str());
-            }
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if matches!(
-                    normalized.components().next_back(),
-                    Some(std::path::Component::Normal(_))
-                ) {
-                    normalized.pop();
-                } else if !path.is_absolute() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-            std::path::Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
-}
-
-fn path_values_equal_for_safety(a: &std::path::Path, b: &std::path::Path) -> bool {
-    #[cfg(windows)]
-    {
-        a.to_string_lossy()
-            .eq_ignore_ascii_case(&b.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        a == b
-    }
-}
-
-fn create_parent_dir(path: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(path)?;
-    Ok(())
-}
-
-fn create_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
-    create_parent_dir(path)?;
-    sshwarden_config::ssh_config::ensure_ssh_dir_permissions(path)?;
-    Ok(())
-}
-
-fn write_private_file(path: &std::path::Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        create_parent_dir(parent)?;
-    }
-    std::fs::write(path, content)?;
-    sshwarden_config::ssh_config::ensure_private_file_permissions(path)?;
-    Ok(())
-}
-
 fn write_sshwarden_include_line(
     config_path: &std::path::Path,
     include_path: &std::path::Path,
@@ -2331,14 +2199,6 @@ fn cmd_env(config: &sshwarden_config::Config, shell: &str) -> anyhow::Result<()>
     }
 
     Ok(())
-}
-
-fn shell_single_quote(value: &str) -> String {
-    value.replace('\'', "'\\''")
-}
-
-fn powershell_single_quote(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 fn key_identities_from_tuples(
@@ -6997,6 +6857,7 @@ fn xml_escape(value: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::path_util::paths_equivalent_for_safety;
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
