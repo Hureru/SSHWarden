@@ -1,4 +1,9 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Context as _};
 use bitwarden_russh::ssh_agent;
@@ -78,7 +83,7 @@ fn get_default_socket_path() -> Result<PathBuf, anyhow::Error> {
     sshwarden_config::default_agent_socket_path()
 }
 
-fn ensure_socket_parent_dir(path: &PathBuf) -> Result<(), anyhow::Error> {
+fn ensure_socket_parent_dir(path: &Path) -> Result<(), anyhow::Error> {
     if let Some(parent) = path.parent() {
         let parent_existed = parent.exists();
         std::fs::create_dir_all(parent)

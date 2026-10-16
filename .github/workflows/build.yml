@@ -67,7 +67,7 @@ jobs:
       run: cargo build --verbose
 
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --workspace --verbose
 
     - name: Build (Release)
       run: cargo build --release --verbose
@@ -104,7 +104,7 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
 
     - name: Run clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   fmt:
     name: Format

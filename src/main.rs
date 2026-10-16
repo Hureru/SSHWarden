@@ -6133,8 +6133,8 @@ async fn handle_ui_request(
                 let v: PinValidator = Arc::new(move |pin: &str| -> bool {
                     match decrypt_envelope_local_key_cache_with_pin(&cache, pin) {
                         Ok((keys_json, lck)) => {
-                            *dc_inner.lock().unwrap() = Some(keys_json);
-                            *kh_inner.lock().unwrap() = Some(lck);
+                            *dc_inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(keys_json);
+                            *kh_inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(lck);
                             true
                         }
                         Err(_) => false,
@@ -6177,7 +6177,11 @@ async fn handle_ui_request(
         .await;
 
         if let Some(pin) = pin_result {
-            let keys_json = match decrypted_cache.lock().unwrap().take() {
+            let keys_json = match decrypted_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
                 Some(j) => j,
                 None => {
                     tracing::warn!("PIN validator reported success but cache was empty");
@@ -6191,7 +6195,7 @@ async fn handle_ui_request(
                 let mut agent_for_unlock = agent.clone();
                 if agent_for_unlock.set_keys(keys).is_ok() {
                     if let Some(kh) = lck_holder {
-                        let maybe_lck = kh.lock().unwrap().take();
+                        let maybe_lck = kh.lock().unwrap_or_else(|e| e.into_inner()).take();
                         if let Some(lck) = maybe_lck {
                             // Multi-device: seed this device's own platform unlock
                             // slot from the freshly recovered key, mirroring the
