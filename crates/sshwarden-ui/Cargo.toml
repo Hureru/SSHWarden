@@ -10,7 +10,15 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 sshwarden-api = { path = "../sshwarden-api" }
-slint = { version = "1.15", features = ["unstable-winit-030"] }
+# Only winit + femtovg are used; the default set also adds the Qt backend and
+# the software renderer (and their png 0.17/0.18 deps), which we don't need.
+slint = { version = "1.15", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-femtovg",
+    "unstable-winit-030",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "2.11"

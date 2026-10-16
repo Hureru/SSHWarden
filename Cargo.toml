@@ -34,7 +34,10 @@ sysinfo = { workspace = true }
 base64 = { workspace = true }
 zeroize = { workspace = true }
 rand = "0.8"
-slint = "1.15"
+# Only the winit + femtovg backend is used; slint's default feature set also
+# pulls in the Qt backend and the software renderer (png 0.17/0.18), which
+# nothing here needs. Keep the feature list in sync with sshwarden-ui.
+slint = { version = "1.15", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
 rustls = { version = "0.23", features = ["ring"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -76,3 +79,12 @@ zeroize = { version = "1", features = ["derive"] }
 print_stderr = "deny"
 print_stdout = "deny"
 unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+# `panic = "abort"` drops the unwinding tables and lets LTO remove more code.
+# Mutex poisoning is still handled without unwinding: every `.lock()` site
+# recovers via `unwrap_or_else(|e| e.into_inner())` rather than panicking.
+panic = "abort"
