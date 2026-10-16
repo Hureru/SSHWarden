@@ -11,9 +11,9 @@ feature from being usable.
 
 Implementation progress:
 
-- Done: user documentation (#4), design ADR (#5), quoted `Include` / `IdentityFile` paths (#6.2), Unix SSH config permissions (#6.5), catch-all warnings (#6.3), and debug logging for process-peek inference failures (#3).
+- Done: user documentation (#4), design ADR (#5), quoted `Include` / `IdentityFile` paths (#6.2), Unix SSH config permissions (#6.5), catch-all warnings (#6.3), debug logging for process-peek inference failures (#3), and concurrent edit locking (#6.4).
 - Explicitly deferred: system tray / menu-bar entry (#1).
-- Remaining: Linux/macOS validation, large-list profiling, concurrent edit locking, and broader integration tests.
+- Remaining: Linux/macOS validation, large-list profiling, and broader integration tests.
 
 ---
 
@@ -149,11 +149,11 @@ These are not bugs per se — flag them during a real-world soak.
 - **Snippet file path with spaces / non-ASCII:** fixed for both `Include` and
   `IdentityFile`; status/uninstall also accept legacy unquoted Include lines.
 - **Binding to `*` or other catch-all patterns:** warning added in CLI and GUI.
-- **Concurrent edits:** two `sshwarden keys bind` invocations racing. The
-  tmp-rename atomic save in `bindings.rs` prevents corruption but the second
-  writer's read can lose the first writer's add (read-modify-write race).
-  Add a file lock (`fs2::FileExt::try_lock_exclusive`) if this becomes a
-  real-world problem.
+- **Concurrent edits:** fixed. Two `sshwarden keys bind` (or sign-flow
+  binding) invocations racing are now serialised by an exclusive advisory file
+  lock (`std::fs::File::try_lock`) held across the read-modify-write in
+  `HostBindingsFile::update_locked`, so no writer's add can be lost. See
+  `crates/sshwarden-config/src/bindings.rs`.
 - **`~/.ssh` permissions on Unix:** fixed for SSHWarden-created `~/.ssh` and
   `~/.ssh/config`; the managed snippet file itself is still written private,
   but arbitrary configured parent directories are not chmodded.
@@ -183,5 +183,5 @@ If continuing incrementally:
 
 1. **Next** — Linux/macOS sysinfo validation (#3). Required before claiming non-Windows support.
 2. **Then** — broader integration tests (#7), ideally after moving more SSH config generation logic into `sshwarden-config`.
-3. **Later** — virtual scrolling/search (#2) and concurrent edit locking (#6.4).
+3. **Later** — virtual scrolling/search (#2).
 4. **Deferred** — tray (#1).
