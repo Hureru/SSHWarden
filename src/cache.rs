@@ -9,9 +9,9 @@ use base64::Engine;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::finish_unlock_with_json;
 use crate::runtime::{AuthorizationMemorySet, CachedKeyTuples, LocalCacheKeyHandle};
 use crate::sshconfig::ManagedKey;
+use crate::unlock::finish_unlock_with_json;
 #[cfg(windows)]
 use crate::{try_hello_encrypt, try_hello_unlock};
 pub(crate) fn key_identities_from_tuples(
