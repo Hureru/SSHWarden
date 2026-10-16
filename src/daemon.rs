@@ -50,14 +50,8 @@ pub(crate) async fn run_foreground(
                 tracing::warn!("Failed to persist device unlock slots: {}", e);
             }
         });
-    let vault_file = sshwarden_config::vault::VaultFile::load().unwrap_or_else(|e| {
-        tracing::warn!("Failed to load vault file: {}", e);
-        None
-    });
-
     let has_local_key_cache = local_key_cache.is_some();
-    let has_vault_file = vault_file.is_some();
-    let has_remembered_device = has_local_key_cache || has_vault_file;
+    let has_remembered_device = has_local_key_cache;
 
     // Login and fetch keys BEFORE starting the agent server (so password prompt works cleanly)
     // Skip if we have a remembered device — user will unlock with PIN/Hello/password later.
@@ -159,11 +153,6 @@ pub(crate) async fn run_foreground(
     let vault_locked = Arc::new(std::sync::atomic::AtomicBool::new(has_remembered_device));
     let api_client: Arc<RwLock<Option<sshwarden_api::BitwardenClient>>> =
         Arc::new(RwLock::new(api_client));
-    let pin_encrypted_keys: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(
-        vault_file.as_ref().map(|v| v.pin_encrypted.clone()),
-    ));
-    let vault_file_data: Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>> =
-        Arc::new(RwLock::new(vault_file));
     let local_key_cache_data: Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>> =
         Arc::new(RwLock::new(local_key_cache));
     let local_cache_key_state: LocalCacheKeyHandle =
@@ -215,8 +204,6 @@ pub(crate) async fn run_foreground(
             if first_login {
                 prompt_setup_pin(
                     &cached_key_tuples,
-                    &pin_encrypted_keys,
-                    &vault_file_data,
                     &local_key_cache_data,
                     &local_cache_key_state,
                     &config,
@@ -254,7 +241,7 @@ pub(crate) async fn run_foreground(
         } else {
             info!("Local key cache has no key identities.");
         }
-    } else if !has_vault_file {
+    } else {
         info!("Agent running with no keys.");
     }
 
@@ -331,8 +318,6 @@ pub(crate) async fn run_foreground(
                     &cached_key_tuples,
                     &public_key_identity_tuples,
                     &api_client,
-                    &pin_encrypted_keys,
-                    &vault_file_data,
                     &local_key_cache_data,
                     &local_cache_key_state,
                     &key_material_fingerprints,
@@ -364,8 +349,6 @@ pub(crate) async fn run_foreground(
                 let cached_keys_clone = cached_key_tuples.clone();
                 let agent_clone = agent.clone();
                 let key_names_clone = key_names.clone();
-                let pin_encrypted_clone = pin_encrypted_keys.clone();
-                let vault_file_clone = vault_file_data.clone();
                 let local_key_cache_clone = local_key_cache_data.clone();
                 let local_cache_key_state_clone = local_cache_key_state.clone();
                 let runtime_event_tx_clone = runtime_event_tx.clone();
@@ -382,8 +365,6 @@ pub(crate) async fn run_foreground(
                         cached_keys_clone,
                         agent_clone,
                         key_names_clone,
-                        pin_encrypted_clone,
-                        vault_file_clone,
                         local_key_cache_clone,
                         local_cache_key_state_clone,
                         prompt_behavior,

@@ -8,9 +8,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
-#[cfg(windows)]
-use base64::Engine;
-
 use crate::bindings_cli::prompt_authorization_with_bind_flow;
 #[cfg(windows)]
 use crate::cache::{current_hello_unlock_info, decrypt_envelope_local_key_cache_with_hello};
@@ -24,12 +21,7 @@ use crate::control::PinFailureHandle;
 use crate::runtime::{
     AuthorizationMemorySet, CachedKeyTuples, LocalCacheKeyHandle, RuntimeEvent, UIRequestTx,
 };
-#[cfg(windows)]
-use crate::unlock::try_hello_unlock;
-use crate::unlock::{
-    gate_pin_validator, get_pin_encrypted_data, make_pin_validator, save_device_session,
-    DecryptedCache, PinValidator,
-};
+use crate::unlock::{gate_pin_validator, save_device_session, DecryptedCache, PinValidator};
 /// Resolve the human-friendly key name for an SSH UI request, given the
 /// freshly-decrypted key list. Falls back to "Unknown key" when no `cipher_id`
 /// match is found.
@@ -106,8 +98,6 @@ pub(crate) async fn handle_ui_request(
     cached_key_tuples: CachedKeyTuples,
     agent: sshwarden_agent::SshWardenAgent,
     key_names: Arc<RwLock<std::collections::HashMap<String, String>>>,
-    pin_encrypted_keys: Arc<RwLock<Option<String>>>,
-    vault_file_data: Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
     local_key_cache_data: Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
     local_cache_key_state: LocalCacheKeyHandle,
     prompt_behavior: sshwarden_config::PromptBehavior,
@@ -193,10 +183,10 @@ pub(crate) async fn handle_ui_request(
             }
         }
 
-        // 2. Windows Hello envelope (preferred) → legacy vault.enc Hello sign-path.
+        // 2. Windows Hello envelope unlock (local-key-cache.json).
         #[cfg(windows)]
         {
-            // 2a. Envelope-based Hello unlock from local-key-cache.json.
+            // Envelope-based Hello unlock from local-key-cache.json.
             let cache_opt = local_key_cache_data.read().await.clone();
             if let Some(cache) = cache_opt.filter(|c| current_hello_unlock_info(c).is_some()) {
                 let cache_for_unlock = cache.clone();
@@ -242,59 +232,6 @@ pub(crate) async fn handle_ui_request(
                     }
                 }
             }
-
-            // 2b. Legacy Hello sign-path from vault.enc (backward compatibility).
-            let hello_info = {
-                let vf = vault_file_data.read().await;
-                vf.as_ref().and_then(|v| {
-                    let challenge = v.hello_challenge.as_ref()?;
-                    let encrypted = v.hello_encrypted.as_ref()?;
-                    Some((challenge.clone(), encrypted.clone()))
-                })
-            };
-
-            if let Some((challenge_b64, hello_encrypted)) = hello_info {
-                if let Ok(challenge_bytes) =
-                    base64::engine::general_purpose::STANDARD.decode(&challenge_b64)
-                {
-                    if challenge_bytes.len() == 16 {
-                        let mut challenge = [0u8; 16];
-                        challenge.copy_from_slice(&challenge_bytes);
-                        let hello_result = tokio::task::spawn_blocking(move || {
-                            try_hello_unlock(&challenge, &hello_encrypted)
-                        })
-                        .await;
-                        if let Ok(Ok(keys_json)) = hello_result {
-                            if let Ok(keys) =
-                                serde_json::from_str::<Vec<(String, String, String)>>(&keys_json)
-                            {
-                                let key_name = key_name_for_request(&request, &keys);
-                                apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys)
-                                    .await;
-                                let mut agent_for_unlock = agent.clone();
-                                if agent_for_unlock.set_keys(keys).is_ok() {
-                                    vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
-                                    info!("Auto-unlocked via Windows Hello sign-path (legacy)");
-                                    let _ = runtime_event_tx
-                                        .send(RuntimeEvent::AutoUnlockedWindowsHello)
-                                        .await;
-                                    let approved = run_authorization_prompt(
-                                        &request,
-                                        key_name,
-                                        prompt_behavior,
-                                        &ui_request_tx,
-                                    )
-                                    .await;
-                                    let _ = response_tx.send((request.request_id, approved));
-                                    return;
-                                }
-                            }
-                        } else {
-                            info!("Hello sign-path auto-unlock failed, trying PIN dialog fallback");
-                        }
-                    }
-                }
-            }
         }
 
         // 3. PIN dialog: envelope-first validator with legacy fallback.
@@ -326,13 +263,8 @@ pub(crate) async fn handle_ui_request(
                     }
                 });
                 (v, dc, Some(kh))
-            } else if let Some(enc_data) =
-                get_pin_encrypted_data(&pin_encrypted_keys, &vault_file_data).await
-            {
-                let (v, dc) = make_pin_validator(enc_data);
-                (v, dc, None)
             } else {
-                // No PIN credentials of any kind — bail out.
+                // No PIN credentials — bail out.
                 info!(
                     request_id = request.request_id,
                     "Auto-unlock failed: no PIN credentials available"
@@ -563,8 +495,6 @@ pub(crate) async fn fetch_vault_keys_with_client(
 /// This avoids requiring the master password on every restart.
 pub(crate) async fn prompt_setup_pin(
     cached_key_tuples: &CachedKeyTuples,
-    pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
-    vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
     local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
     local_cache_key_state: &LocalCacheKeyHandle,
     config: &sshwarden_config::Config,
@@ -606,14 +536,6 @@ pub(crate) async fn prompt_setup_pin(
         Ok((cache, local_cache_key)) => {
             *local_key_cache_data.write().await = Some(cache);
             local_cache_key_state.write().await.set(local_cache_key);
-            *pin_encrypted_keys.write().await = None;
-            *vault_file_data.write().await = None;
-            if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
-                tracing::warn!(
-                    "Failed to delete legacy vault file after envelope cache write: {}",
-                    e
-                );
-            }
             info!("PIN set. Envelope local key cache saved.");
         }
         Err(e) => {

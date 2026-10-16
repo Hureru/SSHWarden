@@ -28,16 +28,13 @@ use crate::runtime::{
 };
 use crate::sshconfig::{sync_managed_ssh_config_with_bindings, write_key_selector_files};
 use crate::sync::{do_sync, reconcile_synced_key_state, resolve_pending_sync};
+#[cfg(windows)]
+use crate::unlock::try_restore_api_session_hello;
 use crate::unlock::{
     ensure_local_cache_key_for_manual_sync, finish_unlock_with_json, gate_pin_validator,
-    get_pin_encrypted_data, make_pin_validator, save_device_session, try_restore_api_session,
-    DecryptedCache, PinValidator,
+    save_device_session, try_restore_api_session, DecryptedCache, PinValidator,
 };
-#[cfg(windows)]
-use crate::unlock::{try_hello_unlock, try_restore_api_session_hello};
 use crate::{err_line, out_line};
-#[cfg(windows)]
-use base64::Engine;
 pub(crate) async fn cmd_control(cmd: &str) -> anyhow::Result<()> {
     match sshwarden_agent::control::send_control_command(cmd).await {
         Ok(response) => {
@@ -281,8 +278,6 @@ pub(crate) async fn build_status_response(
     json: bool,
     agent: &sshwarden_agent::SshWardenAgent,
     vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
-    vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
     pending_sync: &Arc<std::sync::atomic::AtomicBool>,
     notification_state: &Arc<RwLock<NotificationRuntimeState>>,
@@ -292,17 +287,14 @@ pub(crate) async fn build_status_response(
     let count = agent.key_count();
     let signable = agent.signable_key_count();
     let agent_running = agent.is_running();
-    // SEC: reflect PIN availability across both layouts — the legacy
-    // pin_encrypted_keys slot AND the v3 local key cache, where set-pin/migration
-    // moves the PIN into local_cache_key.pin_encrypted (and clears the legacy slot).
-    let has_pin = pin_encrypted_keys.read().await.is_some()
-        || local_key_cache_data
-            .read()
-            .await
-            .as_ref()
-            .map(|c| c.local_cache_key.pin_encrypted.is_some())
-            .unwrap_or(false);
-    let has_vault = vault_file_data.read().await.is_some();
+    // SEC: PIN availability lives in the v3 local key cache
+    // (`local_cache_key.pin_encrypted`).
+    let has_pin = local_key_cache_data
+        .read()
+        .await
+        .as_ref()
+        .map(|c| c.local_cache_key.pin_encrypted.is_some())
+        .unwrap_or(false);
     let has_local_key_cache = local_key_cache_data.read().await.is_some();
     let authenticated = api_client.read().await.is_some();
     let pending = pending_sync.load(std::sync::atomic::Ordering::Relaxed);
@@ -332,9 +324,7 @@ pub(crate) async fn build_status_response(
         "signable_key_count": signable,
         "agent_running": agent_running,
         "has_pin": has_pin,
-        "has_vault_file": has_vault,
         "has_local_key_cache": has_local_key_cache,
-        "legacy_migration_available": has_vault && !has_local_key_cache,
         "authenticated": authenticated,
         "pending_sync": pending,
         "data_dir": device_data_dir,
@@ -361,14 +351,8 @@ pub(crate) async fn build_status_response(
     if has_pin {
         extras.push("PIN configured");
     }
-    if has_vault {
-        extras.push("vault.enc present");
-    }
     if has_local_key_cache {
         extras.push("local key cache present");
-    }
-    if has_vault && !has_local_key_cache {
-        extras.push("legacy migration available");
     }
     if authenticated {
         extras.push("API session restored");
@@ -406,8 +390,6 @@ pub(crate) async fn handle_control_command(
     cached_key_tuples: &CachedKeyTuples,
     public_key_identity_tuples: &CachedKeyTuples,
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
-    pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
-    vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
     local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
     local_cache_key_state: &LocalCacheKeyHandle,
     key_material_fingerprints: &KeyMaterialFingerprints,
@@ -467,7 +449,7 @@ pub(crate) async fn handle_control_command(
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
 
-            // Try platform-native Local Key Cache first, then Windows Hello/legacy Hello.
+            // Try platform-native Local Key Cache first, then Windows Hello.
             #[cfg(not(windows))]
             if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
                 let resp = finish_native_unlock_response(
@@ -501,7 +483,7 @@ pub(crate) async fn handle_control_command(
                 tracing::warn!("Platform-native local key cache unlock failed");
             }
 
-            // Try envelope Local Key Cache Windows Hello first, then legacy Hello.
+            // Try envelope Local Key Cache Windows Hello.
             #[cfg(windows)]
             if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
                 match decrypt_envelope_local_key_cache_with_hello(&cache) {
@@ -547,83 +529,9 @@ pub(crate) async fn handle_control_command(
                 }
             }
 
-            // Try legacy Hello sign-path (if hello_challenge available).
-            #[cfg(windows)]
-            {
-                let hello_info = {
-                    let vf = vault_file_data.read().await;
-                    vf.as_ref().and_then(|v| {
-                        let challenge = v.hello_challenge.as_ref()?;
-                        let encrypted = v.hello_encrypted.as_ref()?;
-                        Some((challenge.clone(), encrypted.clone()))
-                    })
-                };
-
-                if let Some((challenge_b64, hello_encrypted)) = hello_info {
-                    if let Ok(challenge_bytes) =
-                        base64::engine::general_purpose::STANDARD.decode(&challenge_b64)
-                    {
-                        if challenge_bytes.len() == 16 {
-                            let mut challenge = [0u8; 16];
-                            challenge.copy_from_slice(&challenge_bytes);
-
-                            // Try Hello sign-path unlock
-                            let hello_result = tokio::task::spawn_blocking(move || {
-                                try_hello_unlock(&challenge, &hello_encrypted)
-                            })
-                            .await;
-
-                            if let Ok(Ok(keys_json)) = hello_result {
-                                let resp = finish_unlock_with_json(
-                                    &keys_json,
-                                    agent,
-                                    vault_locked,
-                                    cached_key_tuples,
-                                    key_names,
-                                    "Vault unlocked via Windows Hello",
-                                )
-                                .await;
-
-                                if resp.ok {
-                                    try_restore_api_session_hello(
-                                        api_client,
-                                        config,
-                                        notification_rx,
-                                        notification_client,
-                                        notification_state,
-                                    )
-                                    .await;
-                                    resolve_pending_sync(
-                                        pending_sync,
-                                        api_client,
-                                        cached_key_tuples,
-                                        public_key_identity_tuples,
-                                        local_key_cache_data,
-                                        local_cache_key_state,
-                                        authorization_memory,
-                                        key_material_fingerprints,
-                                        vault_locked,
-                                        agent,
-                                        key_names,
-                                        notification_state,
-                                    )
-                                    .await;
-                                }
-
-                                return resp;
-                            }
-                            info!("Hello unlock failed or cancelled, trying fallback");
-                        }
-                    }
-                }
-            }
-
-            // Fall back to PIN dialog when Hello sign-path fails
+            // Fall back to the PIN dialog (v3 local key cache only).
             if auto_unlock {
-                info!("Hello sign-path failed, trying PIN dialog fallback");
-                // Envelope-first (v3 local key cache) with legacy vault.enc
-                // fallback, mirroring the SSH-request path so v3 PINs validate in
-                // this dialog too (get_pin_encrypted_data only reads legacy slots).
+                info!("Trying PIN dialog fallback");
                 let envelope_cache = {
                     let guard = local_key_cache_data.read().await;
                     guard
@@ -650,11 +558,6 @@ pub(crate) async fn handle_control_command(
                             }
                         });
                         Some((v, dc, Some(kh)))
-                    } else if let Some(enc_data) =
-                        get_pin_encrypted_data(pin_encrypted_keys, vault_file_data).await
-                    {
-                        let (v, dc) = make_pin_validator(enc_data);
-                        Some((v, dc, None))
                     } else {
                         None
                     };
@@ -833,99 +736,9 @@ pub(crate) async fn handle_control_command(
                     }
                 }
 
-                let vf = vault_file_data.read().await;
-                let (challenge_b64, hello_encrypted) = match *vf {
-                    Some(ref v) => (v.hello_challenge.clone(), v.hello_encrypted.clone()),
-                    None => {
-                        return sshwarden_agent::ControlResponse::err(
-                            "No vault file found. Set PIN first.",
-                        )
-                    }
-                };
-                drop(vf);
-
-                let challenge_b64 =
-                    match challenge_b64 {
-                        Some(c) => c,
-                        None => return sshwarden_agent::ControlResponse::err(
-                            "Windows Hello not enrolled. Set PIN with Hello available to enroll.",
-                        ),
-                    };
-
-                let hello_encrypted =
-                    match hello_encrypted {
-                        Some(e) => e,
-                        None => return sshwarden_agent::ControlResponse::err(
-                            "Windows Hello not enrolled. Set PIN with Hello available to enroll.",
-                        ),
-                    };
-
-                let challenge_bytes =
-                    match base64::engine::general_purpose::STANDARD.decode(&challenge_b64) {
-                        Ok(b) if b.len() == 16 => {
-                            let mut arr = [0u8; 16];
-                            arr.copy_from_slice(&b);
-                            arr
-                        }
-                        _ => {
-                            return sshwarden_agent::ControlResponse::err(
-                                "Invalid hello_challenge in vault file",
-                            )
-                        }
-                    };
-
-                let hello_result = tokio::task::spawn_blocking(move || {
-                    try_hello_unlock(&challenge_bytes, &hello_encrypted)
-                })
-                .await;
-
-                match hello_result {
-                    Ok(Ok(keys_json)) => {
-                        let resp = finish_unlock_with_json(
-                            &keys_json,
-                            agent,
-                            vault_locked,
-                            cached_key_tuples,
-                            key_names,
-                            "Vault unlocked via Windows Hello",
-                        )
-                        .await;
-                        if resp.ok {
-                            try_restore_api_session_hello(
-                                api_client,
-                                config,
-                                notification_rx,
-                                notification_client,
-                                notification_state,
-                            )
-                            .await;
-                            resolve_pending_sync(
-                                pending_sync,
-                                api_client,
-                                cached_key_tuples,
-                                public_key_identity_tuples,
-                                local_key_cache_data,
-                                local_cache_key_state,
-                                authorization_memory,
-                                key_material_fingerprints,
-                                vault_locked,
-                                agent,
-                                key_names,
-                                notification_state,
-                            )
-                            .await;
-                        }
-                        resp
-                    }
-                    Ok(Err(e)) => sshwarden_agent::ControlResponse::err(&format!(
-                        "Hello unlock failed: {}",
-                        e
-                    )),
-                    Err(e) => sshwarden_agent::ControlResponse::err(&format!(
-                        "Hello unlock task failed: {}",
-                        e
-                    )),
-                }
+                sshwarden_agent::ControlResponse::err(
+                    "Windows Hello is not enrolled. Set PIN with Hello available to enroll.",
+                )
             }
 
             #[cfg(not(windows))]
@@ -936,8 +749,6 @@ pub(crate) async fn handle_control_command(
                 json,
                 agent,
                 vault_locked,
-                pin_encrypted_keys,
-                vault_file_data,
                 api_client,
                 pending_sync,
                 notification_state,
@@ -1030,99 +841,13 @@ pub(crate) async fn handle_control_command(
                         }
                         Err(e) => {
                             tracing::warn!("PIN unlock from local key cache failed: {}", e);
+                            sshwarden_agent::ControlResponse::err("Invalid PIN")
                         }
                     }
-                }
-
-                // Fall back to legacy in-memory/vault.enc cache.
-                let encrypted = {
-                    let mem = pin_encrypted_keys.read().await.clone();
-                    if mem.is_some() {
-                        mem
-                    } else {
-                        vault_file_data
-                            .read()
-                            .await
-                            .as_ref()
-                            .map(|v| v.pin_encrypted.clone())
-                    }
-                };
-
-                match encrypted {
-                    Some(enc_data) => match sshwarden_api::crypto::pin_decrypt(&enc_data, &pin) {
-                        Ok(keys_json) => {
-                            if local_key_cache_data.read().await.is_none() {
-                                let keys_for_migration: Result<Vec<(String, String, String)>, _> =
-                                    serde_json::from_str(&keys_json);
-                                if let Ok(keys_for_migration) = keys_for_migration {
-                                    match write_envelope_local_key_cache(
-                                    &keys_for_migration,
-                                    &config.auth.email,
-                                    &config.server.base_url,
-                                    &pin,
-                                ) {
-                                    Ok((cache, local_cache_key)) => {
-                                        *local_key_cache_data.write().await = Some(cache);
-                                        local_cache_key_state.write().await.set(local_cache_key);
-                                        *pin_encrypted_keys.write().await = None;
-                                        *vault_file_data.write().await = None;
-                                        if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
-                                            tracing::warn!("Failed to delete legacy vault file after migration: {}", e);
-                                        }
-                                        info!("Migrated legacy vault.enc to envelope local key cache");
-                                    }
-                                    Err(e) => tracing::warn!(
-                                        "Failed to migrate legacy vault.enc to envelope local key cache: {}",
-                                        e
-                                    ),
-                                }
-                                }
-                            }
-                            let resp = finish_unlock_with_json(
-                                &keys_json,
-                                agent,
-                                vault_locked,
-                                cached_key_tuples,
-                                key_names,
-                                "Vault unlocked via PIN",
-                            )
-                            .await;
-
-                            if resp.ok {
-                                // Try to restore API session from device session file
-                                try_restore_api_session(
-                                    api_client,
-                                    config,
-                                    &pin,
-                                    notification_rx,
-                                    notification_client,
-                                    notification_state,
-                                )
-                                .await;
-                                resolve_pending_sync(
-                                    pending_sync,
-                                    api_client,
-                                    cached_key_tuples,
-                                    public_key_identity_tuples,
-                                    local_key_cache_data,
-                                    local_cache_key_state,
-                                    authorization_memory,
-                                    key_material_fingerprints,
-                                    vault_locked,
-                                    agent,
-                                    key_names,
-                                    notification_state,
-                                )
-                                .await;
-                            }
-
-                            resp
-                        }
-                        Err(_) => sshwarden_agent::ControlResponse::err("Invalid PIN"),
-                    },
-                    None => sshwarden_agent::ControlResponse::err(
+                } else {
+                    sshwarden_agent::ControlResponse::err(
                         "No PIN configured. Use 'sshwarden set-pin' first.",
-                    ),
+                    )
                 }
             };
 
@@ -1138,13 +863,8 @@ pub(crate) async fn handle_control_command(
             let password = zeroize::Zeroizing::new(password);
             let was_locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
 
-            // Get email from vault file or config
-            let email = {
-                let vf = vault_file_data.read().await;
-                vf.as_ref()
-                    .map(|v| v.email.clone())
-                    .unwrap_or_else(|| config.auth.email.clone())
-            };
+            // Email from config (used for re-login).
+            let email = config.auth.email.clone();
 
             if email.is_empty() {
                 return sshwarden_agent::ControlResponse::err(
@@ -1320,10 +1040,6 @@ pub(crate) async fn handle_control_command(
                     tracing::warn!("Failed to delete local key cache: {}", e);
                     failures.push(format!("local key cache ({e})"));
                 }
-                if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
-                    tracing::warn!("Failed to delete legacy vault file: {}", e);
-                    failures.push(format!("legacy vault file ({e})"));
-                }
             }
 
             let native_slot = local_key_cache_data
@@ -1364,8 +1080,6 @@ pub(crate) async fn handle_control_command(
 
             if remove_shared_cache {
                 *local_key_cache_data.write().await = None;
-                *vault_file_data.write().await = None;
-                *pin_encrypted_keys.write().await = None;
                 public_key_identity_tuples.write().await.clear();
                 key_names.write().await.clear();
                 let _ = agent.clear_keys();
@@ -1377,13 +1091,6 @@ pub(crate) async fn handle_control_command(
                     .ok()
                     .flatten();
                 *local_key_cache_data.write().await = cache.clone();
-                *vault_file_data.write().await =
-                    sshwarden_config::vault::VaultFile::load().ok().flatten();
-                *pin_encrypted_keys.write().await = vault_file_data
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(|v| v.pin_encrypted.clone());
                 public_key_identity_tuples.write().await.clear();
                 // Clear unconditionally (mirroring the shared-cache branch): if the
                 // shared cache fails to reload below, stale labels from the
@@ -1411,7 +1118,7 @@ pub(crate) async fn handle_control_command(
 
             if failures.is_empty() {
                 let message = if remove_shared_cache {
-                    "Forgot shared local key cache, legacy vault file, and device session material"
+                    "Forgot shared local key cache and device session material"
                 } else {
                     "Forgot this device's session and native unlock material; shared key cache was kept"
                 };
@@ -1453,14 +1160,6 @@ pub(crate) async fn handle_control_command(
                 Ok((cache, local_cache_key)) => {
                     *local_key_cache_data.write().await = Some(cache);
                     local_cache_key_state.write().await.set(local_cache_key);
-                    *pin_encrypted_keys.write().await = None;
-                    *vault_file_data.write().await = None;
-                    if let Err(e) = sshwarden_config::vault::VaultFile::delete() {
-                        tracing::warn!(
-                            "Failed to delete legacy vault file after envelope cache write: {}",
-                            e
-                        );
-                    }
                     info!("Envelope local key cache saved");
 
                     // Save device session with PIN-encrypted refresh token

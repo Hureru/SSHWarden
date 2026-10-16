@@ -3,7 +3,6 @@ pub mod cache;
 pub mod session;
 pub mod ssh_config;
 pub mod unlock_slots;
-pub mod vault;
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;

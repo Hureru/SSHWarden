@@ -282,13 +282,13 @@ fn err_line(msg: impl std::fmt::Display) {
     eprintln!("{msg}");
 }
 
-/// True when a Remembered Device exists on disk (local key cache or legacy vault
-/// file) — the offline equivalent of run_foreground's startup check.
+/// True when a Remembered Device exists on disk (envelope Local Key Cache) —
+/// the offline equivalent of run_foreground's startup check.
 fn has_remembered_device_on_disk() -> bool {
     matches!(
         sshwarden_config::cache::LocalKeyCacheFile::load(),
         Ok(Some(_))
-    ) || matches!(sshwarden_config::vault::VaultFile::load(), Ok(Some(_)))
+    )
 }
 
 /// `startup enable`: refuse unless a Remembered Device exists, then install the

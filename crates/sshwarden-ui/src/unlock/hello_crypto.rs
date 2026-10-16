@@ -4,9 +4,10 @@
 //! Windows Hello–protected signature, then encrypts/decrypts vault data
 //! with that key via AES-256-CBC + HMAC-SHA256 (reusing sshwarden_api crypto).
 //!
-//! The Hello-encrypted ciphertext is stored in vault.enc (not Credential
-//! Manager) to avoid the 2560-byte CredentialBlob size limit and to
-//! keep everything portable.
+//! The Hello-encrypted ciphertext is stored in the local key cache
+//! (`local-key-cache.json`, or the device unlock-slots file in multi-device
+//! mode) rather than in Credential Manager, to avoid the 2560-byte
+//! CredentialBlob size limit and to keep everything portable.
 
 use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};

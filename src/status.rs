@@ -55,7 +55,7 @@ pub(crate) async fn cmd_status(json: bool) -> anyhow::Result<()> {
 
     let agent_running = b("agent_running");
     let locked = b("locked");
-    let has_device = b("has_local_key_cache") || b("has_vault_file");
+    let has_device = b("has_local_key_cache");
     let key_count = n("key_count");
     let signable = n("signable_key_count");
     let stale = details
@@ -290,23 +290,10 @@ pub(crate) async fn cmd_doctor(
             .get("has_local_key_cache")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let has_vault_file = status
-            .get("has_vault_file")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let legacy_migration_available = status
-            .get("legacy_migration_available")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(has_vault_file && !has_local_key_cache);
         if has_local_key_cache {
             checks.push(DoctorCheck::ok(
                 "local_key_cache",
                 "Envelope Local Key Cache is present",
-            ));
-        } else if legacy_migration_available {
-            checks.push(DoctorCheck::warn(
-                "local_key_cache.migration",
-                "Legacy vault.enc is present without envelope Local Key Cache; run `sshwarden unlock --method pin` to migrate",
             ));
         } else {
             checks.push(DoctorCheck::warn(

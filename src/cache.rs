@@ -267,21 +267,14 @@ pub(crate) fn current_hello_challenge_b64() -> Option<String> {
     if multi_device_mode() {
         device_challenge
     } else {
-        device_challenge
-            .or_else(|| {
-                // After set-pin / envelope migration the Hello challenge lives in
-                // the envelope cache (local-key-cache.json), not vault.enc.
-                sshwarden_config::cache::LocalKeyCacheFile::load()
-                    .ok()
-                    .flatten()
-                    .and_then(|cache| cache.local_cache_key.hello_challenge)
-            })
-            .or_else(|| {
-                sshwarden_config::vault::VaultFile::load()
-                    .ok()
-                    .flatten()
-                    .and_then(|vault| vault.hello_challenge)
-            })
+        device_challenge.or_else(|| {
+            // The Hello challenge lives in the envelope cache
+            // (local-key-cache.json).
+            sshwarden_config::cache::LocalKeyCacheFile::load()
+                .ok()
+                .flatten()
+                .and_then(|cache| cache.local_cache_key.hello_challenge)
+        })
     }
 }
 

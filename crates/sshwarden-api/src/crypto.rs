@@ -257,8 +257,9 @@ pub fn encrypt_enc_string(data: &[u8], key: &SymmetricKey) -> anyhow::Result<Str
 
 /// The fixed legacy salt used before per-cache random salts (SEC-04).
 ///
-/// Retained so pre-v3 local caches and the legacy `vault.enc` (both encrypted
-/// with this salt) stay decryptable; new material uses `random_pin_salt()`.
+/// Retained so pre-v3 local caches and PIN-encrypted device session tokens
+/// (both encrypted with this salt) stay decryptable; new material uses
+/// `random_pin_salt()`.
 pub fn legacy_pin_salt() -> [u8; 32] {
     use sha2::Digest;
     let digest = Sha256::digest(b"sshwarden-pin-key-derivation");
@@ -296,8 +297,9 @@ pub fn derive_pin_key_with_salt(pin: &str, salt: &[u8]) -> anyhow::Result<Symmet
 
 /// Derive a SymmetricKey from a PIN using the fixed legacy salt.
 ///
-/// Backward-compatibility shim for the legacy `vault.enc` and pre-v3 caches.
-/// New code should use `derive_pin_key_with_salt` with a random salt.
+/// Backward-compatibility shim for pre-v3 caches and pin-encrypted device
+/// session tokens. New code should use `derive_pin_key_with_salt` with a random
+/// salt.
 pub fn derive_pin_key(pin: &str) -> anyhow::Result<SymmetricKey> {
     derive_pin_key_with_salt(pin, &legacy_pin_salt())
 }
@@ -446,7 +448,7 @@ mod tests {
         assert!(pin_decrypt_with_salt(&enc, pin, &other).is_err());
 
         // The legacy wrappers are equivalent to using the legacy salt explicitly,
-        // so existing vault.enc / pre-v3 caches stay decryptable.
+        // so pre-v3 caches and device session tokens stay decryptable.
         let legacy = pin_encrypt(data, pin).unwrap();
         assert_eq!(
             pin_decrypt_with_salt(&legacy, pin, &legacy_pin_salt()).unwrap(),

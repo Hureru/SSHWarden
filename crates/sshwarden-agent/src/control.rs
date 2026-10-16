@@ -235,10 +235,10 @@ pub enum ControlAction {
         pin: String,
     },
     Forget {
-        /// In multi-device storage mode, also remove shared remembered-secret
-        /// cache files (`local-key-cache.json` and legacy `vault.enc`). Plain
-        /// `forget` is device-only there; on legacy storage this flag is
-        /// effectively always true for backwards compatibility.
+        /// In multi-device storage mode, also remove the shared remembered-secret
+        /// cache file (`local-key-cache.json`). Plain `forget` is device-only
+        /// there; on legacy storage this flag is effectively always true for
+        /// backwards compatibility.
         shared: bool,
     },
     /// Cleanly shut down the daemon: cancel the main loop, stop the agent and

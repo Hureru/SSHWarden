@@ -36,45 +36,8 @@ pub(crate) fn try_hello_encrypt(plaintext: &str, challenge: &[u8; 16]) -> anyhow
     sshwarden_ui::unlock::hello_crypto::hello_encrypt_keys(plaintext, challenge)
 }
 
-/// Read PIN-encrypted data from in-memory cache or vault file.
-pub(crate) async fn get_pin_encrypted_data(
-    pin_encrypted_keys: &Arc<RwLock<Option<String>>>,
-    vault_file_data: &Arc<RwLock<Option<sshwarden_config::vault::VaultFile>>>,
-) -> Option<String> {
-    {
-        let mem = pin_encrypted_keys.read().await;
-        if let Some(ref s) = *mem {
-            return Some(s.clone());
-        }
-    }
-    let vf = vault_file_data.read().await;
-    vf.as_ref().map(|v| v.pin_encrypted.clone())
-}
-
 pub(crate) type PinValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub(crate) type DecryptedCache = Arc<std::sync::Mutex<Option<String>>>;
-
-/// Create a PIN validator closure and a shared cache for the decrypted result.
-///
-/// The validator performs Argon2id-based decryption, caching the result on success
-/// so the caller can retrieve the decrypted keys without re-running the KDF.
-pub(crate) fn make_pin_validator(enc_data: String) -> (PinValidator, DecryptedCache) {
-    let decrypted_cache: Arc<std::sync::Mutex<Option<String>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let cache_clone = decrypted_cache.clone();
-
-    let validator: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(move |pin: &str| -> bool {
-        match sshwarden_api::crypto::pin_decrypt(&enc_data, pin) {
-            Ok(keys_json) => {
-                *cache_clone.lock().unwrap_or_else(|e| e.into_inner()) = Some(keys_json);
-                true
-            }
-            Err(_) => false,
-        }
-    });
-
-    (validator, decrypted_cache)
-}
 
 /// Wrap a PIN validator so every attempt shares the daemon-wide brute-force
 /// accounting (SEC-03) with `ControlAction::UnlockPin`: reject outright while a
