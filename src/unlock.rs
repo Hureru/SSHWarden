@@ -18,9 +18,9 @@ use crate::cache::{
     decrypt_envelope_local_key_cache_with_pin, decrypt_envelope_payload, multi_device_mode,
     reload_shared_local_cache_from_disk_if_multi_device,
 };
+use crate::control::{pin_lockout_remaining, record_pin_attempt, PinFailureHandle};
 use crate::notifications::connect_notification_client;
 use crate::runtime::{CachedKeyTuples, LocalCacheKeyHandle, NotificationRuntimeState, UIRequestTx};
-use crate::{pin_lockout_remaining, record_pin_attempt, PinFailureHandle};
 /// Try to unlock using Windows Hello sign-path.
 /// Must be called from spawn_blocking.
 #[cfg(windows)]
