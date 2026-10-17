@@ -83,7 +83,9 @@ unwrap_used = "warn"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = true
+# Keep the symbol table so an incident stack trace (eu-stack/gdb on a shipped
+# binary) resolves to function names; full DWARF is still dropped.
+strip = "debuginfo"
 # `panic = "abort"` drops the unwinding tables and lets LTO remove more code.
 # Mutex poisoning is still handled without unwinding: every `.lock()` site
 # recovers via `unwrap_or_else(|e| e.into_inner())` rather than panicking.

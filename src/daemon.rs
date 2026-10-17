@@ -311,27 +311,39 @@ pub(crate) async fn run_foreground(
                     info!("Received stop command, shutting down...");
                     break;
                 }
-                let response = handle_control_command(
-                    ctrl_req.action,
-                    &mut agent,
-                    &vault_locked,
-                    &cached_key_tuples,
-                    &public_key_identity_tuples,
-                    &api_client,
-                    &local_key_cache_data,
-                    &local_cache_key_state,
-                    &key_material_fingerprints,
-                    &key_names,
-                    &config,
-                    auto_unlock,
-                    &ui_request_tx,
-                    &mut notification_rx,
-                    &mut _notification_client,
-                    &pending_sync,
-                    &notification_state,
-                    &authorization_memory,
-                    &pin_failures,
-                ).await;
+                // Watchdog: control actions run serially here, so an action that
+                // never returns (a lock wait, a network call without a timeout)
+                // would otherwise wedge every later command — including `stop` —
+                // until the process is killed. Bound it and report the timeout
+                // instead; dropping the future releases whatever it held.
+                let budget = control_action_timeout(&ctrl_req.action);
+                let label = control_action_label(&ctrl_req.action);
+                let response = run_control_action(
+                    label,
+                    budget,
+                    handle_control_command(
+                        ctrl_req.action,
+                        &mut agent,
+                        &vault_locked,
+                        &cached_key_tuples,
+                        &public_key_identity_tuples,
+                        &api_client,
+                        &local_key_cache_data,
+                        &local_cache_key_state,
+                        &key_material_fingerprints,
+                        &key_names,
+                        &config,
+                        auto_unlock,
+                        &ui_request_tx,
+                        &mut notification_rx,
+                        &mut _notification_client,
+                        &pending_sync,
+                        &notification_state,
+                        &authorization_memory,
+                        &pin_failures,
+                    ),
+                )
+                .await;
                 let _ = ctrl_req.reply.send(response);
             }
             // UI requests from SSH agent
@@ -574,4 +586,180 @@ pub(crate) async fn run_foreground(
     agent.stop();
     info!("SSHWarden stopped.");
     Ok(())
+}
+
+/// Time budget for a control action that does not wait on the user.
+///
+/// Generous compared to a healthy run (the slowest normal action is `login`,
+/// whose KDF plus sync takes seconds) so it only fires on a genuine stall.
+const CONTROL_ACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Time budget for a control action that legitimately waits for the user.
+///
+/// Windows Hello, macOS Keychain, and Linux Secret Service user-presence
+/// prompts, and the host-binding dialog, stay open until the user answers —
+/// bounded anyway so a walked-away prompt cannot wedge the control channel
+/// forever.
+const CONTROL_ACTION_USER_PROMPT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+
+/// Run one control action under its watchdog budget, turning a stall into an
+/// error reply instead of a wedged control channel.
+///
+/// Dropping the timed-out future releases any lock guard it held, which is what
+/// lets the loop serve the next command (`stop`, `status`, ...) again.
+async fn run_control_action<F>(
+    label: &'static str,
+    budget: std::time::Duration,
+    action: F,
+) -> sshwarden_agent::ControlResponse
+where
+    F: std::future::Future<Output = sshwarden_agent::ControlResponse>,
+{
+    match tokio::time::timeout(budget, action).await {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::warn!(
+                action = label,
+                budget_secs = budget.as_secs(),
+                "Control action exceeded its time budget and was aborted so the control channel stays responsive"
+            );
+            sshwarden_agent::ControlResponse::err(&format!(
+                "Control action '{label}' timed out after {}s and was aborted; the agent is still running. Check the daemon log for what it was doing.",
+                budget.as_secs()
+            ))
+        }
+    }
+}
+
+/// Per-action watchdog budget, see [`CONTROL_ACTION_TIMEOUT`].
+fn control_action_timeout(action: &sshwarden_agent::ControlAction) -> std::time::Duration {
+    use sshwarden_agent::ControlAction;
+    match action {
+        // These prompt for user presence or wait on a dialog.
+        ControlAction::Unlock
+        | ControlAction::UnlockHello
+        | ControlAction::UnlockNative
+        | ControlAction::BindHostsDialog => CONTROL_ACTION_USER_PROMPT_TIMEOUT,
+        _ => CONTROL_ACTION_TIMEOUT,
+    }
+}
+
+/// Stable, secret-free label for logging and error messages.
+///
+/// Never derive this from `Debug`: the PIN/password variants hold credentials.
+fn control_action_label(action: &sshwarden_agent::ControlAction) -> &'static str {
+    use sshwarden_agent::ControlAction;
+    match action {
+        ControlAction::Lock => "lock",
+        ControlAction::Unlock => "unlock",
+        ControlAction::UnlockPin { .. } => "unlock-pin",
+        ControlAction::UnlockHello => "unlock-hello",
+        ControlAction::UnlockNative => "unlock-native",
+        ControlAction::UnlockPassword { .. } => "unlock-password",
+        ControlAction::Status { .. } => "status",
+        ControlAction::Sync => "sync",
+        ControlAction::SetPin { .. } => "set-pin",
+        ControlAction::Forget { .. } => "forget",
+        ControlAction::Stop => "stop",
+        ControlAction::BindHostsDialog => "bind-hosts-dialog",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use sshwarden_agent::ControlAction;
+
+    #[test]
+    fn user_prompt_actions_get_the_long_budget() {
+        for action in [
+            ControlAction::Unlock,
+            ControlAction::UnlockHello,
+            ControlAction::UnlockNative,
+            ControlAction::BindHostsDialog,
+        ] {
+            assert_eq!(
+                control_action_timeout(&action),
+                CONTROL_ACTION_USER_PROMPT_TIMEOUT,
+                "{} should use the user-prompt budget",
+                control_action_label(&action)
+            );
+        }
+
+        for action in [
+            ControlAction::Status { json: true },
+            ControlAction::Sync,
+            ControlAction::Lock,
+            ControlAction::Forget { shared: false },
+            ControlAction::Stop,
+        ] {
+            assert_eq!(
+                control_action_timeout(&action),
+                CONTROL_ACTION_TIMEOUT,
+                "{} should use the short budget",
+                control_action_label(&action)
+            );
+        }
+    }
+
+    #[test]
+    fn labels_are_stable_and_secret_free() {
+        // `ControlAction` deliberately does not implement `Debug` (the PIN and
+        // password variants hold credentials), so logs and error messages must go
+        // through this helper; pin the strings so a rename cannot silently change
+        // user-visible diagnostics.
+        let pin = "1234".to_string();
+        let password = "hunter2".to_string();
+
+        assert_eq!(
+            control_action_label(&ControlAction::UnlockPin { pin: pin.clone() }),
+            "unlock-pin"
+        );
+        assert_eq!(
+            control_action_label(&ControlAction::SetPin { pin }),
+            "set-pin"
+        );
+        assert_eq!(
+            control_action_label(&ControlAction::UnlockPassword { password }),
+            "unlock-password"
+        );
+        assert_eq!(
+            control_action_label(&ControlAction::Status { json: false }),
+            "status"
+        );
+        assert_eq!(
+            control_action_label(&ControlAction::Forget { shared: true }),
+            "forget"
+        );
+    }
+
+    #[tokio::test]
+    async fn stuck_control_action_is_aborted_and_reported() {
+        let stuck = run_control_action(
+            "sync",
+            std::time::Duration::from_millis(50),
+            std::future::pending(),
+        )
+        .await;
+
+        assert!(!stuck.ok, "a stalled action must not report success");
+        let error = stuck.error.unwrap_or_default();
+        assert!(
+            error.contains("timed out"),
+            "timeout should be reported to the caller, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_control_action_passes_through_unchanged() {
+        let response = run_control_action("status", std::time::Duration::from_secs(30), async {
+            sshwarden_agent::ControlResponse::ok("all good")
+        })
+        .await;
+
+        assert!(response.ok);
+        assert_eq!(response.message.as_deref(), Some("all good"));
+    }
 }

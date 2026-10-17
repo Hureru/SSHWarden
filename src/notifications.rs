@@ -9,6 +9,12 @@ use tracing::info;
 
 use crate::runtime::{NotificationConnectionState, NotificationRuntimeState};
 
+/// Time budget for the `/api/config` notification-URL discovery request.
+const NOTIFICATION_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Time budget for establishing the notification-hub connection.
+const NOTIFICATION_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub(crate) fn notification_options(
     config: &sshwarden_config::Config,
 ) -> sshwarden_api::NotificationOptions {
@@ -48,14 +54,20 @@ pub(crate) async fn connect_notification_client(
         state.last_error = None;
     }
     info!("Attempting to connect to notification hub: {}", notif_url);
-    match sshwarden_api::NotificationClient::connect_with_options(
-        &notif_url,
-        access_token,
-        notification_options(config),
+    // Bounded: this runs inside a control action (and after unlock), so a hub
+    // that accepts the connection but never completes the handshake must not
+    // hold the caller forever.
+    let connect_result = tokio::time::timeout(
+        NOTIFICATION_CONNECT_TIMEOUT,
+        sshwarden_api::NotificationClient::connect_with_options(
+            &notif_url,
+            access_token,
+            notification_options(config),
+        ),
     )
-    .await
-    {
-        Ok((notif_client, rx)) => {
+    .await;
+    match connect_result {
+        Ok(Ok((notif_client, rx))) => {
             *notification_rx = Some(rx);
             *notification_client = Some(notif_client);
             let mut state = notification_state.write().await;
@@ -64,12 +76,23 @@ pub(crate) async fn connect_notification_client(
             state.last_connected_at = Some(std::time::Instant::now());
             state.last_error = None;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!("Failed to start notification client: {}", e);
             let mut state = notification_state.write().await;
             state.state = NotificationConnectionState::Failed;
             state.reconnect_attempts = state.reconnect_attempts.saturating_add(1);
             state.last_error = Some(e.to_string());
+        }
+        Err(_) => {
+            let error = format!(
+                "connecting to the notification hub timed out after {}s",
+                NOTIFICATION_CONNECT_TIMEOUT.as_secs()
+            );
+            tracing::warn!("Failed to start notification client: {}", error);
+            let mut state = notification_state.write().await;
+            state.state = NotificationConnectionState::Failed;
+            state.reconnect_attempts = state.reconnect_attempts.saturating_add(1);
+            state.last_error = Some(error);
         }
     }
 }
@@ -83,10 +106,22 @@ pub(crate) async fn resolve_notifications_url(
     }
 
     if let Some(client) = api_client {
-        match client.discover_notifications_url().await {
-            Ok(Some(url)) => return url,
-            Ok(None) => tracing::debug!("Server config discovery omitted notifications URL"),
-            Err(e) => tracing::debug!("Server config discovery failed: {}", e),
+        // Bounded: this runs before the hub connection and inside control
+        // actions, so an unresponsive `/api/config` must fall back to the
+        // built-in URL rules instead of stalling the caller.
+        match tokio::time::timeout(
+            NOTIFICATION_DISCOVERY_TIMEOUT,
+            client.discover_notifications_url(),
+        )
+        .await
+        {
+            Ok(Ok(Some(url))) => return url,
+            Ok(Ok(None)) => tracing::debug!("Server config discovery omitted notifications URL"),
+            Ok(Err(e)) => tracing::debug!("Server config discovery failed: {}", e),
+            Err(_) => tracing::debug!(
+                "Server config discovery timed out after {}s",
+                NOTIFICATION_DISCOVERY_TIMEOUT.as_secs()
+            ),
         }
     }
 
