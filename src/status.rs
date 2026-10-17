@@ -19,10 +19,18 @@ pub(crate) async fn cmd_status(json: bool) -> anyhow::Result<()> {
         Ok(r) => r.details.unwrap_or_else(|| serde_json::json!({})),
         Err(_) => {
             // Agent unreachable: render an offline view.
+            let local_state_dir = sshwarden_config::local_state_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unresolved>".to_string());
+            let log_path = crate::process::log_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unresolved>".to_string());
             if json {
                 out_line(serde_json::to_string_pretty(&serde_json::json!({
                     "agent_running": false,
                     "has_remembered_device": has_remembered_device_on_disk(),
+                    "local_state_dir": local_state_dir,
+                    "log_path": log_path,
                 }))?);
                 return Ok(());
             }
@@ -35,6 +43,9 @@ pub(crate) async fn cmd_status(json: bool) -> anyhow::Result<()> {
                     "not set up"
                 }
             ));
+            // Machine-local state never sits in the (possibly cloud-synced) data
+            // dir, so point users at the real log location.
+            out_line(format!("Log:       {log_path}"));
             out_line("");
             if has_remembered_device_on_disk() {
                 out_line("Next:      sshwarden run        (start the agent, then `unlock`)");
@@ -176,6 +187,15 @@ pub(crate) fn count_key_selector_files() -> anyhow::Result<(std::path::PathBuf, 
         0
     };
     Ok((dir, count))
+}
+
+/// Join paths into a single comma-separated, human-readable list.
+fn describe_paths(paths: &[std::path::PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub(crate) async fn cmd_doctor(
@@ -359,6 +379,65 @@ pub(crate) async fn cmd_doctor(
                 format!("Notification client state is {other}"),
             )),
         }
+    }
+
+    // Machine-local runtime state (PID file, log, sockets) is deliberately kept
+    // out of the shared data dir: that dir may be cloud-synced, where PID/log
+    // churn is pure noise and a foreign PID can confuse the liveness check.
+    // Report the real paths (users look for sshwarden.log beside the exe) and any
+    // leftovers from the pre-migration layout under the shared root.
+    match crate::process::local_state_dir() {
+        Ok(dir) => {
+            let log = crate::process::log_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let legacy_remaining = || {
+                crate::process::legacy_pid_file_paths()
+                    .into_iter()
+                    .chain(crate::process::legacy_log_file_paths())
+                    .filter(|path| path.exists())
+                    .collect::<Vec<_>>()
+            };
+            let legacy = legacy_remaining();
+            let base = format!(
+                "PID/log/socket state lives in {} (log: {}); machine-local, never cloud-synced",
+                dir.display(),
+                log
+            );
+            if legacy.is_empty() {
+                checks.push(DoctorCheck::ok("runtime_state", base));
+            } else if fix {
+                crate::process::cleanup_legacy_runtime_files();
+                crate::process::migrate_legacy_log();
+                let still_there = legacy_remaining();
+                if still_there.is_empty() {
+                    checks.push(DoctorCheck::ok(
+                        "runtime_state",
+                        format!("{base}; removed legacy runtime file(s) from the shared data dir"),
+                    ));
+                } else {
+                    checks.push(DoctorCheck::warn(
+                        "runtime_state",
+                        format!(
+                            "{base}; legacy runtime file(s) could not be cleaned up: {}",
+                            describe_paths(&still_there)
+                        ),
+                    ));
+                }
+            } else {
+                checks.push(DoctorCheck::warn(
+                    "runtime_state",
+                    format!(
+                        "{base}; legacy runtime file(s) are still in the shared data dir: {} — run `sshwarden doctor --fix` to move/remove them",
+                        describe_paths(&legacy)
+                    ),
+                ));
+            }
+        }
+        Err(e) => checks.push(DoctorCheck::warn(
+            "runtime_state",
+            format!("Could not determine the machine-local state directory: {e}"),
+        )),
     }
 
     match count_key_selector_files() {

@@ -308,6 +308,15 @@ pub(crate) async fn build_status_response(
     let device_data_dir = sshwarden_config::device_data_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unresolved>".to_string());
+    // P1-3 / multi-device: PID/log/socket state is machine-local and deliberately
+    // lives outside the (possibly cloud-synced) shared data root, so surface it
+    // too — users look for sshwarden.log next to the executable.
+    let local_state_dir = sshwarden_config::local_state_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unresolved>".to_string());
+    let log_path = crate::process::log_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unresolved>".to_string());
     let device_id =
         sshwarden_config::current_device_id().unwrap_or_else(|_| "<unresolved>".to_string());
     let multi_device = sshwarden_config::multi_device_enabled().unwrap_or(false);
@@ -330,6 +339,8 @@ pub(crate) async fn build_status_response(
         "data_dir": device_data_dir,
         "shared_data_dir": shared_data_dir,
         "device_data_dir": device_data_dir,
+        "local_state_dir": local_state_dir,
+        "log_path": log_path,
         "device_id": device_id,
         "multi_device": multi_device,
         "ssh_config_path_style": ssh_config_path_style,
