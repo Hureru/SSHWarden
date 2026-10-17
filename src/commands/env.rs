@@ -9,7 +9,7 @@ pub(crate) fn cmd_env(config: &sshwarden_config::Config, shell: &str) -> anyhow:
     // third-party clients that honour SSH_AUTH_SOCK. Note goes to stderr so it
     // doesn't break `eval`.
     #[cfg(windows)]
-    err_line(
+    crate::err_line(
         r"# Note: Windows OpenSSH talks to the fixed pipe \\.\pipe\openssh-ssh-agent and ignores SSH_AUTH_SOCK; these exports only matter for a custom [socket] endpoint or clients that honour SSH_AUTH_SOCK.",
     );
 
