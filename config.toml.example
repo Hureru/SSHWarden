@@ -131,9 +131,9 @@ portable = false
 
 # 多设备共享模式（适合把 SSHWarden 放在 OneDrive/Dropbox 等同步目录中）：
 #   - 共享：config.toml、local-key-cache.json、bindings.json、keys/、sshwarden_config
-#   - 每设备独立：session、pid、log、runtime socket、Windows Hello/native unlock slot
+#   - 每设备独立：session、Windows Hello/native unlock slot
 # 这样两台机器可以共享同一份 Bitwarden SSH key 本地投影和 Host 绑定，
-# 但不会互相覆盖运行态文件。
+# 但不会互相覆盖上述设备文件。
 # 重要：multi_device 本身不改变数据根目录的位置，只在已有数据目录下拆分
 # 共享/设备文件。要让数据真正落在同步目录，仍需用 portable=true（配合
 # portable_dir）或 SSHWARDEN_HOME / SSHWARDEN_PORTABLE 把数据根指向该
@@ -142,6 +142,29 @@ portable = false
 # C:\Users\zheng 与 C:\Users\Administrator 这样的用户名差异写入绝对路径。
 multi_device = false
 # device_id = "auto"          # 默认 auto；也可用 SSHWARDEN_DEVICE_ID 覆盖
+
+# 运行态文件（PID、日志、Unix socket）的位置。这类文件是**机器本地**的，
+# 永远不放在共享/同步目录里，否则云同步会持续上传它们，另一台机器还可能
+# 把同步过来的 PID 误判成本机进程。
+# 默认（留空）：
+#   Windows: %LOCALAPPDATA%\SSHWarden\<实例名>  （LOCALAPPDATA 不参与 OneDrive 同步）
+#   Linux:   $XDG_STATE_HOME/sshwarden/<实例名>  （默认 ~/.local/state/sshwarden/<实例名>）
+#   macOS:   ~/Library/Application Support/SSHWarden/<实例名>
+# 其中 <实例名> = multi_device=true 时的 device_id，否则为数据根目录名
+# （例如数据根 .../OneDrive/Program/SSHWarden → 实例名 SSHWarden）。
+# 也可用 SSHWARDEN_LOCAL_HOME 环境变量强制覆盖（优先级最高）。
+# 注意：显式设置本项时按原样使用，不再追加实例名；同一机器上多个安装
+# 需各自指定不同目录。
+# local_dir = "~/.local/state/sshwarden-manual"
+
+# ============================================
+# 日志配置
+# ============================================
+[logging]
+# 守护进程日志（sshwarden.log）的大小上限，超过后轮转为单个 sshwarden.log.1
+# 备份文件。0 表示不轮转。可用 SSHWARDEN_LOG_MAX_BYTES 环境变量覆盖。
+# 默认: 5242880（5 MiB）
+max_file_bytes = 5242880
 
 # ============================================
 # SSH config / Host binding 生成配置

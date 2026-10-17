@@ -46,12 +46,16 @@ shared_data_dir/
 shared_data_dir/devices/<device-id>/
   session-<hostname>.enc
   unlock-slots.json
-  sshwarden.pid
-  sshwarden.log
-  run/
 ```
 
 `config_dir()` remains the shared data directory for backward-compatible callers that manage Bitwarden projection files. New runtime/session callers use `device_data_dir()`.
+
+> **Updated by ADR 0025 (2026-10-17):** `sshwarden.pid`, `sshwarden.log`, and the
+> runtime socket directory no longer live under `devices/<device-id>/`; they moved
+> to a machine-local state directory (`local_state_dir()`) outside the shared
+> tree entirely, because a cloud-synced root must not carry per-machine runtime
+> state. `devices/<device-id>/` now holds only the device session file and
+> `unlock-slots.json`.
 
 Shared files:
 
@@ -64,10 +68,8 @@ Shared files:
 Device-local files:
 
 - Bitwarden device session file
-- `sshwarden.pid`
-- `sshwarden.log`
-- runtime socket directory
 - `unlock-slots.json` containing Windows Hello / native unlock material for the current device
+- `sshwarden.pid`, `sshwarden.log`, and the runtime socket directory — moved out of the shared tree by ADR 0025; they now live in the machine-local state directory (`local_state_dir()`), not under `devices/<device-id>/`
 
 Platform-native unlock slots are not stored in the shared local key cache in multi-device mode. A startup migration copies older shared Hello/native slots into the current device's `unlock-slots.json`; future cache refreshes strip platform slots from the shared cache.
 

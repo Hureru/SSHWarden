@@ -76,6 +76,10 @@ _Avoid_: portable mode, executable directory
 An explicit user choice to keep SSHWarden's user data together with the application files.
 _Avoid_: default storage, standard installation
 
+**Machine-Local State**:
+The PID file, log file, and runtime socket directory belonging to this machine only, kept outside the shared (possibly cloud-synced) data directory because they mean nothing anywhere else.
+_Avoid_: shared data directory, synced runtime state, portable data
+
 **Agent Takeover**:
 A user's explicit choice for SSHWarden to become the SSH agent used by SSH client applications in a shell or desktop session.
 _Avoid_: agent chaining, transparent proxying, fallback agent
@@ -295,6 +299,7 @@ _Avoid_: login method, authentication method
 - "Linux native unlock" means Secret Service-compatible secret storage by default, not Polkit as the primary storage mechanism.
 - "baseline" means **Baseline Experience**, not reduced or experimental platform support.
 - "portable" means **Portable Mode**, an explicit storage choice; it is not the default cross-platform installation model.
+- "machine-local state" means the PID file, log file, and runtime socket directory for this machine only; it never lives in the shared (possibly cloud-synced) data directory, while shared Bitwarden projection files are unaffected.
 - "agent endpoint" means the SSH agent protocol endpoint, not the control IPC endpoint.
 - "Unix agent endpoint" means a per-user runtime socket by default, not a dotfile socket in the home directory.
 - "environment export" defaults to POSIX shell syntax and may support additional shell syntaxes.

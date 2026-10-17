@@ -26,6 +26,7 @@ SSHWarden 的目标不是复刻完整 Bitwarden Desktop，而是提供一个专�
 | IPC 控制命令 | 已实现；Windows Named Pipe 与 Unix socket 均含调用方鉴权 |
 | Local Key Cache | 已实现信封加密模型（格式 v3，PIN 随机盐） |
 | 标准平台存储目录 | 已实现，默认平台标准目录（`%APPDATA%`/`$XDG_CONFIG_HOME`/`~/Library/Application Support`）；便携模式可选 |
+| 运行态文件位置 | 已实现：PID/日志/socket 属于机器本地状态，落在平台本地目录（`%LOCALAPPDATA%`/`$XDG_STATE_HOME`/`~/Library/Application Support`），不进 OneDrive 等同步目录；日志默认 5 MiB 轮转（见 ADR 0025） |
 | 自启动 | `startup enable`/`disable`；Windows/Linux/macOS 均已实现（Linux/macOS 待实机验证） |
 | Shell integration | `sshwarden env` 已实现（sh/fish/powershell/cmd） |
 | macOS native unlock | 已实现（Phase 6，Keychain；仍需平台实机验证） |
