@@ -162,13 +162,30 @@ fn main() -> anyhow::Result<()> {
             })
         });
 
-        // Main thread: run Slint event loop and handle UI requests
-        run_slint_event_loop(ui_request_rx);
+        // Main thread: run Slint event loop and handle UI requests.
+        //
+        // The agent thread owns the process lifetime, so a watcher quits the Slint
+        // loop as soon as it finishes (stop, singleton yield, or error). Waiting
+        // for the request channel to close instead is not enough: senders are
+        // held outside the agent future (including the `Arc` created above), so
+        // the close signal never arrives and the process lingers after `stop`.
+        // `quit_event_loop` posts a queued event, so it is safe even if the loop
+        // has not started yet.
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let agent_watcher = std::thread::spawn(move || {
+            let result = tokio_handle.join();
+            let _ = slint::quit_event_loop();
+            let _ = result_tx.send(result);
+        });
 
-        // Wait for tokio thread to finish
-        match tokio_handle.join() {
-            Ok(result) => result,
-            Err(_) => anyhow::bail!("Tokio runtime thread panicked"),
+        run_slint_event_loop(ui_request_rx);
+        let _ = agent_watcher.join();
+
+        // Surface the agent thread's outcome as this process's result.
+        match result_rx.recv() {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => anyhow::bail!("Tokio runtime thread panicked"),
+            Err(_) => anyhow::bail!("Agent thread ended without reporting a result"),
         }
     } else {
         // Non-UI commands: use a simple tokio runtime

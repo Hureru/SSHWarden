@@ -65,13 +65,3 @@ This roadmap tracks implementation work needed to align the codebase with the cu
   Slint winit backend; see `docs/linux-dialog-size-investigation.md` and the
   repro at `crates/sshwarden-ui/examples/repro_linux_dialog.rs`. Not fixed
   upstream as of Slint 1.15; candidate fixes are noted in that document.
-- **`stop` tears the agent down but the process stays alive.** After
-  `sshwarden stop` the PID file is removed, the sockets are closed, and the log
-  reports "Agent stopped", yet the process keeps running: the main thread sits in
-  `slint::run_event_loop_until_quit()` and the borrowed `Arc<Sender>` held by
-  `main` keeps the UI channel open, so the "channel closed" quit never fires.
-  Confirmed on builds predating the machine-local-state change (ADR 0025), so it
-  is not a regression from it; the lingering process serves nothing, but repeated
-  stop/start cycles accumulate one. Candidate fixes: drop the outer
-  `ui_request_tx` before entering the event loop, or signal shutdown through the
-  UI channel and call `slint::quit_event_loop()`.
