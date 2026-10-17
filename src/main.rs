@@ -35,7 +35,8 @@ use daemon::run_foreground;
 #[cfg(windows)]
 use process::detach_console;
 use process::{
-    claim_pid_file, cmd_daemon_install, cmd_daemon_uninstall, log_file_path, remove_pid_file,
+    claim_pid_file, cmd_daemon_install, cmd_daemon_uninstall, ensure_local_state_dir,
+    log_file_path, migrate_legacy_log, remove_pid_file, LogMigration,
 };
 use ssh_target::{parse_ssh_target, SSH_VALUE_TAKING_FLAGS};
 use status::{cmd_doctor, cmd_status};
@@ -56,6 +57,10 @@ fn main() -> anyhow::Result<()> {
     let is_daemon = matches!(cli.command, Some(Commands::Run { background: true }));
 
     if is_daemon {
+        // PID/log/sockets live in the machine-local state directory, never in the
+        // (possibly cloud-synced) shared data root.
+        ensure_local_state_dir()?;
+        let log_migration = migrate_legacy_log();
         let log_path = log_file_path()?;
         let log_file = std::fs::OpenOptions::new()
             .create(true)
@@ -71,6 +76,22 @@ fn main() -> anyhow::Result<()> {
             .with_writer(std::sync::Mutex::new(log_file))
             .with_ansi(false)
             .init();
+
+        // Reported only now: log setup necessarily runs before the subscriber
+        // exists, so the migration itself cannot log.
+        match log_migration {
+            LogMigration::NotNeeded => {}
+            LogMigration::Moved { from } => info!(
+                "Moved legacy log {} -> {}",
+                from.display(),
+                log_path.display()
+            ),
+            LogMigration::LeftInPlace { from } => tracing::warn!(
+                "Could not move legacy log {} to {}; it was left in place and a fresh log started",
+                from.display(),
+                log_path.display()
+            ),
+        }
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(

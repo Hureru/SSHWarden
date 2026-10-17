@@ -650,14 +650,13 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
     Ok(shared_data_dir()?.join("config.toml"))
 }
 
+/// Runtime directory for unix sockets and other ephemeral endpoints.
+///
+/// Kept separate from the shared data root: sockets must be device-local and,
+/// on Linux/macOS, short-pathed (the unix socket `sun_path` limit is 104 bytes).
 pub fn runtime_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = env_path("SSHWARDEN_RUNTIME_DIR") {
         return Ok(dir);
-    }
-
-    #[cfg(windows)]
-    {
-        Ok(device_data_dir()?.join("run"))
     }
 
     #[cfg(target_os = "linux")]
@@ -665,18 +664,17 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
         if let Some(dir) = env_path("XDG_RUNTIME_DIR") {
             return Ok(dir.join("sshwarden"));
         }
-        Ok(device_data_dir()?.join("run"))
     }
 
     #[cfg(target_os = "macos")]
     {
-        Ok(device_data_dir()?.join("run"))
+        // `$TMPDIR` is a per-user, short, already-ephemeral runtime directory.
+        if let Some(dir) = env_path("TMPDIR") {
+            return Ok(dir.join("sshwarden"));
+        }
     }
 
-    #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
-    {
-        Ok(device_data_dir()?.join("run"))
-    }
+    Ok(local_state_dir()?.join("run"))
 }
 
 pub fn default_agent_socket_path() -> anyhow::Result<PathBuf> {

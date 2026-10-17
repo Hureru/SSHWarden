@@ -7,12 +7,29 @@ use anyhow::Context;
 use tracing::info;
 
 /// Resolve the running agent's PID from the PID file, if a live owner exists.
+///
+/// The machine-local PID file is authoritative. During an upgrade from a build
+/// that still wrote the PID under the shared data root, the legacy locations are
+/// checked read-only so a new CLI cannot start a second daemon beside one that
+/// is still running the old layout.
 pub(crate) fn running_agent_pid() -> Option<u32> {
-    let path = pid_file_path().ok()?;
-    if !pid_file_owner_alive(&path) {
-        return None;
+    let mut candidates = Vec::new();
+    if let Ok(path) = pid_file_path() {
+        candidates.push(path);
     }
-    std::fs::read_to_string(&path).ok()?.trim().parse().ok()
+    candidates.extend(legacy_pid_file_paths());
+    for path in candidates {
+        if !pid_file_owner_alive(&path) {
+            continue;
+        }
+        if let Some(pid) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            return Some(pid);
+        }
+    }
+    None
 }
 
 /// Spawn a detached background agent process (`<exe> run --background`).
@@ -33,19 +50,149 @@ pub(crate) fn spawn_background_agent(exe: &std::path::Path) -> anyhow::Result<()
     Ok(())
 }
 
-/// Get the runtime data directory for SSHWarden (same as exe directory for portability).
-pub(crate) fn data_dir() -> anyhow::Result<std::path::PathBuf> {
-    sshwarden_config::device_data_dir()
+/// Get the machine-local runtime state directory (PID file, log file, sockets).
+///
+/// This is deliberately *not* the shared data directory: the shared root may be
+/// a cloud-synced folder (OneDrive/Dropbox), and PID/log/socket state is
+/// device-local. See [`sshwarden_config::local_state_dir`].
+pub(crate) fn local_state_dir() -> anyhow::Result<std::path::PathBuf> {
+    sshwarden_config::local_state_dir()
+}
+
+/// Create the machine-local state directory if it does not exist yet.
+pub(crate) fn ensure_local_state_dir() -> anyhow::Result<std::path::PathBuf> {
+    let dir = local_state_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create local state directory: {}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Get the PID file path.
 pub(crate) fn pid_file_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(data_dir()?.join("sshwarden.pid"))
+    Ok(local_state_dir()?.join("sshwarden.pid"))
 }
 
 /// Get the log file path.
 pub(crate) fn log_file_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(data_dir()?.join("sshwarden.log"))
+    Ok(local_state_dir()?.join("sshwarden.log"))
+}
+
+/// Locations that held the PID file before runtime state moved to
+/// [`local_state_dir`] (multi-device runs kept it under `devices/<id>/`).
+pub(crate) fn legacy_pid_file_paths() -> Vec<std::path::PathBuf> {
+    legacy_state_paths("sshwarden.pid")
+}
+
+/// Locations that held the log file before runtime state moved to
+/// [`local_state_dir`].
+pub(crate) fn legacy_log_file_paths() -> Vec<std::path::PathBuf> {
+    legacy_state_paths("sshwarden.log")
+}
+
+/// Pre-migration candidates for a runtime file name, de-duplicated and with the
+/// current (authoritative) path removed so callers never "migrate" onto themselves.
+fn legacy_state_paths(file_name: &str) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    let current = local_state_dir().ok().map(|dir| dir.join(file_name));
+    for dir in [
+        sshwarden_config::device_data_dir().ok(),
+        sshwarden_config::shared_data_dir().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let candidate = dir.join(file_name);
+        if Some(&candidate) == current.as_ref() || paths.contains(&candidate) {
+            continue;
+        }
+        paths.push(candidate);
+    }
+    paths
+}
+
+/// One-time cleanup of runtime files left in the shared data root by older
+/// builds, so cloud sync stops mirroring machine-local state.
+///
+/// A legacy PID file whose recorded process is still alive is left alone: that
+/// means an older-version daemon is still running from the old layout.
+pub(crate) fn cleanup_legacy_runtime_files() {
+    for path in legacy_pid_file_paths() {
+        if pid_file_owner_alive(&path) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!("Removed legacy PID file: {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to remove legacy PID file"
+            ),
+        }
+    }
+
+    // Sockets are recreated at runtime; drop the leftover empty directories.
+    for dir in [
+        sshwarden_config::device_data_dir()
+            .ok()
+            .map(|dir| dir.join("run")),
+        sshwarden_config::shared_data_dir()
+            .ok()
+            .map(|dir| dir.join("run")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if dir == local_state_dir().unwrap_or_default().join("run") {
+            continue;
+        }
+        // `remove_dir` only succeeds for empty directories; a non-empty one is
+        // left untouched.
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+/// Outcome of [`migrate_legacy_log`], reported by the caller *after* the tracing
+/// subscriber is installed (log setup runs before logging exists, so an `info!`
+/// inside the migration itself would be dropped).
+pub(crate) enum LogMigration {
+    /// No pre-migration log was found; nothing to do.
+    NotNeeded,
+    /// The legacy log was moved to the machine-local location.
+    Moved { from: std::path::PathBuf },
+    /// The legacy log could not be moved and was left in place (a fresh log was
+    /// started instead).
+    LeftInPlace { from: std::path::PathBuf },
+}
+
+/// Move the pre-migration log to the machine-local location on first daemon
+/// start after an upgrade.
+///
+/// Best effort: on a cross-filesystem move (or any other failure) the legacy
+/// file is left in place and a fresh log is started, so log content is never
+/// truncated or lost.
+pub(crate) fn migrate_legacy_log() -> LogMigration {
+    let Ok(new_path) = log_file_path() else {
+        return LogMigration::NotNeeded;
+    };
+    if new_path.exists() {
+        return LogMigration::NotNeeded;
+    }
+    for legacy in legacy_log_file_paths() {
+        if !legacy.exists() {
+            continue;
+        }
+        if let Some(parent) = new_path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return LogMigration::LeftInPlace { from: legacy };
+            }
+        }
+        return match std::fs::rename(&legacy, &new_path) {
+            Ok(()) => LogMigration::Moved { from: legacy },
+            Err(_) => LogMigration::LeftInPlace { from: legacy },
+        };
+    }
+    LogMigration::NotNeeded
 }
 
 /// Return true if `path` holds a PID whose recorded process is still alive.
@@ -91,10 +238,13 @@ pub(crate) fn process_is_sshwarden(proc: &sysinfo::Process) -> bool {
 
 /// Check if daemon is already running by reading PID file and checking process.
 pub(crate) fn is_daemon_running() -> bool {
-    match pid_file_path() {
-        Ok(p) => p.exists() && pid_file_owner_alive(&p),
-        Err(_) => false,
+    let live = |path: &std::path::Path| path.exists() && pid_file_owner_alive(path);
+    if pid_file_path().map(|p| live(&p)).unwrap_or(false) {
+        return true;
     }
+    // Upgrade path: a daemon started by an older build may still own the PID file
+    // in the shared data directory.
+    legacy_pid_file_paths().iter().any(|p| live(p))
 }
 
 /// Atomically claim the singleton PID file (RT-02). Returns `Ok(true)` if this
@@ -120,8 +270,27 @@ pub(crate) fn claim_pid_file() -> anyhow::Result<bool> {
             .open(&path)
         {
             Ok(mut f) => {
+                // `create_new` guarantees we won this race, but an older build
+                // still running from the shared data root would not be visible in
+                // the machine-local PID path. Yield to it so two daemons cannot
+                // coexist across the storage-layout upgrade.
+                if let Some(legacy) = legacy_pid_file_paths()
+                    .into_iter()
+                    .find(|p| p.exists() && pid_file_owner_alive(p))
+                {
+                    drop(f);
+                    let _ = std::fs::remove_file(&path);
+                    tracing::info!(
+                        legacy = %legacy.display(),
+                        "A daemon from an older layout is still running; not starting a second one"
+                    );
+                    return Ok(false);
+                }
                 f.write_all(std::process::id().to_string().as_bytes())
                     .with_context(|| format!("Failed to write PID file: {}", path.display()))?;
+                // We are the sole owner: it is now safe to drop stale legacy state
+                // so cloud sync stops mirroring it.
+                cleanup_legacy_runtime_files();
                 return Ok(true);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
