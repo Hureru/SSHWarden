@@ -533,6 +533,9 @@ pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
         });
     }
 
+    // Must run before `show()`: see `window_placement::declare_fixed_size`.
+    crate::window_placement::declare_fixed_size(dialog.window(), 640.0, 440.0);
+
     if let Err(e) = dialog.show() {
         tracing::error!(error = %e, "Failed to show bind-hosts dialog");
         if let Some(sender) = tx_for_show_error.borrow_mut().take() {

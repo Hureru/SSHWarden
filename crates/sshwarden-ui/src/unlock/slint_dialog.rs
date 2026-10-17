@@ -234,6 +234,9 @@ pub fn show_pin_dialog(
         slint::CloseRequestResponse::HideWindow
     });
 
+    // Must run before `show()`: see `window_placement::declare_fixed_size`.
+    crate::window_placement::declare_fixed_size(dialog.window(), 380.0, 195.0);
+
     if let Err(e) = dialog.show() {
         tracing::error!(error = %e, "Failed to show PIN dialog");
         if let Ok(mut guard) = tx_for_show_error.lock() {

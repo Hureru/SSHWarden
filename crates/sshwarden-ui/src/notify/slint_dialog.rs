@@ -209,6 +209,9 @@ pub fn show_auth_dialog(request: AuthDialogRequest) {
         slint::CloseRequestResponse::HideWindow
     });
 
+    // Must run before `show()`: see `window_placement::declare_fixed_size`.
+    crate::window_placement::declare_fixed_size(dialog.window(), 380.0, 230.0);
+
     if let Err(e) = dialog.show() {
         tracing::error!(error = %e, "Failed to show auth dialog");
         if let Some(sender) = tx_for_show_error.borrow_mut().take() {

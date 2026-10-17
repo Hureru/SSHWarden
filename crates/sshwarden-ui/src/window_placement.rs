@@ -54,6 +54,29 @@ pub(crate) fn center_on_active_monitor_and_focus(window: &slint::Window) {
     });
 }
 
+/// Declare the logical size of a fixed-size dialog *before* `show()` is called.
+///
+/// Workaround for a Slint 1.15 + winit 0.30 interaction on Wayland (see
+/// `docs/linux-dialog-size-investigation.md`): Slint creates the winit window
+/// lazily in `show()` with `WindowAttributes::inner_size == None`. winit then
+/// falls back to its 800×600 default (`wayland/window/mod.rs`), and because our
+/// dialogs are non-resizable, `WindowState::set_resizable(false)`
+/// (`wayland/window/state.rs`) pins `min == max` to that same 800×600 — after
+/// Slint already handed over the correct 380×230 min/max hints. The result is an
+/// 800×600 window whose content is painted into a 380×230 corner.
+///
+/// Calling this first stores the size in the window attributes that
+/// `ensure_window()` uses, so winit creates the window at the right size and the
+/// min/max hints it pins are the correct ones. It also marks the size as
+/// explicit, which stops Slint from re-resizing to the layout's preferred size
+/// on show.
+///
+/// The Qt backend is unaffected (it never creates a winit window), which is why
+/// builds with `backend-qt` never showed this.
+pub(crate) fn declare_fixed_size(window: &slint::Window, width: f32, height: f32) {
+    window.set_size(slint::LogicalSize::new(width, height));
+}
+
 #[cfg(windows)]
 fn center_on_platform_active_monitor(window: &WinitWindow) -> bool {
     let Some(bounds) = cursor_monitor_work_area() else {
