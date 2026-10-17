@@ -23,6 +23,14 @@ static RESOLVED_SHARED_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// shared directory for backwards compatibility.
 static RESOLVED_DEVICE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// Cached resolution of the machine-local state directory (PID file, log file,
+/// runtime sockets).
+///
+/// This directory never lives inside the shared (possibly cloud-synced) data
+/// root, so device-local runtime files are not uploaded to OneDrive/Dropbox and
+/// two machines cannot overwrite each other's PID/log state.
+static RESOLVED_LOCAL_DIR: OnceLock<PathBuf> = OnceLock::new();
+
 /// Cached `[storage] multi_device` decision and resolved device id.
 ///
 /// Resolved once from the first successful [`Config::load`] and reused for the
@@ -50,6 +58,8 @@ pub struct Config {
     pub ssh_config: SshConfigConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,10 +317,45 @@ pub struct StorageConfig {
     /// `SSHWARDEN_DEVICE_ID`.
     #[serde(default = "default_device_id")]
     pub device_id: String,
+    /// Optional explicit directory for machine-local runtime state (PID file,
+    /// log file, runtime sockets).
+    ///
+    /// Supports `~`, `~/...`, and `~\...`; relative paths resolve under the
+    /// shared data directory. When set, this is used verbatim (no per-instance
+    /// subdirectory is appended), so it must be unique per SSHWarden instance if
+    /// two installs share one machine. `SSHWARDEN_LOCAL_HOME` overrides this
+    /// value. Unset means the platform-local default:
+    /// `%LOCALAPPDATA%\SSHWarden\<instance>` on Windows,
+    /// `$XDG_STATE_HOME/sshwarden/<instance>` on Linux, and
+    /// `~/Library/Application Support/SSHWarden/<instance>` on macOS.
+    pub local_dir: Option<String>,
 }
 
 fn default_device_id() -> String {
     "auto".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    /// Size cap for the daemon log file, in bytes. When the file grows past this
+    /// limit it is rotated to a single `<log>.1` backup. `0` disables rotation.
+    ///
+    /// The default is 5 MiB. `SSHWARDEN_LOG_MAX_BYTES` overrides this value.
+    #[serde(default = "default_log_max_file_bytes")]
+    pub max_file_bytes: u64,
+}
+
+/// Default daemon log size cap (5 MiB) before rotation to a single `.1` backup.
+pub fn default_log_max_file_bytes() -> u64 {
+    5 * 1024 * 1024
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: default_log_max_file_bytes(),
+        }
+    }
 }
 
 impl Config {
@@ -405,6 +450,119 @@ pub fn device_data_dir() -> anyhow::Result<PathBuf> {
     };
     let _ = RESOLVED_DEVICE_DIR.set(resolved.clone());
     Ok(resolved)
+}
+
+/// Machine-local state directory for the current instance (PID file, log file,
+/// runtime sockets).
+///
+/// Resolution priority (highest first):
+/// 1. `SSHWARDEN_LOCAL_HOME=<dir>` (explicit override, used verbatim).
+/// 2. `[storage] local_dir` (`~` expands; relative paths resolve under the
+///    shared data directory; used verbatim, no instance subdirectory).
+/// 3. Platform-local default with a per-instance subdirectory:
+///    - Windows: `%LOCALAPPDATA%\SSHWarden\<instance>` (`APPDATA` fallback)
+///    - Linux: `$XDG_STATE_HOME/sshwarden/<instance>` (default
+///      `~/.local/state/sshwarden/<instance>`)
+///    - macOS: `~/Library/Application Support/SSHWarden/<instance>`
+///
+/// None of those platform locations are cloud-synced by OneDrive/iCloud known
+/// folder features, which is the point: `sshwarden.pid`, `sshwarden.log`, and
+/// unix sockets are device/process-local state and must not be shared.
+///
+/// `<instance>` is the device id in multi-device mode, otherwise the shared data
+/// directory's own name, so two installations on one machine do not fight over a
+/// single PID file.
+pub fn local_state_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = RESOLVED_LOCAL_DIR.get() {
+        return Ok(dir.clone());
+    }
+    let config = Config::load()?;
+    let shared = shared_data_dir()?;
+    let platform_local = platform_local_dir()?;
+    let device_id = if config.storage.multi_device {
+        Some(current_device_id()?)
+    } else {
+        None
+    };
+    let resolved = resolve_local_state_dir_with(
+        env_path("SSHWARDEN_LOCAL_HOME").as_deref(),
+        &config,
+        &shared,
+        &platform_local,
+        device_id.as_deref(),
+        &home_dir_any()?,
+    )?;
+    let _ = RESOLVED_LOCAL_DIR.set(resolved.clone());
+    Ok(resolved)
+}
+
+/// Pure resolution helper for [`local_state_dir`], split out so the priority
+/// rules (env > config > platform default) are unit-testable without the
+/// process-wide [`OnceLock`] cache.
+fn resolve_local_state_dir_with(
+    env_local_home: Option<&Path>,
+    config: &Config,
+    shared: &Path,
+    platform_local: &Path,
+    device_id: Option<&str>,
+    home: &Path,
+) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = env_local_home {
+        return Ok(dir.to_path_buf());
+    }
+    if let Some(configured) = config
+        .storage
+        .local_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let expanded = expand_home_path_with_home(configured, home)?;
+        return Ok(if expanded.is_absolute() {
+            expanded
+        } else {
+            shared.join(expanded)
+        });
+    }
+    Ok(platform_local.join(instance_key_with(shared, device_id)))
+}
+
+/// Per-instance directory name under the platform-local state root.
+///
+/// Uses the sanitized device id in multi-device mode, otherwise the shared data
+/// directory's own name (e.g. `SSHWarden`, `sshwarden-data`), falling back to
+/// `default` when the shared root has no usable name (e.g. a filesystem root).
+fn instance_key_with(shared: &Path, device_id: Option<&str>) -> String {
+    if let Some(id) = device_id {
+        return sanitize_device_id(id);
+    }
+    let Some(name) = shared.file_name() else {
+        return "default".to_string();
+    };
+    let raw = name.to_string_lossy();
+    if raw.trim().is_empty() {
+        return "default".to_string();
+    }
+    sanitize_instance_name(&raw)
+}
+
+/// Size cap for the daemon log file before rotation.
+///
+/// `SSHWARDEN_LOG_MAX_BYTES` overrides `[logging] max_file_bytes`; an unparsable
+/// or unreadable value falls back to the built-in default so log setup can never
+/// fail on a bad config.
+pub fn log_max_file_bytes() -> u64 {
+    if let Some(value) = std::env::var("SSHWARDEN_LOG_MAX_BYTES")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return value;
+    }
+    Config::load()
+        .map(|config| config.logging.max_file_bytes)
+        .unwrap_or_else(|_| default_log_max_file_bytes())
 }
 
 pub fn current_device_id() -> anyhow::Result<String> {
@@ -650,9 +808,25 @@ fn hostname_for_device_id() -> String {
 }
 
 fn sanitize_device_id(value: &str) -> String {
+    sanitize_path_segment(value, true)
+}
+
+/// Case-preserving variant of [`sanitize_device_id`] for directory names derived
+/// from an existing path (e.g. the shared data root's own name), where the
+/// original casing is more readable than a forced-lowercase id.
+fn sanitize_instance_name(value: &str) -> String {
+    sanitize_path_segment(value, false)
+}
+
+fn sanitize_path_segment(value: &str, lowercase: bool) -> String {
     let mut out = String::new();
     let mut last_dash = false;
-    for ch in value.trim().chars().flat_map(char::to_lowercase) {
+    let chars: Vec<char> = if lowercase {
+        value.trim().chars().flat_map(char::to_lowercase).collect()
+    } else {
+        value.trim().chars().collect()
+    };
+    for ch in chars {
         let allowed = ch.is_ascii_alphanumeric() || ch == '_' || ch == '.';
         if allowed {
             out.push(ch);
@@ -721,6 +895,40 @@ fn platform_config_dir() -> anyhow::Result<PathBuf> {
 #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 fn platform_config_dir() -> anyhow::Result<PathBuf> {
     home_dir().map(|home| home.join(".sshwarden"))
+}
+
+/// Platform default for machine-local runtime state (never cloud-synced).
+#[cfg(windows)]
+fn platform_local_dir() -> anyhow::Result<PathBuf> {
+    // LOCALAPPDATA is the non-roaming per-user root; OneDrive known-folder
+    // backups never touch it. APPDATA is only a fallback for odd environments.
+    env_path("LOCALAPPDATA")
+        .or_else(|| env_path("APPDATA"))
+        .context("LOCALAPPDATA/APPDATA environment variable not set")
+        .map(|dir| dir.join("SSHWarden"))
+}
+
+#[cfg(target_os = "linux")]
+fn platform_local_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = env_path("XDG_STATE_HOME") {
+        return Ok(dir.join("sshwarden"));
+    }
+    home_dir().map(|home| home.join(".local").join("state").join("sshwarden"))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_local_dir() -> anyhow::Result<PathBuf> {
+    // ~/Library is not part of iCloud Drive's synced known folders.
+    home_dir().map(|home| {
+        home.join("Library")
+            .join("Application Support")
+            .join("SSHWarden")
+    })
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
+fn platform_local_dir() -> anyhow::Result<PathBuf> {
+    platform_config_dir()
 }
 
 #[cfg(not(windows))]
@@ -850,5 +1058,112 @@ mod tests {
         // Separators are neutralized to '-', so traversal characters cannot form
         // a real parent reference even when mixed with dots.
         assert_eq!(sanitize_device_id("../.."), "..-..");
+    }
+
+    #[test]
+    fn local_state_dir_prefers_env_then_config_then_platform() {
+        let home = Path::new("/home/alice");
+        let shared = Path::new("/sync/SSHWarden");
+        let platform = Path::new("/home/alice/.local/state/sshwarden");
+        let mut config = Config::default();
+
+        // Platform default: platform root + per-instance key.
+        assert_eq!(
+            resolve_local_state_dir_with(None, &config, shared, platform, None, home).unwrap(),
+            platform.join("SSHWarden")
+        );
+
+        // `[storage] local_dir` wins over the platform default and is used verbatim.
+        config.storage.local_dir = Some("/var/lib/sshwarden".to_string());
+        assert_eq!(
+            resolve_local_state_dir_with(None, &config, shared, platform, None, home).unwrap(),
+            PathBuf::from("/var/lib/sshwarden")
+        );
+
+        // `SSHWARDEN_LOCAL_HOME` wins over the config value.
+        assert_eq!(
+            resolve_local_state_dir_with(
+                Some(Path::new("/tmp/override")),
+                &config,
+                shared,
+                platform,
+                None,
+                home
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/override")
+        );
+    }
+
+    #[test]
+    fn local_state_dir_expands_local_dir_forms() {
+        let home = Path::new("/home/alice");
+        let shared = Path::new("/sync/SSHWarden");
+        let platform = Path::new("/unused");
+        let mut config = Config::default();
+
+        // Tilde expands to the home directory (absolute result, no shared join).
+        config.storage.local_dir = Some("~/.sshwarden-run".to_string());
+        assert_eq!(
+            resolve_local_state_dir_with(None, &config, shared, platform, None, home).unwrap(),
+            home.join(".sshwarden-run")
+        );
+
+        // A relative path resolves under the shared data directory.
+        config.storage.local_dir = Some("runtime".to_string());
+        assert_eq!(
+            resolve_local_state_dir_with(None, &config, shared, platform, None, home).unwrap(),
+            shared.join("runtime")
+        );
+
+        // Blank/whitespace is treated as unset.
+        config.storage.local_dir = Some("   ".to_string());
+        assert_eq!(
+            resolve_local_state_dir_with(None, &config, shared, platform, None, home).unwrap(),
+            platform.join("SSHWarden")
+        );
+    }
+
+    #[test]
+    fn instance_key_uses_device_id_then_shared_name() {
+        let shared = Path::new("/sync/SSHWarden");
+
+        // Multi-device mode: the sanitized device id takes precedence.
+        assert_eq!(
+            resolve_local_state_dir_with(
+                None,
+                &Config::default(),
+                shared,
+                Path::new("/local"),
+                Some("My-Host_01"),
+                Path::new("/home/alice")
+            )
+            .unwrap(),
+            PathBuf::from("/local/my-host_01")
+        );
+
+        // Single-device mode: the shared root's own directory name isolates instances.
+        assert_eq!(
+            resolve_local_state_dir_with(
+                None,
+                &Config::default(),
+                Path::new("/sync/sshwarden-data"),
+                Path::new("/local"),
+                None,
+                Path::new("/home/alice")
+            )
+            .unwrap(),
+            PathBuf::from("/local/sshwarden-data")
+        );
+
+        // A shared root with no usable name falls back to `default`.
+        assert_eq!(instance_key_with(Path::new("/"), None), "default");
+        assert_eq!(instance_key_with(Path::new("/sync/.."), None), "default");
+    }
+
+    #[test]
+    fn logging_default_is_five_mib() {
+        assert_eq!(default_log_max_file_bytes(), 5 * 1024 * 1024);
+        assert_eq!(Config::default().logging.max_file_bytes, 5 * 1024 * 1024);
     }
 }
