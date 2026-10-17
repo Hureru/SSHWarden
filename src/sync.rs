@@ -48,10 +48,13 @@ pub(crate) async fn reconcile_synced_key_state(
     cached_key_tuples.write().await.set(key_tuples.to_vec());
     *key_material_fingerprints.write().await = new_fingerprints;
 
-    if let (Some(existing_cache), Some(local_cache_key)) = (
-        local_key_cache_data.read().await.as_ref().cloned(),
-        local_cache_key_state.read().await.clone_key(),
-    ) {
+    // Bind the guards' results to locals first: a `read().await` guard used as a
+    // temporary inside the `if let` scrutinee would otherwise live until the end
+    // of the whole statement and self-deadlock on the `write().await` below
+    // (tokio's RwLock is not reentrant).
+    let existing_cache = local_key_cache_data.read().await.as_ref().cloned();
+    let local_cache_key = local_cache_key_state.read().await.clone_key();
+    if let (Some(existing_cache), Some(local_cache_key)) = (existing_cache, local_cache_key) {
         match refresh_envelope_local_key_cache(key_tuples, &existing_cache, &local_cache_key) {
             Ok(cache) => {
                 *local_key_cache_data.write().await = Some(cache);
@@ -200,5 +203,139 @@ pub(crate) async fn resolve_pending_sync(
             tracing::warn!("Pending sync failed: {}; sync remains pending", e);
             false
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::cache::build_envelope_local_key_cache;
+    use crate::runtime::{LocalCacheKeyState, SecureKeyCache};
+
+    /// Set by the parent test run on the child process it spawns, so the child
+    /// takes the branch that performs the actual check.
+    const CHILD_ENV: &str = "SSHWARDEN_SYNC_DEADLOCK_TEST_CHILD";
+
+    /// Unique temp directory under the OS temp root, so the test never writes
+    /// into a real installation's config directory.
+    fn temp_home(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sshwarden-sync-test-{}-{unique}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Regression: `reconcile_synced_key_state` must not self-deadlock when the
+    /// on-disk envelope cache is loaded AND an in-memory Local Cache Key exists
+    /// (the state reached by `login` right after a native auto-unlock). The bug
+    /// was a `read().await` guard bound as a temporary in the `if let`
+    /// scrutinee, kept alive across the body's `write().await` on the same lock.
+    ///
+    /// The body runs in a child process of this test binary. `reconcile` calls
+    /// `refresh_envelope_local_key_cache`, which re-saves `local-key-cache.json`
+    /// into the shared data directory — and that directory is resolved through a
+    /// process-wide `OnceLock`, so setting `SSHWARDEN_HOME` from inside the test
+    /// is only honoured while no other test in this binary has resolved it yet
+    /// (the SSH include-line tests already do). A fresh process makes the temp
+    /// override deterministic and keeps the test from ever rewriting a real
+    /// `local-key-cache.json`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_refreshes_cache_without_deadlock() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let output = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "--nocapture",
+                    "sync::tests::reconcile_refreshes_cache_without_deadlock",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "isolated child test failed (deadlock?)\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+            return;
+        }
+
+        let home = temp_home("reconcile");
+        std::env::set_var("SSHWARDEN_HOME", &home);
+        let resolved = sshwarden_config::config_dir().unwrap();
+        assert!(
+            resolved.starts_with(&home),
+            "child not isolated: config_dir resolved to {}",
+            resolved.display()
+        );
+
+        let cached_key_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
+        let public_key_identity_tuples: CachedKeyTuples =
+            Arc::new(RwLock::new(SecureKeyCache::new()));
+        let authorization_memory: AuthorizationMemorySet =
+            Arc::new(RwLock::new(std::collections::HashSet::new()));
+        let key_material_fingerprints: KeyMaterialFingerprints =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let notification_state = Arc::new(RwLock::new(NotificationRuntimeState::default()));
+
+        let key_tuples = vec![(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nnot-a-real-key\n-----END OPENSSH PRIVATE KEY-----\n"
+                .to_string(),
+            "test-key".to_string(),
+            "cipher-1".to_string(),
+        )];
+
+        // Trigger condition: disk cache loaded + in-memory Local Cache Key.
+        let local_cache_key = sshwarden_api::crypto::SymmetricKey {
+            enc_key: vec![7u8; 32],
+            mac_key: vec![9u8; 32],
+        };
+        let existing_cache = build_envelope_local_key_cache(
+            &key_tuples,
+            "user@example.com",
+            "https://vault.example.com",
+            &local_cache_key,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let local_key_cache_data = Arc::new(RwLock::new(Some(existing_cache)));
+        let mut state = LocalCacheKeyState::default();
+        state.set(local_cache_key);
+        let local_cache_key_state = Arc::new(RwLock::new(state));
+
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconcile_synced_key_state(
+                &key_tuples,
+                &cached_key_tuples,
+                &public_key_identity_tuples,
+                &local_key_cache_data,
+                &local_cache_key_state,
+                &authorization_memory,
+                &key_material_fingerprints,
+                &notification_state,
+            ),
+        )
+        .await;
+        assert!(done.is_ok(), "reconcile_synced_key_state deadlocked");
+
+        // The refresh really happened (Ok branch, not the "stale cache" error path).
+        assert!(local_key_cache_data.read().await.is_some());
+        assert!(local_cache_key_state.read().await.clone_key().is_some());
+        assert!(!notification_state.read().await.stale_cache);
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

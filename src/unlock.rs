@@ -81,7 +81,10 @@ pub(crate) async fn ensure_local_cache_key_for_manual_sync(
         None => return Ok(()),
     };
 
-    if let Some(local_cache_key) = local_cache_key_state.read().await.clone_key() {
+    // Bind to a local so the read guard is dropped before the `clear()` write on
+    // the same lock below.
+    let in_memory_key = local_cache_key_state.read().await.clone_key();
+    if let Some(local_cache_key) = in_memory_key {
         if decrypt_envelope_payload(&cache, local_cache_key.clone()).is_ok() {
             return Ok(());
         }

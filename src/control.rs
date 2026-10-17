@@ -783,7 +783,10 @@ pub(crate) async fn handle_control_command(
             }
 
             let resp = 'unlock: {
-                if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
+                // Bind to a local first so the read guard is released at the end of
+                // this statement, before the `write().await` on the same lock below.
+                let cache_opt = local_key_cache_data.read().await.as_ref().cloned();
+                if let Some(cache) = cache_opt {
                     match decrypt_envelope_local_key_cache_with_pin(&cache, &pin) {
                         Ok((keys_json, local_cache_key)) => {
                             // SEC-04: now that we hold the local cache key and a
@@ -1156,7 +1159,8 @@ pub(crate) async fn handle_control_command(
             let email = config.auth.email.clone();
             let server_url = config.server.base_url.clone();
 
-            let cache_write_result = match local_cache_key_state.read().await.clone_key() {
+            let local_cache_key = local_cache_key_state.read().await.clone_key();
+            let cache_write_result = match local_cache_key {
                 Some(local_cache_key) => write_envelope_local_key_cache_with_key(
                     &keys,
                     &email,
