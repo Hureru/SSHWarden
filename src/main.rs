@@ -10,6 +10,7 @@ mod cli;
 mod commands;
 mod control;
 mod daemon;
+mod logging;
 mod naming;
 mod notifications;
 mod path_util;
@@ -62,10 +63,8 @@ fn main() -> anyhow::Result<()> {
         ensure_local_state_dir()?;
         let log_migration = migrate_legacy_log();
         let log_path = log_file_path()?;
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
+        let log_max_bytes = sshwarden_config::log_max_file_bytes();
+        let log_writer = logging::RotatingFileWriter::open(&log_path, log_max_bytes)
             .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
 
         tracing_subscriber::fmt()
@@ -73,9 +72,19 @@ fn main() -> anyhow::Result<()> {
                 tracing_subscriber::EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
             )
-            .with_writer(std::sync::Mutex::new(log_file))
+            .with_writer(std::sync::Mutex::new(log_writer))
             .with_ansi(false)
             .init();
+
+        if log_max_bytes > 0 {
+            info!(
+                "Logging to {} (rotating at {} bytes)",
+                log_path.display(),
+                log_max_bytes
+            );
+        } else {
+            info!("Logging to {} (rotation disabled)", log_path.display());
+        }
 
         // Reported only now: log setup necessarily runs before the subscriber
         // exists, so the migration itself cannot log.
