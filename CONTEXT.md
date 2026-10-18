@@ -109,7 +109,7 @@ The act of updating the local key cache from the current Bitwarden vault data af
 _Avoid_: login, unlock, authorization
 
 **Stale Cache**:
-A local key cache that no longer matches the latest SSH keys known by the running daemon.
+A local key cache whose refresh after the most recent sync failed, so it may not match the latest SSH keys known by the running daemon. Cleared by the next successful **Cache Refresh**.
 _Avoid_: locked cache, corrupted cache, sync failure
 
 **Bitwarden Unreachable**:
@@ -120,8 +120,12 @@ _Avoid_: offline, no network, logged out
 The Bitwarden-compatible server push endpoint that notifies SSHWarden about vault changes and logout events.
 _Avoid_: sync endpoint, control channel, SSH agent endpoint
 
+**Notification Connection State**:
+The delivery state of the **Notification Hub** socket — `not_started`, `starting`, `running`, `failed` (retrying with backoff), or `stopped` — reported separately from the Bitwarden session, sync freshness, and local cache state.
+_Avoid_: bitwarden status, login state, sync state
+
 **Fallback Sync**:
-A sync performed after notification delivery appears unavailable despite reconnect attempts.
+A sync performed after notification delivery appears unavailable despite reconnect attempts, or after an established notification connection is lost, since no supported hub can replay what was published while the socket was down.
 _Avoid_: healthy notification polling, manual sync, cache refresh
 
 **Pending Sync**:
@@ -213,7 +217,9 @@ _Avoid_: login method, authentication method
 - A **Bitwarden Vault** contains zero or more **SSH Keys**.
 - The **Bitwarden Vault** is the authoritative source for **SSH Keys**.
 - A **Notification Hub** can trigger sync when the **Bitwarden Vault** changes.
-- **Fallback Sync** backs up the **Notification Hub** only after reconnect attempts indicate notifications are degraded.
+- **Notification Connection State** is reported separately from the Bitwarden session, sync freshness, and **Stale Cache**.
+- Losing an established **Notification Hub** connection requests **Fallback Sync**, because no supported hub can replay events published while the socket was down.
+- **Fallback Sync** backs up the **Notification Hub** after reconnect attempts indicate notifications are degraded, or after an established connection is lost.
 - While locked, **Notification Hub** events and due **Fallback Sync** create **Pending Sync** instead of pulling and decrypting vault data.
 - **Pending Sync** is resolved after **Unlock** by syncing before normal cached signing when possible.
 - If **Pending Sync** cannot be resolved because **Bitwarden Unreachable**, a **Remembered Device** may still sign with an unlocked **Local Key Cache**.
@@ -273,7 +279,7 @@ _Avoid_: login method, authentication method
 - "offline signing" means signing while **Bitwarden Unreachable** using an unlocked **Local Key Cache**; it does not require the entire network to be unavailable.
 - "pending sync failed" does not by itself block cached signing unless a stricter future policy requires a successful online sync.
 - "notification hub" means Bitwarden-compatible server push for vault changes; it is not the SSHWarden control channel or SSH agent endpoint.
-- "fallback sync" means sync after notification reconnect attempts fail or exceed a configured threshold; it is not blind polling while the **Notification Hub** is healthy.
+- "fallback sync" means sync after notification reconnect attempts fail, or after an established **Notification Hub** connection is lost; it is not blind polling while the **Notification Hub** is healthy.
 - "pending sync" means sync should run after unlock; it is not itself evidence that the local key cache is stale or corrupted.
 - "unlock" and "login" are different. Resolved: **Login** talks to Bitwarden to read current vault data; **Unlock** makes already stored keys usable again.
 - "lock" and "forget" are different. Resolved: **Lock** temporarily prevents signing with remembered SSH keys and local cache refresh capability; **Forget** removes remembered key and session material so a future **Login** is required.

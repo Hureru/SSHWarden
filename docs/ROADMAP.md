@@ -11,11 +11,11 @@ This roadmap tracks implementation work needed to align the codebase with the cu
   - fix SignalR notification URL construction for Bitwarden cloud vs self-hosted/Vaultwarden,
   - resolve service URLs using explicit config, then `/api/config` discovery, then built-in defaults,
   - restore/connect API session and notifications after any successful unlock path,
-  - reconnect or restart notifications after access token refresh,
-  - track notification connection state,
+  - reconnect or restart notifications after access token refresh; the token refresh tick is 5 minutes because the hub rejects a stale token with HTTP 401,
+  - track notification connection state; implemented through a per-transition status stream and reported by `status`/`doctor`; see ADR 0026,
   - accept both text and binary SignalR initial responses,
   - send SignalR MessagePack ping every 30 seconds and treat 90 seconds of inactivity as stale,
-  - use reconnect-first fallback sync after notification failures instead of blind polling while WebSocket is healthy.
+  - use reconnect-first fallback sync after notification failures instead of blind polling while WebSocket is healthy; a lost established connection also requests a throttled recovery sync because no supported hub can replay missed events; see ADR 0026.
 - Address SSH authentication failures when many keys are loaded: completed through local host bindings, public Key Selector Files, and managed OpenSSH config. See `docs/host-bindings.md` and ADR 0023.
 
 ## P1 — Cross-platform baseline infrastructure
