@@ -128,6 +128,8 @@ sshwarden status              # 查看 agent / vault 状态与下一步建议
 sshwarden doctor [--fix]      # 诊断（--fix 执行安全修复，如写入 ~/.ssh/config 的 Include 行）
 ```
 
+`status` 分别报告四件独立的事：会话（`Bitwarden`）、推送连接（`Notify`）、缓存新鲜度（`Sync`）、本地 key cache 刷新（`Cache`，仅出错时出现）。观测不到的事实一律显示 `unknown`，不会默认成“正常”；`Sync: up to date` 只在本次会话确实同步成功、且推送连接正在投递时才出现。`status --json` 输出带 `schema_version: 2`，字段只增不改，agent 未运行时输出同一组字段、值为 `null`，因此脚本无需为两种形态分别处理。
+
 ### ② Vault 会话（需联网）
 
 ```bash

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::runtime::{NotificationConnectionState, NotificationRuntimeState};
+use crate::runtime::NotificationRuntimeState;
 
 /// Time budget for the `/api/config` notification-URL discovery request.
 const NOTIFICATION_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -47,12 +47,7 @@ pub(crate) async fn connect_notification_client(
     *notification_rx = None;
 
     let notif_url = resolve_notifications_url(config, api_client).await;
-    {
-        let mut state = notification_state.write().await;
-        state.state = NotificationConnectionState::Starting;
-        state.url = Some(notif_url.clone());
-        state.last_error = None;
-    }
+    notification_state.write().await.begin_connect(&notif_url);
     info!("Attempting to connect to notification hub: {}", notif_url);
     // Bounded: this runs inside a control action (and after unlock), so a hub
     // that accepts the connection but never completes the handshake must not
@@ -70,18 +65,23 @@ pub(crate) async fn connect_notification_client(
         Ok(Ok((notif_client, rx))) => {
             *notification_rx = Some(rx);
             *notification_client = Some(notif_client);
-            let mut state = notification_state.write().await;
-            state.state = NotificationConnectionState::Running;
-            state.reconnect_attempts = 0;
-            state.last_connected_at = Some(std::time::Instant::now());
-            state.last_error = None;
+            // The client streams its own status from here on; mirror the first
+            // snapshot so a status request at this instant is already correct.
+            notification_state
+                .write()
+                .await
+                .apply_status(&sshwarden_api::NotificationStatus {
+                    state: sshwarden_api::NotificationConnectionState::Connected,
+                    connects: 1,
+                    ..Default::default()
+                });
         }
         Ok(Err(e)) => {
             tracing::warn!("Failed to start notification client: {}", e);
-            let mut state = notification_state.write().await;
-            state.state = NotificationConnectionState::Failed;
-            state.reconnect_attempts = state.reconnect_attempts.saturating_add(1);
-            state.last_error = Some(e.to_string());
+            notification_state
+                .write()
+                .await
+                .mark_client_failed(e.to_string());
         }
         Err(_) => {
             let error = format!(
@@ -89,10 +89,7 @@ pub(crate) async fn connect_notification_client(
                 NOTIFICATION_CONNECT_TIMEOUT.as_secs()
             );
             tracing::warn!("Failed to start notification client: {}", error);
-            let mut state = notification_state.write().await;
-            state.state = NotificationConnectionState::Failed;
-            state.reconnect_attempts = state.reconnect_attempts.saturating_add(1);
-            state.last_error = Some(error);
+            notification_state.write().await.mark_client_failed(error);
         }
     }
 }

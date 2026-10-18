@@ -5,132 +5,70 @@
 
 use crate::commands::login::create_client;
 use crate::path_util::{create_parent_dir, write_private_file};
-use crate::process::running_agent_pid;
 use crate::sshconfig::{
     key_selector_dir, managed_sshwarden_include_path, user_ssh_config_path,
     write_sshwarden_include_line,
 };
 use crate::{has_remembered_device_on_disk, out_line};
 /// `status`: a legible one-screen summary plus a suggested next step. With
-/// `--json`, prints the agent's raw machine-readable status. Works even when the
+/// `--json`, prints the agent's machine-readable status. Works even when the
 /// agent is down (falls back to local file inspection).
+///
+/// Both views come from one model (see `status_report`), and both stay honestly
+/// incomplete when a fact cannot be observed (agent down, no session, hub never
+/// connected) instead of printing a healthy-looking default.
 pub(crate) async fn cmd_status(json: bool) -> anyhow::Result<()> {
+    // Machine-local state never sits in the (possibly cloud-synced) data dir, so
+    // point users at the real log location — including when the agent is up,
+    // which is exactly when they go looking for it.
+    let local_state_dir = sshwarden_config::local_state_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unresolved>".to_string());
+    let log_path = crate::process::log_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unresolved>".to_string());
+    let device_remembered = has_remembered_device_on_disk();
+
     let details = match sshwarden_agent::control::send_control_command("status-json").await {
-        Ok(r) => r.details.unwrap_or_else(|| serde_json::json!({})),
+        Ok(response) => match response.details {
+            Some(details) => details,
+            None => serde_json::to_value(&response)?,
+        },
         Err(_) => {
-            // Agent unreachable: render an offline view.
-            let local_state_dir = sshwarden_config::local_state_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "<unresolved>".to_string());
-            let log_path = crate::process::log_file_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "<unresolved>".to_string());
+            // Agent unreachable: emit the same shape with nothing known.
             if json {
-                out_line(serde_json::to_string_pretty(&serde_json::json!({
-                    "agent_running": false,
-                    "has_remembered_device": has_remembered_device_on_disk(),
-                    "local_state_dir": local_state_dir,
-                    "log_path": log_path,
-                }))?);
+                out_line(serde_json::to_string_pretty(
+                    &crate::status_report::offline_details_json(
+                        device_remembered,
+                        &log_path,
+                        &local_state_dir,
+                    ),
+                )?);
                 return Ok(());
             }
-            out_line("Agent:     not running");
-            out_line(format!(
-                "Device:    {}",
-                if has_remembered_device_on_disk() {
-                    "Remembered"
-                } else {
-                    "not set up"
-                }
-            ));
-            // Machine-local state never sits in the (possibly cloud-synced) data
-            // dir, so point users at the real log location.
-            out_line(format!("Log:       {log_path}"));
-            out_line("");
-            if has_remembered_device_on_disk() {
-                out_line("Next:      sshwarden run        (start the agent, then `unlock`)");
-            } else {
-                out_line("Next:      sshwarden login      (set up this device)");
+            for line in crate::status_report::StatusReport::offline(device_remembered, log_path)
+                .render_lines()
+            {
+                out_line(line);
             }
             return Ok(());
         }
     };
+
+    let missing = crate::status_report::missing_detail_keys(&details);
+    if !missing.is_empty() {
+        // A live daemon answered with fewer keys than the schema documents:
+        // surface it in the log instead of letting a script find out the hard way.
+        tracing::debug!(?missing, "status-json is missing documented keys");
+    }
 
     if json {
         out_line(serde_json::to_string_pretty(&details)?);
         return Ok(());
     }
 
-    let b = |k: &str| details.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
-    let n = |k: &str| details.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-
-    let agent_running = b("agent_running");
-    let locked = b("locked");
-    let has_device = b("has_local_key_cache");
-    let key_count = n("key_count");
-    let signable = n("signable_key_count");
-    let stale = details
-        .get("notification")
-        .and_then(|x| x.get("stale_cache"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    out_line(format!(
-        "Agent:     {}",
-        if agent_running {
-            match running_agent_pid() {
-                Some(pid) => format!("running (pid {pid})"),
-                None => "running".to_string(),
-            }
-        } else {
-            "not serving SSH — run `sshwarden doctor`".to_string()
-        }
-    ));
-    out_line(format!(
-        "Device:    {}",
-        if has_device {
-            "Remembered"
-        } else {
-            "not set up"
-        }
-    ));
-    out_line(format!(
-        "Lock:      {}",
-        if locked { "locked" } else { "unlocked" }
-    ));
-    out_line(format!(
-        "Bitwarden: {}",
-        if b("authenticated") {
-            "logged in"
-        } else {
-            "offline"
-        }
-    ));
-    out_line(format!(
-        "Sync:      {}",
-        if stale {
-            "stale (reconnect to refresh)"
-        } else if b("pending_sync") {
-            "pending (loads on next unlock)"
-        } else {
-            "up to date"
-        }
-    ));
-    out_line(format!(
-        "Keys:      {key_count} listed, {signable} signable"
-    ));
-
-    let next = if !has_device {
-        Some("sshwarden login      (set up this device)")
-    } else if locked {
-        Some("sshwarden unlock")
-    } else if key_count == 0 {
-        Some("sshwarden sync       (no keys cached yet)")
-    } else {
-        None
-    };
-    if let Some(next) = next {
-        out_line(format!("Next:      {next}"));
+    for line in crate::status_report::StatusReport::from_details(&details).render_lines() {
+        out_line(line);
     }
     Ok(())
 }
@@ -335,7 +273,7 @@ pub(crate) async fn cmd_doctor(
             checks.push(DoctorCheck::warn(
                 "local_key_cache.stale",
                 format!(
-                    "Local Key Cache is stale: {}",
+                    "Local Key Cache is out of date because the refresh after a sync failed: {}",
                     notification
                         .get("stale_cache_error")
                         .and_then(|v| v.as_str())
@@ -345,38 +283,37 @@ pub(crate) async fn cmd_doctor(
         } else {
             checks.push(DoctorCheck::ok(
                 "local_key_cache.stale",
-                "Local Key Cache is not marked stale",
+                "Local Key Cache is not marked out of date",
             ));
         }
 
+        let notification_health =
+            crate::status_report::json_health_label(&notification, authenticated);
         match notification_state {
             "running" => checks.push(DoctorCheck::ok(
                 "notification",
                 format!(
-                    "Notification client is running ({})",
+                    "Notification hub {} ({})",
+                    notification_health,
                     notification
                         .get("url")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown URL")
                 ),
             )),
+            // Without an API session the hub has nothing to subscribe with, so
+            // this is the expected state rather than a fault to fix.
+            "not_started" if !authenticated => checks.push(DoctorCheck::ok(
+                "notification",
+                "Notification hub not started yet: no Bitwarden API session (unlock or login first)",
+            )),
             "not_started" => checks.push(DoctorCheck::warn(
                 "notification",
-                "Notification client has not started; usually no API session/token is available yet",
+                "Notification hub has not started even though a Bitwarden API session exists; live sync is not running",
             )),
-            "failed" => checks.push(DoctorCheck::warn(
+            _ => checks.push(DoctorCheck::warn(
                 "notification",
-                format!(
-                    "Notification client failed: {}",
-                    notification
-                        .get("last_error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error")
-                ),
-            )),
-            other => checks.push(DoctorCheck::warn(
-                "notification",
-                format!("Notification client state is {other}"),
+                format!("Notification hub {notification_health}"),
             )),
         }
     }

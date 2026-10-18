@@ -20,6 +20,7 @@ mod shell;
 mod ssh_target;
 mod sshconfig;
 mod status;
+mod status_report;
 mod sync;
 mod ui;
 mod unlock;

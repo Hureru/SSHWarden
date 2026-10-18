@@ -267,7 +267,10 @@ pub(crate) async fn run_foreground(
     let config = Arc::new(config);
     let mut last_activity = tokio::time::Instant::now();
     let mut lock_check_interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    let mut token_refresh_interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+    // Poll often enough that an access token is renewed shortly after it starts
+    // expiring. The notification hub rejects a stale token with HTTP 401, so a
+    // lazy tick costs a reconnect storm plus a fallback-sync window.
+    let mut token_refresh_interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
     // Skip the first immediate tick for token refresh
     token_refresh_interval.tick().await;
 
@@ -475,9 +478,15 @@ pub(crate) async fn run_foreground(
                 }
             } => {
                 match event {
+                    sshwarden_api::SyncEvent::ConnectionStatus(status) => {
+                        notification_state.write().await.apply_status(&status);
+                    }
                     sshwarden_api::SyncEvent::CipherChanged => {
                         if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
                             pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Count it as delivered: "no events for a while" must
+                            // mean "no events", not "no processed events".
+                            notification_state.write().await.record_event();
                             info!("Notification: cipher changed while locked; sync pending until unlock");
                         } else {
                             info!("Notification: cipher changed, syncing...");
@@ -494,7 +503,7 @@ pub(crate) async fn run_foreground(
                         }
                     }
                     sshwarden_api::SyncEvent::LogOut => {
-                        notification_state.write().await.last_event_at = Some(std::time::Instant::now());
+                        notification_state.write().await.record_event();
                         info!("Notification: remote logout");
                         let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, Some(&local_cache_key_state), Some(&authorization_memory)).await;
                     }
@@ -503,12 +512,10 @@ pub(crate) async fn run_foreground(
                             pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
                             info!("Notification degraded while locked; sync pending until unlock");
                         } else {
-                            info!("Notification degraded, running fallback sync...");
+                            info!("Notification degraded or reconnected, running fallback sync...");
                             match do_sync(&api_client, &cached_key_tuples, &public_key_identity_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
                                 Ok(count) => {
-                                    let mut state = notification_state.write().await;
-                                    state.last_event_at = Some(std::time::Instant::now());
-                                    state.last_fallback_sync_at = Some(std::time::Instant::now());
+                                    notification_state.write().await.record_fallback_sync();
                                     info!("Fallback-synced: {} SSH keys", count)
                                 },
                                 Err(e) => {

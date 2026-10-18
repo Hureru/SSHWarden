@@ -59,15 +59,14 @@ pub(crate) async fn reconcile_synced_key_state(
             Ok(cache) => {
                 *local_key_cache_data.write().await = Some(cache);
                 local_cache_key_state.write().await.set(local_cache_key);
+                // Clears a staleness flag from an earlier failed refresh: the
+                // flag describes the *current* cache, not a permanent defect.
+                notification_state.write().await.mark_cache_refreshed();
                 tracing::info!("Local key cache refreshed after sync");
             }
             Err(e) => {
                 let error = e.to_string();
-                {
-                    let mut state = notification_state.write().await;
-                    state.stale_cache = true;
-                    state.stale_cache_error = Some(error.clone());
-                }
+                notification_state.write().await.mark_cache_stale(&error);
                 tracing::warn!(
                     "Sync succeeded but local key cache refresh failed: {}",
                     error
@@ -155,6 +154,9 @@ pub(crate) async fn do_sync(
             return Err(format!("Sync succeeded but failed to reload keys: {}", e));
         }
     }
+    // Baseline for `status`'s sync row: without it, "no pending sync" cannot be
+    // distinguished from "never synced at all".
+    notification_state.write().await.record_successful_sync();
     info!("Vault synced: {} SSH keys", count);
     Ok(count)
 }

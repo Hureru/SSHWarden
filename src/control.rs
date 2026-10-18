@@ -328,6 +328,11 @@ pub(crate) async fn build_status_response(
         .unwrap_or("absolute");
 
     let details = serde_json::json!({
+        // Stable contract version for `status --json` consumers (see status_report.rs).
+        "schema_version": crate::status_report::STATUS_SCHEMA_VERSION,
+        // The daemon's own pid: `status` prints this instead of re-verifying the
+        // pid file, which only works when the client binary is the same file.
+        "agent_pid": std::process::id(),
         "locked": locked,
         "key_count": count,
         "signable_key_count": signable,
@@ -352,32 +357,39 @@ pub(crate) async fn build_status_response(
     if !agent_running {
         // RT-01: surface the zombie state — the agent task is not serving SSH
         // clients even though the control channel still answers.
-        extras.push("AGENT NOT SERVING (SSH endpoint unavailable)");
+        extras.push("AGENT NOT SERVING (SSH endpoint unavailable)".to_string());
     }
     if count > 0 && signable < count {
         // lock-keystore: identities are listed (ssh-add -l) but have no private
         // material, so signing fails until unlock. Make that explicit.
-        extras.push("keys listed but not signable until unlock");
+        extras.push("keys listed but not signable until unlock".to_string());
     }
     if has_pin {
-        extras.push("PIN configured");
+        extras.push("PIN configured".to_string());
     }
     if has_local_key_cache {
-        extras.push("local key cache present");
+        extras.push("local key cache present".to_string());
     }
     if authenticated {
-        extras.push("API session restored");
+        extras.push("API session restored".to_string());
     }
     if multi_device {
-        extras.push("multi-device storage");
+        extras.push("multi-device storage".to_string());
     }
     if pending {
-        extras.push("pending sync");
+        extras.push("pending sync".to_string());
     }
     if notification.stale_cache {
-        extras.push("stale cache");
+        // Not a connectivity problem: the last sync succeeded but refreshing the
+        // local key cache did not, so say so instead of implying a sync problem.
+        extras.push("local key cache refresh failed".to_string());
     }
-    extras.push(notification.state_name());
+    // Delivery health, not just a state word: a socket that dropped and is now
+    // retrying used to be indistinguishable from a healthy one here.
+    extras.push(format!(
+        "notifications {}",
+        notification.health_label(authenticated)
+    ));
 
     if json {
         resp.message = None;
@@ -1081,14 +1093,13 @@ pub(crate) async fn handle_control_command(
             cached_key_tuples.write().await.clear();
             *api_client.write().await = None;
             pending_sync.store(false, std::sync::atomic::Ordering::Relaxed);
-            {
-                let mut state = notification_state.write().await;
-                state.stale_cache = false;
-                state.stale_cache_error = None;
-            }
             if let Some(client) = notification_client.take() {
                 client.stop();
             }
+            // Full reset rather than clearing one field: the client is gone, so
+            // every field (state, url, counters, last error) would otherwise
+            // describe a connection that no longer exists.
+            notification_state.write().await.reset();
             *notification_rx = None;
             vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
 
