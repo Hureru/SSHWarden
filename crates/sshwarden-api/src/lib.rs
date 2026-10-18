@@ -5,4 +5,7 @@ pub mod notifications;
 
 pub use client::{BitwardenClient, DecryptedSshKey};
 pub use crypto::SymmetricKey;
-pub use notifications::{NotificationClient, NotificationOptions, SyncEvent};
+pub use notifications::{
+    NotificationClient, NotificationConnectionState, NotificationOptions, NotificationStatus,
+    SyncEvent,
+};

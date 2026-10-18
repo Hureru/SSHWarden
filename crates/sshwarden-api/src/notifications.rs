@@ -12,14 +12,125 @@ type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
 type WsRead = futures_util::stream::SplitStream<WsStream>;
 
 /// Events emitted by the notification hub.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Deliberately not `Copy`: [`SyncEvent::ConnectionStatus`] carries owned
+/// diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
     /// A cipher was created, updated, deleted, or the vault was synced.
     CipherChanged,
     /// The server requests a logout (e.g. remote session revocation).
     LogOut,
-    /// Notification delivery is degraded; caller should fallback-sync if safe.
+    /// Notification delivery is unreliable; the caller should fallback-sync if
+    /// safe.
+    ///
+    /// Emitted in two situations: after repeated failed reconnect attempts, and
+    /// once (throttled) whenever an *established* connection is lost. The
+    /// second case exists because none of the supported hubs (Bitwarden,
+    /// Vaultwarden, warden-worker) implement SignalR `?id=` replay or any
+    /// server-side backfill: anything published while the socket was down is
+    /// gone, so a lost connection always implies a possible gap.
     FallbackSyncDue,
+    /// The connection state changed.
+    ///
+    /// Observability only: pushed with `try_send`, so it may be dropped when the
+    /// consumer is behind. Real events above are never dropped.
+    ConnectionStatus(NotificationStatus),
+}
+
+/// Coarse connection state of the notification hub socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotificationConnectionState {
+    /// No client was started, or a stopped client was replaced.
+    #[default]
+    NotStarted,
+    /// Establishing the connection and SignalR handshake.
+    Connecting,
+    /// Socket is up and the handshake was accepted.
+    Connected,
+    /// The connection failed or was lost; retrying with exponential backoff.
+    Degraded,
+    /// The client was cancelled and will not reconnect.
+    Stopped,
+}
+
+impl NotificationConnectionState {
+    /// Stable, secret-free name used by `status`/`doctor` and their JSON.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Connecting => "starting",
+            Self::Connected => "running",
+            Self::Degraded => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// Whether the hub is currently delivering events.
+    pub fn is_delivering(self) -> bool {
+        matches!(self, Self::Connected)
+    }
+}
+
+/// Snapshot of the notification connection, pushed on every state change.
+///
+/// This is the only channel through which the connection state reaches the
+/// daemon: the reconnect loop used to keep its bookkeeping entirely to itself,
+/// which made a dropped socket indistinguishable from a healthy one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationStatus {
+    pub state: NotificationConnectionState,
+    /// Consecutive failed connect attempts; reset to 0 by a successful connect.
+    pub consecutive_failures: u32,
+    /// Failed connect attempts since this client was created.
+    pub total_failures: u32,
+    /// Delay before the next reconnect attempt (only while degraded).
+    pub next_retry_in: Option<Duration>,
+    /// Last connect/handshake failure (only while degraded).
+    pub last_error: Option<String>,
+    /// Successful connects, including the initial one.
+    pub connects: u64,
+}
+
+impl NotificationStatus {
+    fn connecting() -> Self {
+        Self {
+            state: NotificationConnectionState::Connecting,
+            ..Self::default()
+        }
+    }
+
+    fn connected(connects: u64) -> Self {
+        Self {
+            state: NotificationConnectionState::Connected,
+            connects,
+            ..Self::default()
+        }
+    }
+
+    fn degraded(
+        connects: u64,
+        consecutive_failures: u32,
+        total_failures: u32,
+        next_retry_in: Duration,
+        last_error: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: NotificationConnectionState::Degraded,
+            consecutive_failures,
+            total_failures,
+            next_retry_in: Some(next_retry_in),
+            last_error: Some(last_error.into()),
+            connects,
+        }
+    }
+
+    fn stopped() -> Self {
+        Self {
+            state: NotificationConnectionState::Stopped,
+            ..Self::default()
+        }
+    }
 }
 
 /// Runtime options for the notification connection.
@@ -83,6 +194,12 @@ impl NotificationClient {
         access_token: &str,
         options: NotificationOptions,
     ) -> anyhow::Result<(Self, mpsc::Receiver<SyncEvent>)> {
+        // Publish `Connecting` before the eager attempt so a consumer that polls
+        // status during the handshake budget sees progress instead of a stale
+        // `NotStarted`.
+        let (event_tx, event_rx) = mpsc::channel::<SyncEvent>(32);
+        publish_status(&event_tx, NotificationStatus::connecting());
+
         // Try one eager connect + handshake so a healthy hub is usable
         // immediately. If it fails, still start the background reconnect loop;
         // fallback-sync events are emitted only after repeated reconnect failures.
@@ -101,7 +218,6 @@ impl NotificationClient {
             }
         };
 
-        let (event_tx, event_rx) = mpsc::channel::<SyncEvent>(32);
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
         let url = notifications_url.to_string();
@@ -141,8 +257,11 @@ impl Drop for NotificationClient {
 }
 
 /// Background loop: connect, read messages, parse SignalR/MessagePack frames,
-/// forward events, keep the connection alive, and emit fallback-sync events when
-/// notifications remain degraded.
+/// forward events, keep the connection alive, and report every state change.
+///
+/// The state reporting below is what makes a dropped connection visible: the
+/// daemon renders `status`/`doctor` from these snapshots, so a silent reconnect
+/// loop can no longer masquerade as a healthy socket.
 async fn run_message_loop(
     notifications_url: String,
     access_token: String,
@@ -152,11 +271,21 @@ async fn run_message_loop(
     mut initial_connection: Option<(WsWrite, WsRead)>,
 ) {
     let mut backoff = Duration::from_secs(1);
-    let mut failed_reconnect_attempts = 0usize;
+    let mut consecutive_failures: u32 = 0;
+    let mut total_failures: u32 = 0;
+    let mut connects: u64 = 0;
+    // Shared by the degraded-retry cadence and the lost-connection recovery
+    // request so a flapping socket cannot multiply the sync rate.
     let mut last_fallback_sent: Option<Instant> = None;
+
+    if initial_connection.is_some() {
+        connects = 1;
+        publish_status(&event_tx, NotificationStatus::connected(connects));
+    }
 
     loop {
         if cancel.is_cancelled() {
+            publish_status(&event_tx, NotificationStatus::stopped());
             return;
         }
 
@@ -167,24 +296,48 @@ async fn run_message_loop(
                 Ok(url) => url,
                 Err(e) => {
                     warn!("Failed to build notification URL: {}", e);
+                    publish_status(
+                        &event_tx,
+                        NotificationStatus::degraded(
+                            connects,
+                            consecutive_failures,
+                            total_failures,
+                            backoff,
+                            e.to_string(),
+                        ),
+                    );
                     return;
                 }
             };
 
             match connect_and_initialize(&ws_url).await {
                 Ok(parts) => {
-                    failed_reconnect_attempts = 0;
+                    consecutive_failures = 0;
                     backoff = Duration::from_secs(1);
+                    connects = connects.saturating_add(1);
+                    info!(connects, "Notification hub connected");
+                    publish_status(&event_tx, NotificationStatus::connected(connects));
                     parts
                 }
                 Err(e) => {
-                    failed_reconnect_attempts = failed_reconnect_attempts.saturating_add(1);
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    total_failures = total_failures.saturating_add(1);
                     warn!(
-                        attempts = failed_reconnect_attempts,
+                        attempts = consecutive_failures,
                         "Notification hub connect/handshake failed: {}", e
                     );
+                    publish_status(
+                        &event_tx,
+                        NotificationStatus::degraded(
+                            connects,
+                            consecutive_failures,
+                            total_failures,
+                            backoff,
+                            e.to_string(),
+                        ),
+                    );
                     maybe_emit_fallback_sync(
-                        failed_reconnect_attempts,
+                        consecutive_failures,
                         &mut last_fallback_sent,
                         &options,
                         &event_tx,
@@ -203,25 +356,32 @@ async fn run_message_loop(
         keepalive_interval.tick().await; // skip immediate tick
         let mut idle_check_interval = tokio::time::interval(Duration::from_secs(5));
         idle_check_interval.tick().await;
+        // Why we left the read loop; reported to the daemon as the degradation
+        // reason so `status` can name the cause instead of guessing.
+        let disconnect_reason: String;
 
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     debug!("Notification client cancelled");
+                    publish_status(&event_tx, NotificationStatus::stopped());
                     return;
                 }
                 _ = keepalive_interval.tick() => {
                     if let Err(e) = ws_write.send(Message::Binary(create_signalr_ping().into())).await {
                         warn!("Failed to send notification keepalive ping: {}", e);
+                        disconnect_reason = format!("keepalive ping failed: {e}");
                         break;
                     }
                 }
                 _ = idle_check_interval.tick() => {
                     if last_seen.elapsed() > options.idle_timeout {
+                        let idle_secs = last_seen.elapsed().as_secs();
                         warn!(
-                            idle_secs = last_seen.elapsed().as_secs(),
+                            idle_secs,
                             "Notification hub idle timeout exceeded, reconnecting"
                         );
+                        disconnect_reason = format!("no hub traffic for {idle_secs}s");
                         let _ = ws_write.close().await;
                         break;
                     }
@@ -233,6 +393,7 @@ async fn run_message_loop(
                             if let Some(event) = parse_signalr_message(&data) {
                                 if event_tx.send(event).await.is_err() {
                                     debug!("Event receiver dropped");
+                                    publish_status(&event_tx, NotificationStatus::stopped());
                                     return;
                                 }
                             }
@@ -252,16 +413,22 @@ async fn run_message_loop(
                         Some(Ok(Message::Pong(_))) => {
                             last_seen = Instant::now();
                         }
-                        Some(Ok(Message::Close(_))) => {
+                        Some(Ok(Message::Close(frame))) => {
                             info!("Notification hub closed by server");
+                            disconnect_reason = match frame {
+                                Some(frame) => format!("hub closed the socket: {}", frame.reason),
+                                None => "hub closed the socket".to_string(),
+                            };
                             break;
                         }
                         Some(Err(e)) => {
                             warn!("Notification hub error: {}", e);
+                            disconnect_reason = format!("socket error: {e}");
                             break;
                         }
                         None => {
                             info!("Notification hub stream ended");
+                            disconnect_reason = "hub ended the stream".to_string();
                             break;
                         }
                         _ => {}
@@ -270,9 +437,25 @@ async fn run_message_loop(
             }
         }
 
+        // An established connection was lost. No supported hub can replay what
+        // was published meanwhile (no SignalR `id=` backfill), so every loss is
+        // a potential gap: ask for a throttled recovery sync rather than waiting
+        // for the retry counter to trip.
+        emit_recovery_sync(&mut last_fallback_sent, &options, &event_tx).await;
+
         info!(
             "Reconnecting to notification hub in {}s...",
             backoff.as_secs()
+        );
+        publish_status(
+            &event_tx,
+            NotificationStatus::degraded(
+                connects,
+                consecutive_failures,
+                total_failures,
+                backoff,
+                disconnect_reason,
+            ),
         );
         wait_before_reconnect(backoff, &cancel).await;
         backoff = (backoff * 2).min(options.reconnect_max_backoff);
@@ -328,28 +511,59 @@ async fn wait_before_reconnect(backoff: Duration, cancel: &tokio_util::sync::Can
     }
 }
 
-async fn maybe_emit_fallback_sync(
-    failed_reconnect_attempts: usize,
-    last_fallback_sent: &mut Option<Instant>,
+/// Report a connection-state snapshot without ever blocking the socket loop.
+///
+/// Status is advisory, so a busy consumer drops it instead of stalling the read
+/// loop; the next transition carries the same information.
+fn publish_status(event_tx: &mpsc::Sender<SyncEvent>, status: NotificationStatus) {
+    if event_tx
+        .try_send(SyncEvent::ConnectionStatus(status))
+        .is_err()
+    {
+        debug!("Notification connection-status update dropped (consumer busy)");
+    }
+}
+
+/// Whether a throttled recovery sync is due, given the previous one.
+fn recovery_sync_due(last_sent: Option<Instant>, interval: Duration) -> bool {
+    if interval.is_zero() {
+        return false;
+    }
+    last_sent
+        .map(|instant| instant.elapsed() >= interval)
+        .unwrap_or(true)
+}
+
+/// Ask the caller for a fallback sync because delivery may have been missed.
+///
+/// Throttled by `fallback_sync_interval`; a zero interval disables it, which is
+/// how users opt out of fallback sync entirely (ADR 0021).
+async fn emit_recovery_sync(
+    last_sent: &mut Option<Instant>,
     options: &NotificationOptions,
     event_tx: &mpsc::Sender<SyncEvent>,
 ) {
-    if options.fallback_sync_interval.is_zero()
-        || failed_reconnect_attempts < options.reconnect_attempts_before_fallback
-    {
+    if !recovery_sync_due(*last_sent, options.fallback_sync_interval) {
         return;
     }
-
-    let should_emit = last_fallback_sent
-        .map(|instant| instant.elapsed() >= options.fallback_sync_interval)
-        .unwrap_or(true);
-
-    if should_emit {
-        *last_fallback_sent = Some(Instant::now());
-        if event_tx.send(SyncEvent::FallbackSyncDue).await.is_err() {
-            debug!("Event receiver dropped before fallback sync event");
-        }
+    *last_sent = Some(Instant::now());
+    if event_tx.send(SyncEvent::FallbackSyncDue).await.is_err() {
+        debug!("Event receiver dropped before fallback sync event");
     }
+}
+
+/// Degraded-retry cadence: after repeated consecutive failures, keep asking for
+/// a fallback sync until the hub comes back.
+async fn maybe_emit_fallback_sync(
+    consecutive_failures: u32,
+    last_sent: &mut Option<Instant>,
+    options: &NotificationOptions,
+    event_tx: &mpsc::Sender<SyncEvent>,
+) {
+    if (consecutive_failures as usize) < options.reconnect_attempts_before_fallback {
+        return;
+    }
+    emit_recovery_sync(last_sent, options, event_tx).await;
 }
 
 /// Build the WebSocket URL for the notification hub.
@@ -519,6 +733,53 @@ fn read_varint(data: &[u8]) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
+    /// Drives the real reconnect loop against a closed port.
+    ///
+    /// This is the regression test for the write-once state bug: the loop must
+    /// report `starting`, then `failed` with a reason and a retry delay, and must
+    /// request a fallback sync once the failure threshold is reached.
+    #[tokio::test]
+    async fn a_dead_hub_is_reported_and_requests_a_fallback_sync() {
+        let options = NotificationOptions {
+            reconnect_max_backoff: Duration::from_millis(10),
+            ..NotificationOptions::default()
+        };
+        // Nothing listens on port 1, so every attempt fails immediately.
+        let (_client, mut events) =
+            NotificationClient::connect_with_options("http://127.0.0.1:1", "token", options)
+                .await
+                .unwrap();
+
+        let mut saw_connecting = false;
+        let mut saw_first_failure = false;
+        let mut fallback_syncs = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while fallback_syncs == 0 {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(SyncEvent::ConnectionStatus(status))) => {
+                    saw_connecting |= status.state == NotificationConnectionState::Connecting;
+                    if status.state == NotificationConnectionState::Degraded {
+                        assert!(
+                            status.last_error.is_some(),
+                            "a degraded connection must name its reason"
+                        );
+                        assert!(
+                            status.next_retry_in.is_some(),
+                            "a degraded connection must name its retry delay"
+                        );
+                        saw_first_failure |= status.consecutive_failures == 1;
+                    }
+                }
+                Ok(Some(SyncEvent::FallbackSyncDue)) => fallback_syncs += 1,
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("event stream ended unexpectedly"),
+                Err(_) => panic!("no fallback sync was requested within the deadline"),
+            }
+        }
+        assert!(saw_connecting, "never reported the connection attempt");
+        assert!(saw_first_failure, "never reported the first failed attempt");
+    }
+
     #[test]
     fn build_ws_url_appends_hub_to_notifications_base() {
         let url = build_ws_url("https://example.com/notifications", "token").unwrap();
@@ -554,5 +815,53 @@ mod tests {
     #[test]
     fn signalr_ping_frame_is_messagepack_ping() {
         assert_eq!(create_signalr_ping(), vec![2, 0x91, 6]);
+    }
+
+    #[test]
+    fn recovery_sync_is_due_when_never_sent() {
+        assert!(recovery_sync_due(None, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn recovery_sync_is_throttled_within_the_interval() {
+        assert!(!recovery_sync_due(
+            Some(Instant::now()),
+            Duration::from_secs(300)
+        ));
+        assert!(recovery_sync_due(
+            Some(Instant::now() - Duration::from_secs(301)),
+            Duration::from_secs(300)
+        ));
+    }
+
+    #[test]
+    fn recovery_sync_is_disabled_by_a_zero_interval() {
+        assert!(!recovery_sync_due(None, Duration::ZERO));
+    }
+
+    #[test]
+    fn connection_state_names_are_stable() {
+        // These strings are part of the `status --json` contract.
+        assert_eq!(
+            NotificationConnectionState::NotStarted.name(),
+            "not_started"
+        );
+        assert_eq!(NotificationConnectionState::Connecting.name(), "starting");
+        assert_eq!(NotificationConnectionState::Connected.name(), "running");
+        assert_eq!(NotificationConnectionState::Degraded.name(), "failed");
+        assert_eq!(NotificationConnectionState::Stopped.name(), "stopped");
+        assert!(NotificationConnectionState::Connected.is_delivering());
+        assert!(!NotificationConnectionState::Degraded.is_delivering());
+    }
+
+    #[test]
+    fn degraded_status_reports_the_retry_cadence() {
+        let status = NotificationStatus::degraded(3, 4, 5, Duration::from_secs(8), "boom");
+        assert_eq!(status.state, NotificationConnectionState::Degraded);
+        assert_eq!(status.connects, 3);
+        assert_eq!(status.consecutive_failures, 4);
+        assert_eq!(status.total_failures, 5);
+        assert_eq!(status.next_retry_in, Some(Duration::from_secs(8)));
+        assert_eq!(status.last_error.as_deref(), Some("boom"));
     }
 }
