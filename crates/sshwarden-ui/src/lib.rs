@@ -1,5 +1,6 @@
 pub mod bind_hosts;
 pub mod notify;
+pub mod pick_key;
 pub mod unlock;
 
 mod window_placement;
@@ -73,6 +74,17 @@ pub enum BindHostsResult {
     Cancelled,
 }
 
+/// Request payload for [`UIRequest::PickKeyDialog`].
+#[derive(Debug, Clone)]
+pub struct PickKeyRequest {
+    /// Keys to choose from, as `(vault item id, name)`, in display order.
+    pub keys: Vec<(String, String)>,
+    pub process_name: String,
+    /// What the key is for: the host (and repository), or a host key fingerprint.
+    pub target: String,
+    pub is_forwarding: bool,
+}
+
 /// Unified UI request type for cross-thread communication.
 ///
 /// The tokio thread sends these requests to the Slint main thread via an mpsc channel.
@@ -88,6 +100,12 @@ pub enum UIRequest {
     AuthDialog {
         info: SignRequestInfo,
         response_tx: tokio::sync::oneshot::Sender<AuthorizationResult>,
+    },
+    /// Ask which SSH key to offer for a login. Answers the chosen vault item
+    /// id, or `None` when cancelled.
+    PickKeyDialog {
+        request: PickKeyRequest,
+        response_tx: tokio::sync::oneshot::Sender<Option<String>>,
     },
     /// Request the host-binding management dialog.
     BindHostsDialog {

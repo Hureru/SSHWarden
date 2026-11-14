@@ -287,6 +287,24 @@ fn run_slint_event_loop(mut ui_request_rx: tokio::sync::mpsc::Receiver<sshwarden
                         tracing::error!("Slint event loop is not running, cannot show auth dialog");
                     }
                 }
+                sshwarden_ui::UIRequest::PickKeyDialog {
+                    request,
+                    response_tx,
+                } => {
+                    let pick_request = sshwarden_ui::pick_key::PickKeyDialogRequest {
+                        request,
+                        response_tx,
+                    };
+                    let result = slint::invoke_from_event_loop(move || {
+                        sshwarden_ui::pick_key::show_pick_key_dialog(pick_request);
+                    });
+
+                    if result.is_err() {
+                        tracing::error!(
+                            "Slint event loop is not running, cannot show key picker dialog"
+                        );
+                    }
+                }
                 sshwarden_ui::UIRequest::BindHostsDialog {
                     request,
                     response_tx,
