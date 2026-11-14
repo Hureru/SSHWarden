@@ -173,7 +173,12 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
     ) {
         match session_bind_info_result {
             SessionBindResult::Success(session_bind_info) => {
-                connection_info.set_forwarding(session_bind_info.is_forwarding);
+                // A forwarded connection is bound twice: by the local ssh with
+                // is_forwarding=1, then by the remote ssh with is_forwarding=0.
+                // Never clear the flag, or forwarded requests look local.
+                if session_bind_info.is_forwarding {
+                    connection_info.set_forwarding(true);
+                }
                 connection_info.set_host_key(session_bind_info.host_key.clone());
             }
             SessionBindResult::SignatureFailure => {
@@ -481,6 +486,33 @@ nGZV/aEAZ3ZMrsrA3g32AAAAEHRlc3RAZXhhbXBsZS5jb20BAgMEBQ==
 
         assert!(!signature.as_bytes().is_empty());
         assert_eq!(signature.algorithm(), ssh_key::Algorithm::Ed25519);
+    }
+
+    #[tokio::test]
+    async fn forwarding_flag_survives_the_remote_hop_session_bind() {
+        use bitwarden_russh::session_bind::SessionBindInfo;
+        use bitwarden_russh::ssh_agent::Agent as _;
+
+        let (agent, _request_rx, _response_tx) = create_test_agent();
+        let info = PeerInfo::new(0, 1, "ssh".to_string());
+        for (is_forwarding, host_key) in [(true, b"hop1".to_vec()), (false, b"hop2".to_vec())] {
+            agent
+                .set_sessionbind_info(
+                    &SessionBindResult::Success(SessionBindInfo {
+                        is_forwarding,
+                        host_key,
+                        session_identifier: Vec::new(),
+                    }),
+                    &info,
+                )
+                .await;
+        }
+
+        assert!(
+            info.is_forwarding(),
+            "second bind must not clear forwarding"
+        );
+        assert_eq!(info.host_key(), b"hop2", "last bind is the destination");
     }
 
     // lock-keystore: after lock(), identities remain listable (ssh-add -l keeps
