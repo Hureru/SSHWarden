@@ -58,7 +58,23 @@ _Avoid_: automatic agent filtering, private key export
 
 **Host Binding**:
 A local mapping from a **Vault Item Id** to one or more OpenSSH `Host` patterns, used to generate managed SSH client configuration.
-_Avoid_: Bitwarden vault metadata, server-side key policy, agent-side filtering
+_Avoid_: Bitwarden vault metadata, server-side key policy, agent-side filtering (the agent reads bindings only to order keys; see **Key Selection**)
+
+**Key Selection**:
+The agent's per-connection choice of the order in which **Key Identities** are offered: **Selection Rule**, then **Host Binding**, then **Selection History**, then display name. It reorders and never removes keys.
+_Avoid_: key filtering, authorization, access policy
+
+**Selection Rule**:
+A `[[rules]]` entry in `config.toml` that names the key to offer first for a host, login user, or Git repository pattern.
+_Avoid_: Host Binding, access rule, allow list
+
+**Selection History**:
+The device-local record of which keys each destination most recently accepted, keyed by host key fingerprint and repository owner.
+_Avoid_: authorization memory, known hosts, audit log
+
+**Key Picker**:
+An opt-in dialog shown when **Key Selection** has no preference, in which the user chooses the single key to offer; the choice also approves that key for the connection.
+_Avoid_: authorization prompt, bind dialog, unlock prompt
 
 **Managed SSH Config**:
 The SSHWarden-generated OpenSSH config file included from `~/.ssh/config` that contains Host Binding-derived `IdentityFile` and `IdentitiesOnly yes` rules.

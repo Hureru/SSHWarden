@@ -116,6 +116,12 @@ sshwarden ssh-config show
 
 Make sure the host pattern matches the host you use with `ssh`. OpenSSH host matching follows `ssh_config` `Host` pattern rules.
 
+### Hosts without a binding
+
+A binding is no longer the only thing that picks a key. For every connection the agent orders the keys it offers: `[[rules]]` from `config.toml` first, then host bindings, then the key that server accepted last time, then display name. Nothing is hidden — the preferred key just goes first — so a host you have logged in to once normally works without a binding. Bindings remain the way to offer *exactly one* key (`IdentitiesOnly yes`).
+
+The agent matches binding patterns against the destination as you typed it, so an `ssh_config` alias matches by its alias. Run the daemon with info logging to see which source decided the order for a connection. See [ADR 0027](adr/0027-agent-side-key-selection.md).
+
 ### Bind dialog shows no prefill
 
 SSHWarden could not read the SSH client process command line. This is expected on some hardened or sandboxed systems. Manually type the hostname.

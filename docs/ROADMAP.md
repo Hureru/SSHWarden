@@ -50,6 +50,8 @@ This roadmap tracks implementation work needed to align the codebase with the cu
 - Implement RememberUntilLock as Vault Item Id + Operation Kind.
 - Clear authorization memory on lock, session boundary, daemon restart, key deletion/archive, or key material change.
 - Always require approval for agent forwarding.
+- Order identities per connection by Selection Rule, Host Binding, and Selection History; opt-in Key Picker (ADR 0027). Done on Linux; session-bind and argv reading still need verification on Windows and macOS.
+- Later: CLI/GUI for Selection Rules, and Key Selection state in `status` / `doctor`.
 
 ## P4 — Platform-native unlock
 
