@@ -208,7 +208,7 @@ fn main() -> anyhow::Result<()> {
                 Some(Commands::Unlock { method }) => match method {
                     UnlockMethod::Pin => {
                         let pin_value = prompt_password("Enter PIN: ")?;
-                        cmd_control(&format!("unlock-pin:{}", &*pin_value)).await
+                        cmd_control(&format!("unlock-pin:{}", *pin_value)).await
                     }
                     UnlockMethod::Hello => cmd_control("unlock-hello").await,
                     UnlockMethod::Native => cmd_control("unlock-native").await,

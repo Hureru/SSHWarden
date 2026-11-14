@@ -21,7 +21,7 @@ pub(crate) async fn cmd_set_pin() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cmd = format!("set-pin:{}", &*pin);
+    let cmd = format!("set-pin:{}", *pin);
     cmd_control(&cmd).await
 }
 
@@ -95,7 +95,7 @@ pub(crate) async fn cmd_login(
     // Prefer the running daemon: it performs the login + sync and loads keys
     // into the live agent. The control protocol carries only the password, so
     // the daemon uses its own configured server/email.
-    match sshwarden_agent::control::send_control_command(&format!("unlock-password:{}", &*password))
+    match sshwarden_agent::control::send_control_command(&format!("unlock-password:{}", *password))
         .await
     {
         Ok(response) => {
@@ -192,7 +192,7 @@ pub(crate) async fn offer_pin_setup() -> anyhow::Result<()> {
         err_line("PINs do not match. Skipped — run `sshwarden set-pin` later.");
         return Ok(());
     }
-    match sshwarden_agent::control::send_control_command(&format!("set-pin:{}", &*pin)).await {
+    match sshwarden_agent::control::send_control_command(&format!("set-pin:{}", *pin)).await {
         Ok(resp) if resp.ok => out_line("PIN set — this device is now remembered."),
         Ok(resp) => err_line(format!(
             "Could not set PIN: {}",

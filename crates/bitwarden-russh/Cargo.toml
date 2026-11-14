@@ -23,3 +23,6 @@ ssh-key = { version = "0.6.6", default-features = false, features = ["encryption
 thiserror = "1.0.63"
 tokio = { version = "1.40.0", features = ["io-util", "macros", "rt"] }
 tokio-util = "0.7.11"
+
+# Vendored code: deliberately not inheriting the workspace lints.
+[lints]
