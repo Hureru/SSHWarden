@@ -10,7 +10,7 @@ use bitwarden_russh::ssh_agent;
 use tokio::net::UnixListener;
 use tracing::{error, info};
 
-use super::agent::{SshAgentUIRequest, SshWardenAgent};
+use super::agent::{SshAgentListRequest, SshAgentUIRequest, SshWardenAgent};
 use crate::peercred_unix_listener_stream::PeercredUnixListenerStream;
 
 const ENV_SSHWARDEN_SSH_AUTH_SOCK: &str = "SSHWARDEN_SSH_AUTH_SOCK";
@@ -18,10 +18,11 @@ const ENV_SSHWARDEN_SSH_AUTH_SOCK: &str = "SSHWARDEN_SSH_AUTH_SOCK";
 impl SshWardenAgent {
     pub fn start_server_with_endpoint(
         auth_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
+        list_request_tx: tokio::sync::mpsc::Sender<SshAgentListRequest>,
         auth_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
         endpoint: Option<PathBuf>,
     ) -> Result<Self, anyhow::Error> {
-        let agent_state = SshWardenAgent::new(auth_request_tx, auth_response_tx);
+        let agent_state = SshWardenAgent::new(auth_request_tx, list_request_tx, auth_response_tx);
 
         let socket_path = get_socket_path(endpoint)?;
 

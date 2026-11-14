@@ -63,6 +63,9 @@ pub(crate) async fn run_authorization_prompt(
     prompt_behavior: sshwarden_config::PromptBehavior,
     ui_request_tx: &UIRequestTx,
 ) -> bool {
+    if picked_by_user(request) {
+        return true;
+    }
     let needs_prompt = request.is_forwarding
         || match prompt_behavior {
             sshwarden_config::PromptBehavior::Always => true,
@@ -106,25 +109,9 @@ pub(crate) async fn handle_ui_request(
     runtime_event_tx: tokio::sync::mpsc::Sender<RuntimeEvent>,
     authorization_memory: AuthorizationMemorySet,
     pin_failures: PinFailureHandle,
+    key_selector: Arc<crate::key_select::KeySelector>,
 ) {
-    if request.is_list {
-        if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
-            info!(
-                request_id = request.request_id,
-                process = %request.process_name,
-                "Key list request while vault locked - listing public identities without unlock"
-            );
-        }
-
-        agent.clear_needs_unlock();
-        info!(
-            request_id = request.request_id,
-            process = %request.process_name,
-            "Key list request - auto-approving"
-        );
-        let _ = response_tx.send((request.request_id, true));
-        return;
-    }
+    key_selector.record_use(&request);
 
     // Check if vault is locked; if so, try to unlock
     if vault_locked.load(std::sync::atomic::Ordering::Relaxed) && auto_unlock {
@@ -426,22 +413,23 @@ pub(crate) async fn handle_ui_request(
         is_forwarding: request.is_forwarding,
     };
 
-    info!(
-        request_id = request.request_id,
-        process = %request.process_name,
-        key = %sign_info.key_name,
-        "Sign request - prompting user"
-    );
-
-    let result_pid = request.pid;
-    let result_cipher_id = request.cipher_id.clone();
-    let approved = prompt_authorization_with_bind_flow(
-        &ui_request_tx,
-        sign_info,
-        result_pid,
-        result_cipher_id.as_deref(),
-    )
-    .await;
+    let approved = if picked_by_user(&request) {
+        true
+    } else {
+        info!(
+            request_id = request.request_id,
+            process = %request.process_name,
+            key = %sign_info.key_name,
+            "Sign request - prompting user"
+        );
+        prompt_authorization_with_bind_flow(
+            &ui_request_tx,
+            sign_info,
+            request.pid,
+            request.cipher_id.as_deref(),
+        )
+        .await
+    };
     if approved
         && !request.is_forwarding
         && matches!(
@@ -454,6 +442,21 @@ pub(crate) async fn handle_ui_request(
         }
     }
     let _ = response_tx.send((request.request_id, approved));
+}
+
+/// Choosing this key in the key picker for this very connection is the user's
+/// approval of the signature it is then asked for. Agent forwarding still
+/// requires the explicit authorization prompt.
+fn picked_by_user(request: &sshwarden_agent::SshAgentUIRequest) -> bool {
+    let picked = request.preselected && !request.is_forwarding;
+    if picked {
+        info!(
+            request_id = request.request_id,
+            process = %request.process_name,
+            "Sign request - approved by key picker choice"
+        );
+    }
+    picked
 }
 
 pub(crate) fn unlock_context_for_request(

@@ -10,6 +10,7 @@ mod cli;
 mod commands;
 mod control;
 mod daemon;
+mod key_select;
 mod logging;
 mod naming;
 mod notifications;
@@ -40,7 +41,6 @@ use process::{
     claim_pid_file, cmd_daemon_install, cmd_daemon_uninstall, ensure_local_state_dir,
     log_file_path, migrate_legacy_log, remove_pid_file, LogMigration,
 };
-use ssh_target::{parse_ssh_target, SSH_VALUE_TAKING_FLAGS};
 use status::{cmd_doctor, cmd_status};
 
 fn main() -> anyhow::Result<()> {
@@ -208,7 +208,7 @@ fn main() -> anyhow::Result<()> {
                 Some(Commands::Unlock { method }) => match method {
                     UnlockMethod::Pin => {
                         let pin_value = prompt_password("Enter PIN: ")?;
-                        cmd_control(&format!("unlock-pin:{}", &*pin_value)).await
+                        cmd_control(&format!("unlock-pin:{}", *pin_value)).await
                     }
                     UnlockMethod::Hello => cmd_control("unlock-hello").await,
                     UnlockMethod::Native => cmd_control("unlock-native").await,
@@ -287,6 +287,24 @@ fn run_slint_event_loop(mut ui_request_rx: tokio::sync::mpsc::Receiver<sshwarden
                         tracing::error!("Slint event loop is not running, cannot show auth dialog");
                     }
                 }
+                sshwarden_ui::UIRequest::PickKeyDialog {
+                    request,
+                    response_tx,
+                } => {
+                    let pick_request = sshwarden_ui::pick_key::PickKeyDialogRequest {
+                        request,
+                        response_tx,
+                    };
+                    let result = slint::invoke_from_event_loop(move || {
+                        sshwarden_ui::pick_key::show_pick_key_dialog(pick_request);
+                    });
+
+                    if result.is_err() {
+                        tracing::error!(
+                            "Slint event loop is not running, cannot show key picker dialog"
+                        );
+                    }
+                }
                 sshwarden_ui::UIRequest::BindHostsDialog {
                     request,
                     response_tx,
@@ -351,71 +369,9 @@ async fn cmd_startup_enable() -> anyhow::Result<()> {
     cmd_daemon_install().await
 }
 
-/// Inspect the argv of the process at `pid` and, if it looks like an SSH client
-/// command, extract the target host (without `user@` prefix).
-///
-/// Best-effort: returns `None` when the process has gone, when permission is
-/// denied, when argv[0] doesn't look like an SSH client binary, or when the
-/// positional target can't be confidently located.
-fn infer_ssh_target_from_pid(pid: u32) -> Option<String> {
-    if pid == 0 {
-        tracing::debug!("Unable to infer SSH target: peer pid is zero");
-        return None;
-    }
-    let argv = sshwarden_agent::peerinfo::gather::get_peer_cmd(pid)?;
-    if argv.is_empty() {
-        tracing::debug!(pid, "Unable to infer SSH target: peer argv is empty");
-        return None;
-    }
-    let basename = std::path::Path::new(&argv[0])
-        .file_name()
-        .and_then(|s| s.to_str())?
-        .to_ascii_lowercase();
-    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
-    if !matches!(
-        basename,
-        "ssh" | "scp" | "sftp" | "ssh-keyscan" | "ssh-copy-id"
-    ) {
-        tracing::debug!(pid, process = %basename, "Unable to infer SSH target: peer is not a recognized SSH client");
-        return None;
-    }
-
-    let mut iter = argv.iter().skip(1).peekable();
-    while let Some(arg) = iter.next() {
-        if arg == "--" {
-            return iter.next().map(|s| parse_ssh_target(s));
-        }
-        if let Some(rest) = arg.strip_prefix('-') {
-            if rest.is_empty() {
-                continue;
-            }
-            // Walk combined short opts; once we hit a value-taking flag,
-            // either inline value is present (rest of chars) or next argv is consumed.
-            let chars: Vec<char> = rest.chars().collect();
-            let mut consume_next = false;
-            for (i, c) in chars.iter().enumerate() {
-                if SSH_VALUE_TAKING_FLAGS.contains(*c) {
-                    if i + 1 >= chars.len() {
-                        consume_next = true;
-                    }
-                    break;
-                }
-            }
-            if consume_next {
-                iter.next();
-            }
-            continue;
-        }
-        return Some(parse_ssh_target(arg));
-    }
-    tracing::debug!(pid, process = %basename, "Unable to infer SSH target: no positional target found");
-    None
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use crate::path_util::{ensure_managed_ssh_config_path_is_safe, paths_equivalent_for_safety};
     use crate::sshconfig::{
         import_host_bindings_from_managed_file, remove_sshwarden_include_line,
@@ -426,51 +382,8 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Helper that runs only the argv-parsing portion of host inference,
-    /// bypassing the live PID lookup.
     fn infer_from_argv(parts: &[&str]) -> Option<String> {
-        let argv = argv(parts);
-        if argv.is_empty() {
-            return None;
-        }
-        let basename = std::path::Path::new(&argv[0])
-            .file_name()
-            .and_then(|s| s.to_str())?
-            .to_ascii_lowercase();
-        let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
-        if !matches!(
-            basename,
-            "ssh" | "scp" | "sftp" | "ssh-keyscan" | "ssh-copy-id"
-        ) {
-            return None;
-        }
-        let mut iter = argv.iter().skip(1).peekable();
-        while let Some(arg) = iter.next() {
-            if arg == "--" {
-                return iter.next().map(|s| parse_ssh_target(s));
-            }
-            if let Some(rest) = arg.strip_prefix('-') {
-                if rest.is_empty() {
-                    continue;
-                }
-                let chars: Vec<char> = rest.chars().collect();
-                let mut consume_next = false;
-                for (i, c) in chars.iter().enumerate() {
-                    if SSH_VALUE_TAKING_FLAGS.contains(*c) {
-                        if i + 1 >= chars.len() {
-                            consume_next = true;
-                        }
-                        break;
-                    }
-                }
-                if consume_next {
-                    iter.next();
-                }
-                continue;
-            }
-            return Some(parse_ssh_target(arg));
-        }
-        None
+        crate::ssh_target::parse_ssh_argv(&argv(parts)).map(|invocation| invocation.host)
     }
 
     #[test]

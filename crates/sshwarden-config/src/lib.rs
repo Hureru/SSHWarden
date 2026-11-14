@@ -60,6 +60,26 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Agent-side key selection rules (`[[rules]]`), first match wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<SelectionRule>,
+}
+
+/// Prefers one SSH key for connections matching every condition that is set.
+///
+/// `host` takes OpenSSH-style patterns (`*`, `?`, space-separated, `!` negates);
+/// `repo` is a glob over the remote Git repository path (`owner/name`). At
+/// least one of the two is required.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SelectionRule {
+    /// Key display name or vault item id.
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +188,9 @@ pub struct AgentConfig {
     pub notification_reconnect_attempts_before_fallback: usize,
     #[serde(default = "default_notification_reconnect_max_backoff")]
     pub notification_reconnect_max_backoff: u64,
+    /// Ask which key to use when no rule, host binding, or history picks one.
+    #[serde(default)]
+    pub key_picker: bool,
 }
 
 fn default_sync_interval() -> u64 {
@@ -205,6 +228,7 @@ impl Default for AgentConfig {
             notification_reconnect_attempts_before_fallback:
                 default_notification_reconnect_attempts_before_fallback(),
             notification_reconnect_max_backoff: default_notification_reconnect_max_backoff(),
+            key_picker: false,
         }
     }
 }
@@ -1163,5 +1187,41 @@ mod tests {
     fn logging_default_is_five_mib() {
         assert_eq!(default_log_max_file_bytes(), 5 * 1024 * 1024);
         assert_eq!(Config::default().logging.max_file_bytes, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn selection_rules_and_key_picker_parse_and_round_trip() {
+        let defaults = Config::default();
+        assert!(!defaults.agent.key_picker, "the key picker is opt-in");
+        assert!(defaults.rules.is_empty());
+        assert!(
+            !toml::to_string_pretty(&defaults).unwrap().contains("rules"),
+            "an empty rule list must not be written back to config.toml"
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+            [agent]
+            key_picker = true
+
+            [[rules]]
+            key = "work-github"
+            host = "github.com"
+            repo = "acme/*"
+
+            [[rules]]
+            key = "deploy"
+            host = "*.prod.example.com !bastion.prod.example.com"
+            user = "deploy"
+            "#,
+        )
+        .unwrap();
+        assert!(config.agent.key_picker);
+        assert_eq!(config.rules.len(), 2);
+        assert_eq!(config.rules[0].repo.as_deref(), Some("acme/*"));
+        assert_eq!(config.rules[0].user, None);
+
+        let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.rules[1].user.as_deref(), Some("deploy"));
     }
 }

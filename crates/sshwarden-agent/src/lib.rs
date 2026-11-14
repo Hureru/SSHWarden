@@ -14,6 +14,8 @@ mod peercred_unix_listener_stream;
 #[cfg(windows)]
 mod named_pipe_listener_stream;
 
-pub use agent::{SshAgentUIRequest, SshWardenAgent, SshWardenKey};
+pub use agent::{
+    ListSelection, SshAgentListRequest, SshAgentUIRequest, SshWardenAgent, SshWardenKey,
+};
 pub use control::{ControlAction, ControlRequest, ControlResponse, CONTROL_PIPE_NAME};
 pub use request_parser::OperationKind;

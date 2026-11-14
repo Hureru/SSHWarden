@@ -3,7 +3,6 @@
 //! Moved out of `main.rs` as part of the incremental module split (M1 step 6c).
 
 use crate::cache::load_managed_keys_from_cache;
-use crate::infer_ssh_target_from_pid;
 use crate::runtime::UIRequestTx;
 use crate::sshconfig::{
     load_host_bindings_importing_managed, managed_sshwarden_include_path,
@@ -69,7 +68,7 @@ pub(crate) async fn run_bind_hosts_flow(
         return false;
     }
 
-    let prefill_host = infer_ssh_target_from_pid(pid);
+    let prefill_host = crate::ssh_target::invocation_for_pid(pid).map(|invocation| invocation.host);
     let bind_request = sshwarden_ui::BindHostsRequest {
         keys: entries,
         initial_selection: initial_cipher_id.map(String::from),

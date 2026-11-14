@@ -120,10 +120,31 @@ pub(crate) async fn run_foreground(
     let response_tx = Arc::new(response_tx);
     let (runtime_event_tx, mut runtime_event_rx) = tokio::sync::mpsc::channel::<RuntimeEvent>(32);
 
+    // Key list requests are answered by their own task, not the main loop:
+    // a control action waiting on the user must not stall `ssh` at key listing.
+    let key_selector = Arc::new(crate::key_select::KeySelector::load(&config));
+    let (list_tx, mut list_rx) =
+        tokio::sync::mpsc::channel::<sshwarden_agent::SshAgentListRequest>(32);
+    {
+        let key_selector = key_selector.clone();
+        let ui_request_tx = ui_request_tx.clone();
+        tokio::spawn(async move {
+            while let Some(request) = list_rx.recv().await {
+                let key_selector = key_selector.clone();
+                let ui_request_tx = ui_request_tx.clone();
+                tokio::spawn(async move {
+                    let selection = key_selector.select(&request, &ui_request_tx).await;
+                    let _ = request.reply.send(selection);
+                });
+            }
+        });
+    }
+
     // Start the SSH agent server
     let agent_endpoint = config.socket.path.as_deref().map(std::path::PathBuf::from);
     let mut agent = sshwarden_agent::SshWardenAgent::start_server_with_endpoint(
         request_tx,
+        list_tx,
         response_tx.clone(),
         agent_endpoint,
     )
@@ -369,6 +390,7 @@ pub(crate) async fn run_foreground(
                 let runtime_event_tx_clone = runtime_event_tx.clone();
                 let authorization_memory_clone = authorization_memory.clone();
                 let pin_failures_clone = pin_failures.clone();
+                let key_selector_clone = key_selector.clone();
 
                 let ui_tx_clone = ui_request_tx.clone();
 
@@ -388,6 +410,7 @@ pub(crate) async fn run_foreground(
                         runtime_event_tx_clone,
                         authorization_memory_clone,
                         pin_failures_clone,
+                        key_selector_clone,
                     ).await;
                     in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 });

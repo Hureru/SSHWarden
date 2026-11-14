@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted. The premise that the agent cannot know the destination when listing keys only holds for clients without `session-bind@openssh.com`; see ADR 0027, which adds agent-side ordering on top of the bindings described here.
 
 ## Context
 

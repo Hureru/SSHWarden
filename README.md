@@ -165,6 +165,14 @@ sshwarden keys ui                         # 图形绑定管理器（需 agent �
 
 也可以通过签名请求里的 **Bind & Approve...** 图形流程完成绑定。详见 [`docs/host-bindings.md`](docs/host-bindings.md)。
 
+不绑定也可以：agent 会按连接调整 key 的提供顺序（只排序，不隐藏任何 key），依次参考
+
+1. `config.toml` 里的 `[[rules]]`（按主机 / 用户 / Git 仓库匹配，例如同一个 `github.com` 上按 `acme/*` 区分账号）；
+2. Host 绑定；
+3. 访问历史（该服务器上次接受的 key，成功连过一次后自动排到第一）。
+
+需要每次明确选一把时，设置 `[agent] key_picker = true`：没有任何偏好时会弹窗让你点选要用的 key。写法见 [`config.toml.example`](config.toml.example)，设计说明见 [ADR 0027](docs/adr/0027-agent-side-key-selection.md)。
+
 ### ⑤ 集成（本机设置）
 
 ```bash
@@ -211,7 +219,7 @@ Bitwarden Desktop 已经提供 SSH Agent，但它依赖完整 Electron 桌面客
 - Tokio
 - Clap
 - Slint
-- bitwarden-russh
+- bitwarden-russh（vendored 于 `crates/bitwarden-russh`）
 - reqwest
 - tokio-tungstenite
 - AES-256-CBC + HMAC-SHA256
