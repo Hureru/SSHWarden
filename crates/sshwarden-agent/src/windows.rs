@@ -3,15 +3,16 @@ use bitwarden_russh::ssh_agent;
 
 use std::sync::Arc;
 
-use super::agent::{SshAgentUIRequest, SshWardenAgent};
+use super::agent::{SshAgentListRequest, SshAgentUIRequest, SshWardenAgent};
 
 impl SshWardenAgent {
     pub fn start_server_with_endpoint(
         auth_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
+        list_request_tx: tokio::sync::mpsc::Sender<SshAgentListRequest>,
         auth_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
         endpoint: Option<std::path::PathBuf>,
     ) -> Result<Self, anyhow::Error> {
-        let agent_state = SshWardenAgent::new(auth_request_tx, auth_response_tx);
+        let agent_state = SshWardenAgent::new(auth_request_tx, list_request_tx, auth_response_tx);
 
         let stream = named_pipe_listener_stream::NamedPipeServerStream::new(
             endpoint,

@@ -44,9 +44,12 @@ pub trait Agent<I: Clone, K>: Clone + Send + 'static {
         async { true }
     }
 
-    fn can_list(&self, _connection_info: &I) -> impl std::future::Future<Output = bool> + Send {
-        async { true }
-    }
+    /// SSHWarden change: the identities to answer this connection's
+    /// REQUEST_IDENTITIES with, in order. `None` answers FAILURE.
+    fn identities(
+        &self,
+        connection_info: &I,
+    ) -> impl std::future::Future<Output = Option<Vec<K>>> + Send;
 
     fn set_sessionbind_info(
         &self,
@@ -143,13 +146,11 @@ impl<
             Ok(REQUEST_IDENTITIES) => {
                 let agent = self.agent.take().ok_or(SSHAgentError::AgentFailure)?;
                 self.agent = Some(agent.clone());
-                if !agent.can_list(&self.connection_info).await {
-                    writebuf.push(msg::FAILURE);
-                } else if let Ok(keys) = self.keys.0.read() {
+                if let Some(keys) = agent.identities(&self.connection_info).await {
                     writebuf.push(msg::IDENTITIES_ANSWER);
                     writebuf.push_u32_be(keys.len() as u32);
-                    for (public_key_bytes, key) in keys.iter() {
-                        writebuf.extend_ssh_string(public_key_bytes);
+                    for key in &keys {
+                        writebuf.extend_ssh_string(&key.public_key_bytes());
                         writebuf.extend_ssh_string(key.name().as_bytes());
                     }
                 } else {

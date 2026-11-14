@@ -7,6 +7,8 @@ pub struct PeerInfo {
     process_name: String,
     is_forwarding: Arc<AtomicBool>,
     host_key: Arc<Mutex<Vec<u8>>>,
+    /// Vault item id the user picked for this connection in the key picker.
+    picked: Arc<Mutex<Option<String>>>,
 }
 
 impl PeerInfo {
@@ -17,6 +19,7 @@ impl PeerInfo {
             process_name,
             is_forwarding: Arc::new(AtomicBool::new(false)),
             host_key: Arc::new(Mutex::new(Vec::new())),
+            picked: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -27,6 +30,7 @@ impl PeerInfo {
             process_name: "Unknown application".to_string(),
             is_forwarding: Arc::new(AtomicBool::new(false)),
             host_key: Arc::new(Mutex::new(Vec::new())),
+            picked: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -59,5 +63,13 @@ impl PeerInfo {
 
     pub fn host_key(&self) -> Vec<u8> {
         self.host_key.lock().expect("Mutex is not poisoned").clone()
+    }
+
+    pub fn set_picked(&self, cipher_id: Option<String>) {
+        *self.picked.lock().expect("Mutex is not poisoned") = cipher_id;
+    }
+
+    pub fn picked(&self) -> Option<String> {
+        self.picked.lock().expect("Mutex is not poisoned").clone()
     }
 }

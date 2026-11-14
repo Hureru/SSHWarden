@@ -25,10 +25,34 @@ pub struct SshAgentUIRequest {
     /// PID of the calling process (best-effort; 0 if unknown). Used by the
     /// host application for UX features like host inference.
     pub pid: u32,
-    pub is_list: bool,
     pub namespace: Option<String>,
     pub operation_kind: crate::request_parser::OperationKind,
     pub is_forwarding: bool,
+    /// Host key from the connection's last session-bind (empty if the client
+    /// sent none, i.e. OpenSSH < 8.9 or a non-OpenSSH client).
+    pub host_key: Vec<u8>,
+    /// The user picked exactly this key for this connection in the key picker.
+    pub preselected: bool,
+}
+
+/// Asks the host application which identities to list for one connection.
+pub struct SshAgentListRequest {
+    pub pid: u32,
+    pub process_name: String,
+    pub is_forwarding: bool,
+    /// See [`SshAgentUIRequest::host_key`].
+    pub host_key: Vec<u8>,
+    /// Listable keys as `(vault item id, name)`.
+    pub keys: Vec<(String, String)>,
+    /// Dropping this without replying fails the list request closed.
+    pub reply: tokio::sync::oneshot::Sender<ListSelection>,
+}
+
+/// The identities to list, in the order they should be offered.
+pub struct ListSelection {
+    pub cipher_ids: Vec<String>,
+    /// The user explicitly picked `cipher_ids[0]` for this connection.
+    pub user_picked: bool,
 }
 
 /// An SSH key stored in the agent's keystore.
@@ -64,9 +88,9 @@ pub struct SshWardenAgent {
     keystore: ssh_agent::KeyStore<SshWardenKey>,
     cancellation_token: CancellationToken,
     show_ui_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
+    list_request_tx: tokio::sync::mpsc::Sender<SshAgentListRequest>,
     ui_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
     request_id: Arc<AtomicU32>,
-    needs_unlock: Arc<AtomicBool>,
     is_running: Arc<AtomicBool>,
     /// Reports a fatal agent-transport failure (e.g. the SSH agent endpoint
     /// could not be claimed). The main loop watches this so the daemon shuts
@@ -114,10 +138,11 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
                 cipher_id: Some(ssh_key.cipher_uuid.clone()),
                 process_name: info.process_name().to_string(),
                 pid: info.pid(),
-                is_list: false,
                 namespace,
                 operation_kind,
                 is_forwarding: info.is_forwarding(),
+                host_key: info.host_key(),
+                preselected: info.picked().as_deref() == Some(ssh_key.cipher_uuid.as_str()),
             })
             .await
             .is_err()
@@ -135,35 +160,49 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
         false
     }
 
-    async fn can_list(&self, info: &PeerInfo) -> bool {
-        if !self.needs_unlock.load(std::sync::atomic::Ordering::Relaxed) {
-            return true;
-        }
-
-        let request_id = self.get_request_id();
-
-        let mut rx_channel = self.ui_response_tx.subscribe();
-        let message = SshAgentUIRequest {
-            request_id,
-            cipher_id: None,
-            process_name: info.process_name().to_string(),
+    async fn identities(&self, info: &PeerInfo) -> Option<Vec<SshWardenKey>> {
+        let keys = self
+            .keystore
+            .0
+            .read()
+            .expect("RwLock is not poisoned")
+            .values()
+            .map(|key| (key.cipher_uuid.clone(), key.name.clone()))
+            .collect();
+        let (reply, selection) = tokio::sync::oneshot::channel();
+        let request = SshAgentListRequest {
             pid: info.pid(),
-            is_list: true,
-            namespace: None,
-            operation_kind: crate::request_parser::OperationKind::SshAuthentication,
+            process_name: info.process_name().to_string(),
             is_forwarding: info.is_forwarding(),
+            host_key: info.host_key(),
+            keys,
+            reply,
         };
-        if self.show_ui_request_tx.send(message).await.is_err() {
-            // UI channel gone (daemon shutting down); fail closed, don't panic.
-            error!("UI request channel closed; denying list request");
-            return false;
+        if self.list_request_tx.send(request).await.is_err() {
+            // Host application is gone (daemon shutting down); fail closed.
+            error!("List request channel closed; denying list request");
+            return None;
         }
-        while let Ok((id, response)) = rx_channel.recv().await {
-            if id == request_id {
-                return response;
-            }
+        let selection = selection.await.ok()?;
+        if selection.user_picked {
+            info.set_picked(selection.cipher_ids.first().cloned());
         }
-        false
+
+        let keystore = self.keystore.0.read().expect("RwLock is not poisoned");
+        Some(
+            selection
+                .cipher_ids
+                .iter()
+                .filter_map(|id| keystore.values().find(|key| &key.cipher_uuid == id))
+                // Listing needs no private material; do not copy it around.
+                .map(|key| SshWardenKey {
+                    private_key: None,
+                    public_key_bytes: key.public_key_bytes.clone(),
+                    name: key.name.clone(),
+                    cipher_uuid: key.cipher_uuid.clone(),
+                })
+                .collect(),
+        )
     }
 
     async fn set_sessionbind_info(
@@ -179,6 +218,7 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
                 if session_bind_info.is_forwarding {
                     connection_info.set_forwarding(true);
                 }
+                // The last bind names the host actually being authenticated to.
                 connection_info.set_host_key(session_bind_info.host_key.clone());
             }
             SessionBindResult::SignatureFailure => {
@@ -191,6 +231,7 @@ impl ssh_agent::Agent<PeerInfo, SshWardenKey> for SshWardenAgent {
 impl SshWardenAgent {
     pub fn new(
         auth_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
+        list_request_tx: tokio::sync::mpsc::Sender<SshAgentListRequest>,
         auth_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
     ) -> Self {
         let (fatal_tx, _fatal_rx) = tokio::sync::watch::channel(None);
@@ -198,9 +239,9 @@ impl SshWardenAgent {
             keystore: ssh_agent::KeyStore(Arc::new(RwLock::new(HashMap::new()))),
             cancellation_token: CancellationToken::new(),
             show_ui_request_tx: auth_request_tx,
+            list_request_tx,
             ui_response_tx: auth_response_tx,
             request_id: Arc::new(AtomicU32::new(0)),
-            needs_unlock: Arc::new(AtomicBool::new(true)),
             is_running: Arc::new(AtomicBool::new(false)),
             fatal_tx: Arc::new(fatal_tx),
         }
@@ -238,9 +279,6 @@ impl SshWardenAgent {
 
         let keystore = &mut self.keystore;
         keystore.0.write().expect("RwLock is not poisoned").clear();
-
-        self.needs_unlock
-            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         for (key, name, cipher_id) in new_keys.iter() {
             match parse_key_safe(key) {
@@ -291,8 +329,6 @@ impl SshWardenAgent {
 
         let keystore = &mut self.keystore;
         keystore.0.write().expect("RwLock is not poisoned").clear();
-        self.needs_unlock
-            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         for (public_key_openssh, name, cipher_id) in identities {
             match ssh_key::PublicKey::from_openssh(&public_key_openssh)
@@ -334,16 +370,12 @@ impl SshWardenAgent {
             .for_each(|(_public_key, key)| {
                 key.private_key = None;
             });
-        self.needs_unlock
-            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     pub fn clear_keys(&mut self) -> Result<(), anyhow::Error> {
         let keystore = &mut self.keystore;
         keystore.0.write().expect("RwLock is not poisoned").clear();
-        self.needs_unlock
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -367,18 +399,6 @@ impl SshWardenAgent {
             .values()
             .filter(|k| k.private_key.is_some())
             .count()
-    }
-
-    pub fn start_server(
-        auth_request_tx: tokio::sync::mpsc::Sender<SshAgentUIRequest>,
-        auth_response_tx: Arc<tokio::sync::broadcast::Sender<(u32, bool)>>,
-    ) -> Result<Self, anyhow::Error> {
-        Self::start_server_with_endpoint(auth_request_tx, auth_response_tx, None)
-    }
-
-    pub fn clear_needs_unlock(&self) {
-        self.needs_unlock
-            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn is_running(&self) -> bool {
@@ -453,11 +473,116 @@ nGZV/aEAZ3ZMrsrA3g32AAAAEHRlc3RAZXhhbXBsZS5jb20BAgMEBQ==
         tokio::sync::broadcast::Sender<(u32, bool)>,
     ) {
         let (request_tx, request_rx) = tokio::sync::mpsc::channel::<SshAgentUIRequest>(16);
+        let (list_tx, _list_rx) = tokio::sync::mpsc::channel::<SshAgentListRequest>(16);
         let (response_tx, _response_rx) = tokio::sync::broadcast::channel::<(u32, bool)>(16);
         let response_tx = Arc::new(response_tx);
 
-        let agent = SshWardenAgent::new(request_tx, response_tx.clone());
+        let agent = SshWardenAgent::new(request_tx, list_tx, response_tx.clone());
         (agent, request_rx, (*response_tx).clone())
+    }
+
+    const TEST_ED25519_PUB: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA5iivf6TICxdizawaKSZS6GnGZV/aEAZ3ZMrsrA3g32";
+    const SECOND_ED25519_PUB: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICThYtp4xYWmZnmkqU5+TxPcMxxqy3tEVxPX9Qi/5IqD";
+
+    /// Send REQUEST_IDENTITIES over a real `serve` connection and return the
+    /// raw reply body. `answer` plays the host application.
+    async fn list_over_the_wire(
+        answer: impl FnOnce(SshAgentListRequest) + Send + 'static,
+    ) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (request_tx, _request_rx) = tokio::sync::mpsc::channel::<SshAgentUIRequest>(16);
+        let (list_tx, mut list_rx) = tokio::sync::mpsc::channel::<SshAgentListRequest>(16);
+        let (response_tx, _response_rx) = tokio::sync::broadcast::channel::<(u32, bool)>(16);
+        let mut agent = SshWardenAgent::new(request_tx, list_tx, Arc::new(response_tx));
+        agent.is_running.store(true, Ordering::Relaxed);
+        agent
+            .set_public_identities(vec![
+                (
+                    TEST_ED25519_PUB.to_string(),
+                    "first".to_string(),
+                    "id-1".to_string(),
+                ),
+                (
+                    SECOND_ED25519_PUB.to_string(),
+                    "second".to_string(),
+                    "id-2".to_string(),
+                ),
+            ])
+            .expect("set_public_identities should succeed");
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let listener = futures::stream::iter(vec![Ok((server, PeerInfo::unknown()))]);
+        tokio::spawn(ssh_agent::serve(
+            listener,
+            agent.clone(),
+            agent.keystore_clone(),
+            agent.cancellation_token(),
+        ));
+        tokio::spawn(async move {
+            if let Some(request) = list_rx.recv().await {
+                answer(request);
+            }
+        });
+
+        client.write_all(&[0, 0, 0, 1, 11]).await.expect("write");
+        let len = client.read_u32().await.expect("reply length") as usize;
+        let mut body = vec![0; len];
+        client.read_exact(&mut body).await.expect("reply body");
+        agent.cancellation_token().cancel();
+        body
+    }
+
+    /// Comments of an IDENTITIES_ANSWER body, in wire order.
+    fn listed_names(body: &[u8]) -> Vec<String> {
+        fn take<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
+            let len = u32::from_be_bytes(rest[..4].try_into().expect("u32")) as usize;
+            let (value, tail) = rest[4..].split_at(len);
+            *rest = tail;
+            value
+        }
+        assert_eq!(body[0], 12, "expected SSH_AGENT_IDENTITIES_ANSWER");
+        let mut rest = &body[5..];
+        (0..u32::from_be_bytes(body[1..5].try_into().expect("u32")))
+            .map(|_| {
+                take(&mut rest); // key blob
+                String::from_utf8_lossy(take(&mut rest)).into_owned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn identities_are_listed_in_the_selected_order() {
+        let body = list_over_the_wire(|request| {
+            assert_eq!(request.keys.len(), 2, "both keys are offered for selection");
+            let _ = request.reply.send(ListSelection {
+                cipher_ids: vec![
+                    "id-2".to_string(),
+                    "unknown".to_string(),
+                    "id-1".to_string(),
+                ],
+                user_picked: false,
+            });
+        })
+        .await;
+        assert_eq!(listed_names(&body), ["second", "first"]);
+
+        let body = list_over_the_wire(|request| {
+            let _ = request.reply.send(ListSelection {
+                cipher_ids: vec!["id-1".to_string()],
+                user_picked: true,
+            });
+        })
+        .await;
+        assert_eq!(listed_names(&body), ["first"]);
+    }
+
+    #[tokio::test]
+    async fn dropped_selection_fails_the_list_request_closed() {
+        let body = list_over_the_wire(drop).await;
+        assert_eq!(body, [5], "expected SSH_AGENT_FAILURE");
     }
 
     #[tokio::test]
