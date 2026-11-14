@@ -45,7 +45,8 @@ Copyright (C) 2026 SSHWarden Contributors
 
 - **bitwarden-russh**: SSH Agent 协议实现
   - 仓库: https://github.com/bitwarden/bitwarden-russh
-  - 许可证: Apache-2.0 / MIT
+  - 许可证: Apache-2.0（全文见 `crates/bitwarden-russh/LICENSE-2.0.txt`）
+  - 源码副本位于 `crates/bitwarden-russh/`，取自上游 commit a641316（上游已停止维护）
 
 - **Tokio**: 异步运行时
   - 仓库: https://github.com/tokio-rs/tokio
