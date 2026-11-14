@@ -33,9 +33,11 @@ pub fn get_peer_info(peer_pid: u32) -> Result<PeerInfo, String> {
 /// extracting the SSH target host) — never for security-relevant decisions.
 pub fn get_peer_cmd(peer_pid: u32) -> Option<Vec<String>> {
     let mut system = System::new();
-    system.refresh_processes(
+    // `refresh_processes` does not read the command line; ask for it explicitly.
+    system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(peer_pid)]),
         true,
+        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
     );
     let Some(process) = system.process(Pid::from_u32(peer_pid)) else {
         tracing::debug!(
@@ -56,4 +58,17 @@ pub fn get_peer_cmd(peer_pid: u32) -> Option<Vec<String>> {
         );
     }
     argv
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The default sysinfo refresh kind does not include the command line, which
+    // silently turned every argv-based inference into "argv is empty".
+    #[test]
+    fn get_peer_cmd_reads_own_argv() {
+        let argv = get_peer_cmd(std::process::id()).expect("own process is readable");
+        assert!(!argv.is_empty(), "argv of the running test binary is empty");
+    }
 }
