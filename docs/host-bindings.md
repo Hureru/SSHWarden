@@ -65,9 +65,11 @@ sshwarden ssh-config write                            # regenerate snippet + ens
 
 ## GUI path
 
-When a signing request appears for an unbound host, choose **Bind & Approve...**. SSHWarden opens the Bind Hosts dialog, preselects the requested key, and best-effort pre-fills the SSH host by inspecting the client process command line.
+When a signing request appears for an unbound host, choose **Bind…** in the authorization prompt (or press `B`). SSHWarden opens the Bind Hosts dialog, preselects the requested key, and best-effort pre-fills the SSH host by inspecting the client process command line.
 
 If the prefill is empty, type the hostname manually. Process inspection can fail on hardened Linux/macOS systems, sandboxed packages, or if the SSH process exits too quickly.
+
+The host field has the keyboard focus: `Enter` adds the host, `Ctrl+Enter` (`⌘+Enter` on macOS) saves, `Esc` cancels. A host that is still in the field when you save is bound too.
 
 Saving from this flow also approves the original signing request.
 
@@ -125,6 +127,18 @@ The agent matches binding patterns against the destination as you typed it, so a
 ### Bind dialog shows no prefill
 
 SSHWarden could not read the SSH client process command line. This is expected on some hardened or sandboxed systems. Manually type the hostname.
+
+### Dialogs on Wayland
+
+Wayland does not let a program place its own windows, keep them above others, or take the keyboard focus: the compositor decides. SSHWarden's dialogs have a fixed size and the app-id `sshwarden`. niri floats and focuses them without any configuration. If your compositor, or a rule of your own, does otherwise, add a rule for that app-id. For niri:
+
+```kdl
+window-rule {
+    match app-id="^sshwarden$"
+    open-floating true
+    open-focused true
+}
+```
 
 ### Binding to `*`
 

@@ -72,6 +72,8 @@ xdg_toplevel#37.configure(800, 600, ...)  ← compositor 按 800×600 配置
 crate::window_placement::declare_fixed_size(dialog.window(), 380.0, 230.0);
 ```
 
+（后续：这一步已收进 `window_placement::show_dialog()`，四个弹窗都通过它显示，尺寸由调用方传入。）
+
 `Window::set_size()` 在窗口尚未创建时会走到 `WinitWindowOrNone::None(attributes)` 分支，把尺寸写入 `attributes.inner_size` 并标记 `has_explicit_size`。这样：
 
 1. winit 创建窗口时不再回退到 800×600，而是用 380×230；
