@@ -15,6 +15,8 @@ fn main() {
                 info: sshwarden_ui::SignRequestInfo {
                     key_name: "US-Phoenix-Arm-4c24G".to_string(),
                     process_name: "ssh".to_string(),
+                    pid: 0,
+                    target: None,
                     namespace: None,
                     operation_kind: "ssh_authentication".to_string(),
                     is_forwarding: false,

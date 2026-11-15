@@ -1,0 +1,70 @@
+// Shared look and behaviour constants for every SSHWarden dialog.
+
+import { Palette } from "std-widgets.slint";
+
+export global Theme {
+    // Windows' UI font. Slint's generic sans-serif there is Arial; systems
+    // without Segoe UI fall back to their own default.
+    out property <string> font-family: "Segoe UI";
+    out property <length> pad: 16px;
+    out property <length> gap: 10px;
+    out property <length> title-size: 16px;
+    out property <length> body-size: 13px;
+    out property <length> small-size: 12px;
+    // Lists are sized in whole rows: after a long jump (End, or opening on a
+    // key far down) Slint puts a row boundary at the top edge, and a list of
+    // any other height then shows the selected row cut off at the bottom.
+    // shortcut: 40px is the Fluent row height; measure the rows if another style must not cut them.
+    out property <length> list-row: 40px;
+    out property <color> warning: #ff9900;
+    out property <color> error: Palette.color-scheme == ColorScheme.dark ? #ff7b6e : #c42b1c;
+    out property <color> muted: Palette.foreground.with-alpha(0.65);
+    // How long a fresh prompt refuses to be answered, so that a key press or
+    // click meant for the window the user was working in cannot approve it.
+    out property <duration> arm-delay: 400ms;
+}
+
+export component WarningBanner inherits Rectangle {
+    in property <string> text;
+
+    background: Theme.warning.with-alpha(0.2);
+    border-radius: 4px;
+    accessible-role: AccessibleRole.text;
+    accessible-label: "Warning: " + root.text;
+
+    VerticalLayout {
+        padding: 6px;
+        padding-left: 8px;
+        padding-right: 8px;
+
+        Text {
+            text: "\u{26A0} " + root.text;
+            color: Palette.foreground;
+            font-size: Theme.body-size;
+            wrap: word-wrap;
+            accessible-role: none;
+        }
+    }
+}
+
+export component DetailRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+
+    spacing: 8px;
+
+    Text {
+        text: root.label;
+        width: 76px;
+        color: Theme.muted;
+        font-size: Theme.body-size;
+    }
+
+    Text {
+        text: root.value;
+        color: Palette.foreground;
+        font-size: Theme.body-size;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}

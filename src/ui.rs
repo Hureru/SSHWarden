@@ -78,6 +78,8 @@ pub(crate) async fn run_authorization_prompt(
     let sign_info = sshwarden_ui::SignRequestInfo {
         key_name,
         process_name: request.process_name.clone(),
+        pid: request.pid,
+        target: crate::key_select::describe_target(request),
         namespace: request.namespace.clone(),
         operation_kind: operation_kind_for_request(request).to_string(),
         is_forwarding: request.is_forwarding,
@@ -408,6 +410,8 @@ pub(crate) async fn handle_ui_request(
     let sign_info = sshwarden_ui::SignRequestInfo {
         key_name,
         process_name: request.process_name.clone(),
+        pid: request.pid,
+        target: crate::key_select::describe_target(&request),
         namespace: request.namespace.clone(),
         operation_kind: operation_kind.clone(),
         is_forwarding: request.is_forwarding,

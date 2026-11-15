@@ -10,7 +10,7 @@ use crate::sshconfig::{
     write_sshwarden_include_line,
 };
 /// Prompt the user to authorize a sign request, supporting the
-/// "Bind & Approve…" secondary action. Returns true if the request was
+/// "Bind…" secondary action. Returns true if the request was
 /// approved (either directly or after a successful binding save).
 pub(crate) async fn prompt_authorization_with_bind_flow(
     ui_request_tx: &UIRequestTx,

@@ -73,6 +73,17 @@ PIN / Windows Hello / macOS Keychain / Linux Secret Service -> 解锁 Local Cach
 2. Unlock 成功后，Signing Request 仍可能需要用户 Authorization。
 3. Key List Request 不触发 Unlock；锁定状态下可以列出 Key Identity。
 
+授权、解锁、点选 key、绑定主机这四个弹窗都可以只用键盘操作，按钮上标有对应的按键：
+
+- 授权：`Enter` 批准，`Esc` 拒绝，`B` 进入主机绑定。
+- 解锁：输入 PIN 后按 `Enter`，`Esc` 取消。
+- 点选 key：`↑` `↓` `Home` `End` 移动，`Enter` 选用，`1`–`9` 直接选用对应的行，`Esc` 取消。
+- 绑定主机：`Enter` 添加输入框里的主机，`Ctrl+Enter`（macOS 上是 `⌘+Enter`）保存，`Esc` 取消。保存时输入框里还没添加的主机会一并保存。
+
+授权和点选弹窗刚弹出的约 0.4 秒内只响应 `Esc`，批准按钮也暂时不可点，避免正在别的窗口里打字或点击时误批准。
+
+Wayland 下弹窗的位置和焦点由 compositor 决定，见 [`docs/host-bindings.md`](docs/host-bindings.md#dialogs-on-wayland)。
+
 ## 目标平台
 
 SSHWarden 的一等支持平台目标是：
@@ -163,7 +174,7 @@ sshwarden keys unbind github-key --all      # 解绑全部 host
 sshwarden keys ui                         # 图形绑定管理器（需 agent 运行）
 ```
 
-也可以通过签名请求里的 **Bind & Approve...** 图形流程完成绑定。详见 [`docs/host-bindings.md`](docs/host-bindings.md)。
+也可以在签名授权弹窗里点 **Bind…**（或按 `B`）走图形流程完成绑定。详见 [`docs/host-bindings.md`](docs/host-bindings.md)。
 
 不绑定也可以：agent 会按连接调整 key 的提供顺序（只排序，不隐藏任何 key），依次参考
 
