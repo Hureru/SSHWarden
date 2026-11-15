@@ -5,6 +5,10 @@ pub mod unlock;
 
 mod window_placement;
 
+// Linux only: elsewhere a window cannot be created off the main thread.
+#[cfg(all(test, target_os = "linux"))]
+mod dialog_key_tests;
+
 use std::collections::BTreeMap;
 
 /// Information about an SSH sign request, used to display to the user.
@@ -12,6 +16,10 @@ use std::collections::BTreeMap;
 pub struct SignRequestInfo {
     pub key_name: String,
     pub process_name: String,
+    pub pid: u32,
+    /// Where the key is going (host, repository), for display only: it comes
+    /// from the client's command line. `None` when there is no destination.
+    pub target: Option<String>,
     pub namespace: Option<String>,
     pub operation_kind: String,
     pub is_forwarding: bool,
@@ -32,7 +40,7 @@ pub enum AuthorizationResult {
     Approved,
     Denied,
     Timeout,
-    /// User clicked the "Bind this key…" secondary action. The main loop is
+    /// User chose the "Bind…" secondary action. The main loop is
     /// expected to follow up with a [`UIRequest::BindHostsDialog`] and, on
     /// successful save, treat the original sign request as approved.
     BindRequested,

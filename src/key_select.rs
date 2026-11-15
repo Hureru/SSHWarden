@@ -92,6 +92,14 @@ impl SelectContext {
     }
 }
 
+/// Where a login request is going, for the authorization prompt. Display only:
+/// it comes from the client's command line. `None` for anything but a login.
+pub(crate) fn describe_target(request: &SshAgentUIRequest) -> Option<String> {
+    (request.operation_kind == OperationKind::SshAuthentication).then(|| {
+        SelectContext::for_peer(request.pid, request.is_forwarding, &request.host_key).describe()
+    })
+}
+
 /// `*` and `?` glob match, ASCII case-insensitive.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
@@ -417,6 +425,27 @@ impl KeySelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describe_target_only_for_logins_and_never_from_argv_when_forwarded() {
+        let mut request = SshAgentUIRequest {
+            request_id: 1,
+            cipher_id: None,
+            process_name: "ssh".to_string(),
+            // Our own pid: its argv must not be consulted on a forwarded connection.
+            pid: std::process::id(),
+            namespace: None,
+            operation_kind: OperationKind::SshAuthentication,
+            is_forwarding: true,
+            host_key: b"host-key".to_vec(),
+            preselected: false,
+        };
+        let target = describe_target(&request).expect("login has a target");
+        assert!(target.starts_with("SHA256:"), "{target}");
+
+        request.operation_kind = OperationKind::GitSigning;
+        assert_eq!(describe_target(&request), None);
+    }
 
     fn keys() -> Vec<(String, String)> {
         [

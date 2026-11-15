@@ -1,13 +1,16 @@
 use tracing::info;
 
 slint::slint! {
-    import { Button, VerticalBox, LineEdit, Palette } from "std-widgets.slint";
+    import { Button, LineEdit, Palette } from "std-widgets.slint";
+    import { Theme } from "../theme.slint";
 
     export component PinDialog inherits Window {
         title: "SSHWarden - Unlock Vault";
         icon: @image-url("../../assets/Square44x44Logo.png");
+        default-font-family: Theme.font-family;
         width: 380px;
-        height: 195px;
+        // Fixed size, sized to the content: also what makes tiling compositors float it.
+        height: content.preferred-height;
         background: Palette.background;
         always-on-top: true;
 
@@ -19,6 +22,7 @@ slint::slint! {
         in-out property <bool> verifying: false;
         in-out property <string> pin-text: "";
         in property <string> context-text: "";
+        out property <length> content-height: content.preferred-height;
 
         callback submit-pin(string);
         callback cancel();
@@ -36,73 +40,91 @@ slint::slint! {
             }
         }
 
-        VerticalBox {
-            padding: 24px;
-            spacing: 12px;
-
-            Text {
-                text: "Enter PIN to unlock SSHWarden";
-                color: Palette.foreground;
-                font-size: 14px;
+        // Parent of the content, and capturing: Esc cancels even while typing.
+        // It never takes the focus itself: a click beside the field leaves it there.
+        FocusScope {
+            focus-on-tab-navigation: false;
+            focus-on-click: false;
+            capture-key-pressed(event) => {
+                if event.text == Key.Escape {
+                    root.cancel();
+                    return accept;
+                }
+                return reject;
             }
 
-            if context-text != "": Text {
-                text: context-text;
-                color: Palette.foreground;
-                font-size: 12px;
-            }
+            content := VerticalLayout {
+                padding: Theme.pad;
+                spacing: Theme.gap;
 
-            VerticalLayout {
-                spacing: 4px;
+                Text {
+                    text: "Enter PIN to unlock SSHWarden";
+                    color: Palette.foreground;
+                    font-size: Theme.title-size;
+                    font-weight: 600;
+                }
 
-                Rectangle {
-                    clip: false;
-                    height: pin-input.preferred-height;
+                if context-text != "": Text {
+                    text: context-text;
+                    color: Theme.muted;
+                    font-size: Theme.body-size;
+                    wrap: word-wrap;
+                }
 
-                    pin-input := LineEdit {
-                        text <=> root.pin-text;
-                        x: root.shake-offset;
-                        width: parent.width;
-                        input-type: password;
-                        font-size: 16px;
-                        enabled: !root.verifying;
-                        edited => {
-                            root.show-error = false;
+                VerticalLayout {
+                    spacing: 4px;
+
+                    Rectangle {
+                        clip: false;
+                        height: pin-input.preferred-height;
+
+                        pin-input := LineEdit {
+                            text <=> root.pin-text;
+                            x: root.shake-offset;
+                            width: parent.width;
+                            input-type: password;
+                            font-size: 16px;
+                            enabled: !root.verifying;
+                            accessible-label: "PIN";
+                            accessible-description: root.show-error ? root.error-message : "";
+                            edited => {
+                                root.show-error = false;
+                            }
+                            accepted => { root.try-submit(); }
                         }
-                        accepted => { root.try-submit(); }
+                    }
+
+                    // Always one line high, so the window keeps its height.
+                    HorizontalLayout {
+                        height: 16px;
+
+                        if root.show-error: Text {
+                            text: root.error-message;
+                            color: Theme.error;
+                            font-size: Theme.small-size;
+                        }
                     }
                 }
 
-                Text {
-                    text: root.show-error ? root.error-message : "";
-                    color: #e74c3c;
-                    font-size: 12px;
-                    height: 16px;
-                }
-            }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
 
-            HorizontalLayout {
-                alignment: end;
-                spacing: 12px;
+                    Button {
+                        text: "Cancel (Esc)";
+                        clicked => { root.cancel(); }
+                    }
 
-                Button {
-                    text: "Cancel";
-                    clicked => { root.cancel(); }
-                }
-
-                Button {
-                    text: root.verifying ? "Verifying..." : "Unlock";
-                    primary: true;
-                    enabled: !root.verifying;
-                    clicked => { root.try-submit(); }
+                    Button {
+                        text: root.verifying ? "Verifying\u{2026}" : "Unlock (Enter)";
+                        primary: true;
+                        enabled: !root.verifying;
+                        clicked => { root.try-submit(); }
+                    }
                 }
             }
         }
     }
-}
-
-fn center_and_focus_dialog(dialog: &PinDialog) {
-    crate::window_placement::center_on_active_monitor_and_focus(dialog.window());
 }
 
 fn unlock_context_text(context: &crate::UnlockRequestContext) -> String {
@@ -147,12 +169,28 @@ pub fn show_pin_dialog(
     validator: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
     context: Option<crate::UnlockRequestContext>,
 ) {
+    let Some(dialog) = build_pin_dialog(response_tx, validator, context) else {
+        return;
+    };
+    let height = dialog.get_content_height();
+    if let Err(e) = crate::window_placement::show_dialog(&dialog, 380.0, height) {
+        tracing::error!(error = %e, "Failed to show PIN dialog");
+        dialog.invoke_cancel();
+    }
+}
+
+/// The dialog, wired to answer `response_tx`; `None` (already answered) if it cannot be created.
+pub(crate) fn build_pin_dialog(
+    response_tx: tokio::sync::oneshot::Sender<Option<String>>,
+    validator: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    context: Option<crate::UnlockRequestContext>,
+) -> Option<PinDialog> {
     let dialog = match PinDialog::new() {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(error = %e, "Failed to create PIN dialog");
             let _ = response_tx.send(None);
-            return;
+            return None;
         }
     };
 
@@ -162,7 +200,17 @@ pub fn show_pin_dialog(
 
     // Shared sender: Arc<Mutex> so it can be accessed from invoke_from_event_loop
     let tx_cell = std::sync::Arc::new(std::sync::Mutex::new(Some(response_tx)));
-    let tx_for_show_error = tx_cell.clone();
+    // Answers `None` at most once.
+    let cancel = {
+        let tx = tx_cell.clone();
+        move || {
+            if let Ok(mut guard) = tx.lock() {
+                if let Some(sender) = guard.take() {
+                    let _ = sender.send(None);
+                }
+            }
+        }
+    };
 
     // Shake animation on empty submit
     let weak = dialog.as_weak();
@@ -172,7 +220,7 @@ pub fn show_pin_dialog(
 
     // Submit PIN: spawn validation in background thread
     let weak = dialog.as_weak();
-    let tx = tx_cell.clone();
+    let tx = tx_cell;
     dialog.on_submit_pin(move |pin| {
         let pin_str = pin.to_string();
 
@@ -212,46 +260,20 @@ pub fn show_pin_dialog(
     });
 
     let weak = dialog.as_weak();
-    let tx = tx_cell.clone();
+    let cancel_clicked = cancel.clone();
     dialog.on_cancel(move || {
-        if let Ok(mut guard) = tx.lock() {
-            if let Some(sender) = guard.take() {
-                let _ = sender.send(None);
-            }
-        }
+        cancel_clicked();
         if let Some(d) = weak.upgrade() {
             let _ = d.hide();
         }
     });
 
-    let tx = tx_cell;
     dialog.window().on_close_requested(move || {
-        if let Ok(mut guard) = tx.lock() {
-            if let Some(sender) = guard.take() {
-                let _ = sender.send(None);
-            }
-        }
+        cancel();
         slint::CloseRequestResponse::HideWindow
     });
 
-    // Must run before `show()`: see `window_placement::declare_fixed_size`.
-    crate::window_placement::declare_fixed_size(dialog.window(), 380.0, 195.0);
-
-    if let Err(e) = dialog.show() {
-        tracing::error!(error = %e, "Failed to show PIN dialog");
-        if let Ok(mut guard) = tx_for_show_error.lock() {
-            if let Some(sender) = guard.take() {
-                let _ = sender.send(None);
-            }
-        }
-    } else {
-        let weak = dialog.as_weak();
-        slint::Timer::single_shot(std::time::Duration::from_millis(30), move || {
-            if let Some(d) = weak.upgrade() {
-                center_and_focus_dialog(&d);
-            }
-        });
-    }
+    Some(dialog)
 }
 
 /// Request a PIN dialog from the tokio async context.

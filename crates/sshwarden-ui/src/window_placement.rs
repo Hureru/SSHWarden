@@ -73,8 +73,31 @@ pub(crate) fn center_on_active_monitor_and_focus(window: &slint::Window) {
 ///
 /// The Qt backend is unaffected (it never creates a winit window), which is why
 /// builds with `backend-qt` never showed this.
-pub(crate) fn declare_fixed_size(window: &slint::Window, width: f32, height: f32) {
+fn declare_fixed_size(window: &slint::Window, width: f32, height: f32) {
     window.set_size(slint::LogicalSize::new(width, height));
+}
+
+/// Show a fixed-size dialog at `width` × `height` logical pixels, then center
+/// and focus it where the platform allows that.
+pub(crate) fn show_dialog<T: slint::ComponentHandle + 'static>(
+    dialog: &T,
+    width: f32,
+    height: f32,
+) -> Result<(), slint::PlatformError> {
+    // Lets Wayland compositors match the dialogs in window rules. Needs the
+    // platform to exist, which it does once a dialog has been created.
+    let _ = slint::set_xdg_app_id("sshwarden");
+    // Must run before `show()`: see `declare_fixed_size`.
+    declare_fixed_size(dialog.window(), width, height);
+    dialog.show()?;
+
+    let weak = dialog.as_weak();
+    slint::Timer::single_shot(std::time::Duration::from_millis(30), move || {
+        if let Some(d) = weak.upgrade() {
+            center_on_active_monitor_and_focus(d.window());
+        }
+    });
+    Ok(())
 }
 
 #[cfg(windows)]
