@@ -381,6 +381,28 @@ pub(crate) fn user_ssh_config_path() -> anyhow::Result<std::path::PathBuf> {
     sshwarden_config::user_ssh_config_path()
 }
 
+/// Read the user's SSH config for a rewrite. Only a missing file counts as
+/// empty: any other error (bad encoding, permissions) must stop the caller,
+/// or the rewrite would replace the whole file with just our lines.
+fn read_user_ssh_config(config_path: &std::path::Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => Ok(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!(
+            "Failed to read SSH config: {} (left unchanged)",
+            config_path.display()
+        ))),
+    }
+}
+
+/// Replace the user's SSH config through a temp file and a rename, so a crash
+/// cannot leave it half written. A symlinked config (dotfiles) is resolved
+/// first, so the rename replaces the target and keeps the link.
+fn write_user_ssh_config(config_path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    let target = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    sshwarden_config::write_owner_only_file(&target, content)
+}
+
 pub(crate) fn write_sshwarden_include_line(
     config_path: &std::path::Path,
     include_path: &std::path::Path,
@@ -398,7 +420,7 @@ pub(crate) fn write_sshwarden_include_line(
         include_path,
         sshwarden_config::Config::load()?.ssh_config.path_style,
     );
-    let existing = std::fs::read_to_string(config_path).unwrap_or_default();
+    let existing = read_user_ssh_config(config_path)?;
     // Return only when the desired line is already present. A legacy absolute
     // line may still "match" SSHWarden's include semantically, but in
     // home-relative multi-device mode we want the marked block below to rewrite
@@ -450,7 +472,7 @@ pub(crate) fn write_sshwarden_include_line(
         if !new_config.is_empty() && !new_config.ends_with('\n') {
             new_config.push('\n');
         }
-        write_private_file(config_path, &new_config)
+        write_user_ssh_config(config_path, &new_config)
             .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
         return Ok(());
     }
@@ -466,7 +488,7 @@ pub(crate) fn write_sshwarden_include_line(
     new_config.push_str("\n# SSHWarden managed key selector snippets\n");
     new_config.push_str(&include_line);
     new_config.push('\n');
-    write_private_file(config_path, &new_config)
+    write_user_ssh_config(config_path, &new_config)
         .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
 
     Ok(())
@@ -500,8 +522,7 @@ pub(crate) fn remove_sshwarden_include_line(
     if !config_path.exists() {
         return Ok(false);
     }
-    let existing = std::fs::read_to_string(config_path)
-        .with_context(|| format!("Failed to read SSH config: {}", config_path.display()))?;
+    let existing = read_user_ssh_config(config_path)?;
     const MARKER: &str = sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER;
 
     let mut kept: Vec<&str> = Vec::with_capacity(existing.lines().count());
@@ -557,7 +578,7 @@ pub(crate) fn remove_sshwarden_include_line(
             )
         })?;
     }
-    write_private_file(config_path, &new_config)
+    write_user_ssh_config(config_path, &new_config)
         .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
     Ok(true)
 }
@@ -661,6 +682,38 @@ mod tests {
         assert!(snippet.contains("# sshwarden:key id-1"));
         assert!(snippet.contains("# Host <host>"));
         assert!(!snippet.lines().any(|line| line.starts_with("Host ")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit #4: an unreadable config (here: not UTF-8) must fail the command
+    /// and stay byte-for-byte as it was, not be replaced by the Include line.
+    #[test]
+    fn include_write_leaves_unreadable_config_untouched() {
+        let dir = temp_dir("include-non-utf8");
+        let config_path = dir.join("config");
+        let original = b"# caf\xff comment\nHost work\n    User me\n".to_vec();
+        std::fs::write(&config_path, &original).unwrap();
+
+        let result = write_sshwarden_include_line(&config_path, &dir.join("sshwarden_config"));
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&config_path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_write_keeps_symlinked_config_a_symlink() {
+        let dir = temp_dir("include-symlink");
+        let real = dir.join("dotfiles-config");
+        let link = dir.join("config");
+        std::fs::write(&real, "Host work\n    User me\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_sshwarden_include_line(&link, &dir.join("sshwarden_config")).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert!(std::fs::read_to_string(&real).unwrap().contains("Include "));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

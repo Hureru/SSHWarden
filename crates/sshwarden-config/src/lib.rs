@@ -969,7 +969,7 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 /// [`bindings::HostBindingsFile::save`]. This bounds a crash or cloud-sync
 /// collision to a recoverable file-level event instead of truncating the only
 /// copy in place.
-pub(crate) fn write_owner_only_file(path: &Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
+pub fn write_owner_only_file(path: &Path, content: impl AsRef<[u8]>) -> anyhow::Result<()> {
     let tmp = with_suffix(path, ".tmp");
     std::fs::write(&tmp, content)
         .with_context(|| format!("Failed to write tmp file: {}", tmp.display()))?;
