@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Returned by [`send_control_command`] when the control endpoint could not be
 /// contacted at all — nothing is listening on the pipe/socket, so no daemon is
@@ -31,6 +32,13 @@ impl std::error::Error for ControlUnreachable {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ControlCommand {
     pub cmd: String,
+}
+
+// `cmd` can carry a password or PIN (`unlock-password:<pw>`).
+impl Drop for ControlCommand {
+    fn drop(&mut self) {
+        self.cmd.zeroize();
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,7 +106,7 @@ pub const CONTROL_PIPE_NAME: &str = r"\\.\pipe\sshwarden-control";
 /// daemon side. The control protocol is one short JSON object per connection,
 /// so anything larger is malformed or hostile; capping the read avoids
 /// unbounded buffering from a local process flooding the channel (EH-08).
-const MAX_CONTROL_LINE_BYTES: u64 = 64 * 1024;
+const MAX_CONTROL_LINE_BYTES: usize = 64 * 1024;
 
 /// SEC-01 (Windows): build a security descriptor restricting the control pipe
 /// to the current user + LocalSystem, so the named pipe is not created with the
@@ -220,19 +228,19 @@ pub enum ControlAction {
     Lock,
     Unlock,
     UnlockPin {
-        pin: String,
+        pin: Zeroizing<String>,
     },
     UnlockHello,
     UnlockNative,
     UnlockPassword {
-        password: String,
+        password: Zeroizing<String>,
     },
     Status {
         json: bool,
     },
     Sync,
     SetPin {
-        pin: String,
+        pin: Zeroizing<String>,
     },
     Forget {
         /// In multi-device storage mode, also remove the shared remembered-secret
@@ -259,7 +267,6 @@ pub async fn start_control_server(
     tx: tokio::sync::mpsc::Sender<ControlRequest>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
     info!("Control server starting on {}", CONTROL_PIPE_NAME);
@@ -334,22 +341,17 @@ pub async fn start_control_server(
 
         // Read one line from the client (bounded; EH-08)
         let (reader, mut writer) = tokio::io::split(server);
-        let mut buf_reader = BufReader::new(reader.take(MAX_CONTROL_LINE_BYTES));
-        let mut line = String::new();
-
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => {
-                // Client disconnected without sending anything
-                continue;
-            }
-            Ok(_) => {}
+        let line = match read_control_line(reader).await {
+            // Client disconnected without sending anything
+            Ok(line) if line.is_empty() => continue,
+            Ok(line) => line,
             Err(e) => {
                 error!("Control pipe read error: {}", e);
                 continue;
             }
-        }
+        };
 
-        let response = handle_control_line(line.trim(), &tx).await;
+        let response = handle_control_line(&line, &tx).await;
         write_control_response(&mut writer, &response).await;
     }
 }
@@ -371,15 +373,23 @@ async fn dispatch_control_command(
         "stop" => ControlAction::Stop,
         "bind-hosts-dialog" => ControlAction::BindHostsDialog,
         s if s.starts_with("unlock-pin:") => {
-            let pin = s.strip_prefix("unlock-pin:").unwrap_or("").to_string();
+            let pin = s
+                .strip_prefix("unlock-pin:")
+                .unwrap_or("")
+                .to_string()
+                .into();
             ControlAction::UnlockPin { pin }
         }
         s if s.starts_with("unlock-password:") => {
-            let password = s.strip_prefix("unlock-password:").unwrap_or("").to_string();
+            let password = s
+                .strip_prefix("unlock-password:")
+                .unwrap_or("")
+                .to_string()
+                .into();
             ControlAction::UnlockPassword { password }
         }
         s if s.starts_with("set-pin:") => {
-            let pin = s.strip_prefix("set-pin:").unwrap_or("").to_string();
+            let pin = s.strip_prefix("set-pin:").unwrap_or("").to_string().into();
             ControlAction::SetPin { pin }
         }
         other => return ControlResponse::err(&format!("Unknown command: {other}")),
@@ -401,10 +411,38 @@ async fn dispatch_control_command(
     }
 }
 
+/// Reads one control line (at most [`MAX_CONTROL_LINE_BYTES`]; EH-08) into
+/// memory that is wiped when dropped: the line can carry a password or PIN.
+/// No `BufReader`, whose internal buffer would keep a second, unwiped copy.
+async fn read_control_line<R>(mut reader: R) -> std::io::Result<Zeroizing<String>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Zeroizing::new(vec![0u8; MAX_CONTROL_LINE_BYTES]);
+    let mut len = 0;
+    let mut end = None;
+    while end.is_none() && len < buf.len() {
+        let read = reader.read(&mut buf[len..]).await?;
+        if read == 0 {
+            break;
+        }
+        end = buf[len..len + read].iter().position(|b| *b == b'\n');
+        end = end.map(|at| len + at);
+        len += read;
+    }
+    let line = std::str::from_utf8(&buf[..end.unwrap_or(len)])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(Zeroizing::new(line.trim().to_owned()))
+}
+
 async fn handle_control_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ControlRequest>,
 ) -> ControlResponse {
+    // shortcut: a secret containing `"` or `\` is unescaped through serde_json's
+    // scratch buffer, which is not wiped; needs a non-JSON wire format to fix.
     let cmd: ControlCommand = match serde_json::from_str(line) {
         Ok(c) => c,
         Err(e) => return ControlResponse::err(&format!("Invalid command: {e}")),
@@ -431,7 +469,6 @@ pub async fn start_control_server(
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use std::os::unix::fs::PermissionsExt;
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::net::UnixListener;
 
     let path = match sshwarden_config::default_control_socket_path() {
@@ -520,22 +557,32 @@ pub async fn start_control_server(
         let tx = tx.clone();
         tokio::spawn(async move {
             let (reader, mut writer) = tokio::io::split(stream);
-            let mut buf_reader = BufReader::new(reader.take(MAX_CONTROL_LINE_BYTES));
-            let mut line = String::new();
-
-            match buf_reader.read_line(&mut line).await {
-                Ok(0) => return,
-                Ok(_) => {}
+            let line = match read_control_line(reader).await {
+                Ok(line) if line.is_empty() => return,
+                Ok(line) => line,
                 Err(e) => {
                     error!(error = %e, "Control socket read error");
                     return;
                 }
-            }
+            };
 
-            let response = handle_control_line(line.trim(), &tx).await;
+            let response = handle_control_line(&line, &tx).await;
             write_control_response(&mut writer, &response).await;
         });
     }
+}
+
+/// The JSON line for `cmd`, wiped when dropped (`cmd` can carry a password).
+fn control_command_line(cmd: &str) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let command = ControlCommand {
+        cmd: cmd.to_string(),
+    };
+    // Room for the JSON framing, so the buffer is not reallocated (and its old
+    // copy left behind) unless the command needs a lot of escaping.
+    let mut line = Zeroizing::new(Vec::with_capacity(cmd.len() + 64));
+    serde_json::to_writer(&mut *line, &command)?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 /// Send a control command to the running daemon (client side).
@@ -552,13 +599,7 @@ pub async fn send_control_command(cmd: &str) -> anyhow::Result<ControlResponse> 
     let (reader, mut writer) = tokio::io::split(client);
 
     // Send command
-    let command = ControlCommand {
-        cmd: cmd.to_string(),
-    };
-    let cmd_json = serde_json::to_string(&command)?;
-    writer
-        .write_all(format!("{}\n", cmd_json).as_bytes())
-        .await?;
+    writer.write_all(&control_command_line(cmd)?).await?;
     writer.shutdown().await?;
 
     // Read response
@@ -585,11 +626,7 @@ pub async fn send_control_command(cmd: &str) -> anyhow::Result<ControlResponse> 
 
     let (reader, mut writer) = tokio::io::split(stream);
 
-    let command = ControlCommand {
-        cmd: cmd.to_string(),
-    };
-    let cmd_json = serde_json::to_string(&command)?;
-    writer.write_all(format!("{cmd_json}\n").as_bytes()).await?;
+    writer.write_all(&control_command_line(cmd)?).await?;
     writer.shutdown().await?;
 
     let mut buf_reader = BufReader::new(reader);
@@ -598,4 +635,35 @@ pub async fn send_control_command(cmd: &str) -> anyhow::Result<ControlResponse> 
 
     let response: ControlResponse = serde_json::from_str(line.trim())?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn control_line_stops_at_the_newline_and_at_the_size_limit() {
+        let line = read_control_line(&b" {\"cmd\":\"lock\"}\r\nrest"[..]).await;
+        assert_eq!(
+            line.ok().as_deref().map(String::as_str),
+            Some("{\"cmd\":\"lock\"}")
+        );
+
+        let long = vec![b'a'; MAX_CONTROL_LINE_BYTES + 10];
+        let line = read_control_line(&long[..]).await;
+        assert_eq!(line.ok().map(|l| l.len()), Some(MAX_CONTROL_LINE_BYTES));
+
+        assert!(read_control_line(&b"\xff\n"[..]).await.is_err());
+    }
+
+    #[test]
+    fn command_line_round_trips_a_secret_with_quotes() {
+        let line = control_command_line("unlock-password:a\"b\\c").unwrap_or_default();
+        assert_eq!(line.last(), Some(&b'\n'));
+        let parsed: Option<ControlCommand> = serde_json::from_slice(&line).ok();
+        assert_eq!(
+            parsed.map(|c| c.cmd.clone()).as_deref(),
+            Some("unlock-password:a\"b\\c")
+        );
+    }
 }

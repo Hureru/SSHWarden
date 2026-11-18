@@ -774,7 +774,6 @@ pub(crate) async fn handle_control_command(
             .await
         }
         ControlAction::UnlockPin { pin } => {
-            let pin = zeroize::Zeroizing::new(pin);
             if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
@@ -879,7 +878,6 @@ pub(crate) async fn handle_control_command(
             resp
         }
         ControlAction::UnlockPassword { password } => {
-            let password = zeroize::Zeroizing::new(password);
             let was_locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
 
             // Email from config (used for re-login).
@@ -1138,7 +1136,6 @@ pub(crate) async fn handle_control_command(
             }
         }
         ControlAction::SetPin { pin } => {
-            let pin = zeroize::Zeroizing::new(pin);
             if pin.len() < 4 {
                 return sshwarden_agent::ControlResponse::err("PIN must be at least 4 characters");
             }

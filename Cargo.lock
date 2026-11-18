@@ -5179,6 +5179,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "windows 0.61.3",
+ "zeroize",
 ]
 
 [[package]]

@@ -787,15 +787,19 @@ mod tests {
         let password = "hunter2".to_string();
 
         assert_eq!(
-            control_action_label(&ControlAction::UnlockPin { pin: pin.clone() }),
+            control_action_label(&ControlAction::UnlockPin {
+                pin: pin.clone().into()
+            }),
             "unlock-pin"
         );
         assert_eq!(
-            control_action_label(&ControlAction::SetPin { pin }),
+            control_action_label(&ControlAction::SetPin { pin: pin.into() }),
             "set-pin"
         );
         assert_eq!(
-            control_action_label(&ControlAction::UnlockPassword { password }),
+            control_action_label(&ControlAction::UnlockPassword {
+                password: password.into()
+            }),
             "unlock-password"
         );
         assert_eq!(
@@ -842,9 +846,11 @@ mod tests {
             ControlAction::Unlock,
             ControlAction::UnlockHello,
             ControlAction::UnlockNative,
-            ControlAction::UnlockPin { pin: "1".into() },
+            ControlAction::UnlockPin {
+                pin: String::from("1").into(),
+            },
             ControlAction::UnlockPassword {
-                password: "p".into(),
+                password: String::from("p").into(),
             },
         ] {
             assert!(
