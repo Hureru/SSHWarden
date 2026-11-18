@@ -641,19 +641,19 @@ fn encode_signalr_message(value: &rmpv::Value) -> Vec<u8> {
 /// where arguments[0] is a map containing `{"Type": <UpdateType>, ...}`.
 fn parse_signalr_message(data: &[u8]) -> Option<SyncEvent> {
     let (payload_len, header_size) = read_varint(data)?;
-    let payload_start = header_size;
-    let payload_end = payload_start + payload_len;
-
-    if payload_end > data.len() {
+    // `get` instead of index math: the length comes from the server and may be
+    // anything up to usize::MAX.
+    let Some(payload) = data
+        .get(header_size..)
+        .and_then(|rest| rest.get(..payload_len))
+    else {
         debug!(
-            "SignalR frame truncated: expected {} bytes, got {}",
-            payload_end,
+            "SignalR frame truncated: expected {} payload bytes in a {} byte frame",
+            payload_len,
             data.len()
         );
         return None;
-    }
-
-    let payload = &data[payload_start..payload_end];
+    };
 
     let mut cursor = std::io::Cursor::new(payload);
     let value = match rmpv::decode::read_value(&mut cursor) {
@@ -732,6 +732,15 @@ fn read_varint(data: &[u8]) -> Option<(usize, usize)> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Audit #9: a length that does not fit the frame is dropped, not a panic.
+    #[test]
+    fn oversized_signalr_length_is_ignored() {
+        let mut frame = vec![0xff; 9];
+        frame.extend([0x01, 0x93]);
+        assert!(parse_signalr_message(&frame).is_none());
+        assert!(parse_signalr_message(&[0x05, 0x93]).is_none());
+    }
 
     /// Drives the real reconnect loop against a closed port.
     ///

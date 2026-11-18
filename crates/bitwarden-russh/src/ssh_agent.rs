@@ -12,6 +12,8 @@ use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 use super::msg::{REQUEST_IDENTITIES, SIGN_REQUEST};
+
+const MAX_MESSAGE_LEN: usize = 256 * 1024;
 use crate::encoding::{Encoding, Position, Reader};
 use crate::msg::{self, EXTENSION};
 use crate::session_bind::SessionBindResult;
@@ -128,6 +130,11 @@ impl<
 
             // Reading the rest of the buffer
             let len = BigEndian::read_u32(&self.buf) as usize;
+            // SSHWarden change: OpenSSH's limit. Without it four bytes from any
+            // client make the agent allocate and zero 4 GiB.
+            if len > MAX_MESSAGE_LEN {
+                return Err(SSHAgentError::AgentFailure.into());
+            }
             self.buf.clear();
             self.buf.resize(len);
             self.s.read_exact(&mut self.buf).await?;

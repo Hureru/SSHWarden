@@ -658,6 +658,30 @@ V1e7S3lMGgbgyKkAAAAQdGVzdEBleGFtcGxlLmNvbQECAw==
         assert_eq!(body, [5], "expected SSH_AGENT_FAILURE");
     }
 
+    /// Audit #9: a message length over the limit closes the connection.
+    #[tokio::test]
+    async fn oversized_message_length_closes_the_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (agent, _request_rx, _response_tx) = create_test_agent();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let listener = futures::stream::iter(vec![Ok((server, PeerInfo::unknown()))]);
+        tokio::spawn(ssh_agent::serve(
+            listener,
+            agent.clone(),
+            agent.keystore_clone(),
+            agent.cancellation_token(),
+        ));
+
+        client.write_all(&[0xff; 4]).await.expect("write");
+        let mut reply = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut reply))
+            .await
+            .expect("the agent should hang up at once");
+        assert_eq!(read.expect("read"), 0, "expected end of stream");
+        agent.cancellation_token().cancel();
+    }
+
     /// Audit #21: every ECDSA curve signs.
     #[test]
     fn ecdsa_keys_sign_on_every_curve() {
