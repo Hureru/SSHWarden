@@ -46,17 +46,8 @@ pub struct DecryptedSshKey {
 
 impl BitwardenClient {
     pub fn new(base_url: &str, api_url: &str, identity_url: &str) -> Self {
-        Self {
-            http: HttpClient::new(),
-            api_url: api_url.to_string(),
-            identity_url: identity_url.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            access_token: None,
-            refresh_token: None,
-            token_expiry: None,
-            device_id: uuid::Uuid::new_v4().to_string(),
-            user_key: None,
-        }
+        let device_id = uuid::Uuid::new_v4().to_string();
+        Self::new_with_device_id(base_url, api_url, identity_url, &device_id)
     }
 
     /// Create a client with a specific device_id (restored from session file).
@@ -66,8 +57,17 @@ impl BitwardenClient {
         identity_url: &str,
         device_id: &str,
     ) -> Self {
+        // A server that accepts and then says nothing must end in an error:
+        // syncs run inside the daemon's main loop.
+        let http = HttpClient::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            // The builder fails only when the TLS backend cannot start, and
+            // then `HttpClient::new()` would have panicked here as well.
+            .unwrap_or_default();
         Self {
-            http: HttpClient::new(),
+            http,
             api_url: api_url.to_string(),
             identity_url: identity_url.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -485,5 +485,35 @@ impl BitwardenClient {
 
         info!("Access token refreshed successfully");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Audit #7: a server that accepts and never answers ends in a timeout.
+    /// The clock is paused, so the 30 s pass at once.
+    #[tokio::test(start_paused = true)]
+    async fn silent_server_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok(connection) = listener.accept().await {
+                open.push(connection);
+            }
+        });
+
+        let client = BitwardenClient::new(&url, &url, &url);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            client.prelogin("a@b.c"),
+        )
+        .await
+        .expect("the request should give up by itself");
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("timed out"), "got: {error}");
     }
 }

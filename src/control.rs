@@ -1206,20 +1206,21 @@ pub(crate) async fn handle_control_command(
                 )),
             }
         }
-        ControlAction::BindHostsDialog => {
-            match dispatch_standalone_bind_hosts_dialog(ui_request_tx).await {
-                Ok(saved) => {
-                    if saved {
-                        sshwarden_agent::ControlResponse::ok("Bindings updated")
-                    } else {
-                        sshwarden_agent::ControlResponse::ok("Dialog cancelled")
-                    }
-                }
-                Err(e) => sshwarden_agent::ControlResponse::err(&format!(
-                    "Failed to open bind-hosts dialog: {}",
-                    e
-                )),
-            }
-        }
+        // The daemon loop runs this one in its own task; kept for the match.
+        ControlAction::BindHostsDialog => bind_hosts_dialog_response(ui_request_tx).await,
+    }
+}
+
+/// `keys ui`: open the host-binding dialog and report what the user did.
+pub(crate) async fn bind_hosts_dialog_response(
+    ui_request_tx: &UIRequestTx,
+) -> sshwarden_agent::ControlResponse {
+    match dispatch_standalone_bind_hosts_dialog(ui_request_tx).await {
+        Ok(true) => sshwarden_agent::ControlResponse::ok("Bindings updated"),
+        Ok(false) => sshwarden_agent::ControlResponse::ok("Dialog cancelled"),
+        Err(e) => sshwarden_agent::ControlResponse::err(&format!(
+            "Failed to open bind-hosts dialog: {}",
+            e
+        )),
     }
 }
