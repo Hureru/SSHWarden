@@ -993,16 +993,19 @@ pub(crate) async fn handle_control_command(
             }
         }
         ControlAction::Sync => {
-            // do_sync cannot load keys into the agent while the vault is locked
-            // (no private material is held); it only refreshes the on-disk cache.
-            // Report that honestly and mark a pending sync so the next unlock
-            // applies the keys, instead of claiming the running agent was updated.
-            let was_locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
+            // Locked means nothing is pulled or decrypted (ADR 0009): the sync
+            // waits as a Pending Sync, and the next unlock runs it.
+            if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+                pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                return sshwarden_agent::ControlResponse::ok(
+                    "Vault is locked; sync will run on next unlock",
+                );
+            }
             // Only multi-device mode needs the shared cache reconciled before a
             // manual sync. Gating this avoids a NEW PIN prompt (and a hard failure
             // on cancel) for legacy single-device users whose unlock path did not
             // keep the Local Cache Key in memory.
-            if !was_locked && multi_device_mode() {
+            if multi_device_mode() {
                 // If this unlocked session was restored without keeping the Local
                 // Cache Key in memory, a plain sync would update the live agent but
                 // leave `sshwarden keys` showing the old cache header. Prompt for
@@ -1033,14 +1036,7 @@ pub(crate) async fn handle_control_command(
             .await
             {
                 Ok(count) => {
-                    if was_locked {
-                        pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
-                        sshwarden_agent::ControlResponse::ok(&format!(
-                            "Synced {count} SSH keys to cache; they will load into the agent on next unlock"
-                        ))
-                    } else {
-                        sshwarden_agent::ControlResponse::ok(&format!("Synced {count} SSH keys"))
-                    }
+                    sshwarden_agent::ControlResponse::ok(&format!("Synced {count} SSH keys"))
                 }
                 Err(e) => sshwarden_agent::ControlResponse::err(&e),
             }
