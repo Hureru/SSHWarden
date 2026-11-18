@@ -7,7 +7,6 @@ use anyhow::Error;
 use byteorder::{BigEndian, ByteOrder};
 use futures::stream::{Stream, StreamExt};
 use russh_cryptovec::CryptoVec;
-use ssh_key::HashAlg;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -242,20 +241,9 @@ impl<
             return Ok((agent, false));
         };
 
-        let signature_name = match signature.algorithm() {
-            ssh_key::Algorithm::Ed25519 => "ssh-ed25519",
-            ssh_key::Algorithm::Rsa { hash: None } => "ssh-rsa",
-            ssh_key::Algorithm::Rsa {
-                hash: Some(HashAlg::Sha256),
-            } => "rsa-sha2-256",
-            ssh_key::Algorithm::Rsa {
-                hash: Some(HashAlg::Sha512),
-            } => "rsa-sha2-512",
-            _ => {
-                println!("Unsupported signing algorithm");
-                return Ok((agent, false));
-            }
-        };
+        // SSHWarden change: the wire name of every algorithm, ECDSA included.
+        let algorithm = signature.algorithm();
+        let signature_name = algorithm.as_str();
 
         writebuf.push(msg::SIGN_RESPONSE);
         writebuf.push_u32_be(signature_name.len() as u32 + signature.as_bytes().len() as u32 + 8);

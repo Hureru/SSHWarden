@@ -658,6 +658,35 @@ V1e7S3lMGgbgyKkAAAAQdGVzdEBleGFtcGxlLmNvbQECAw==
         assert_eq!(body, [5], "expected SSH_AGENT_FAILURE");
     }
 
+    /// Audit #21: every ECDSA curve signs.
+    #[test]
+    fn ecdsa_keys_sign_on_every_curve() {
+        use rsa::signature::Verifier;
+        use ssh_key::{Algorithm, EcdsaCurve};
+
+        let message = b"test message for ecdsa";
+        for curve in [
+            EcdsaCurve::NistP256,
+            EcdsaCurve::NistP384,
+            EcdsaCurve::NistP521,
+        ] {
+            let key = ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::OsRng,
+                Algorithm::Ecdsa { curve },
+            )
+            .expect("key generation should work");
+            let signature = sign_with(&key, message, 0).expect("signing should work");
+            assert_eq!(
+                signature.algorithm().as_str(),
+                format!("ecdsa-sha2-{}", curve.as_str())
+            );
+            key.public_key()
+                .key_data()
+                .verify(message, &signature)
+                .expect("signature should verify");
+        }
+    }
+
     #[tokio::test]
     async fn test_agent_sign_with_ed25519_key() {
         let (mut agent, _request_rx, _response_tx) = create_test_agent();
