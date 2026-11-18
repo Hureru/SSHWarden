@@ -7,7 +7,7 @@ use anyhow::Error;
 use byteorder::{BigEndian, ByteOrder};
 use futures::stream::{Stream, StreamExt};
 use russh_cryptovec::CryptoVec;
-use ssh_key::{HashAlg, SigningKey};
+use ssh_key::HashAlg;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +24,9 @@ pub struct KeyStore<Key>(pub Arc<RwLock<HashMap<Vec<u8>, Key>>>);
 pub trait SshKey {
     fn name(&self) -> &str;
     fn public_key_bytes(&self) -> Vec<u8>;
-    fn private_key(&self) -> Option<Box<dyn SigningKey>>;
+    /// SSHWarden change: sign `data` with the SIGN_REQUEST `flags` (they pick
+    /// the RSA hash). An error answers FAILURE.
+    fn sign(&self, data: &[u8], flags: u32) -> Result<ssh_key::Signature, Error>;
 }
 
 #[allow(missing_docs)]
@@ -219,6 +221,8 @@ impl<
         };
 
         let data = r.read_string()?;
+        // Clients that send no flags field mean 0.
+        let flags = r.read_u32().unwrap_or(0);
 
         let ok = agent.confirm(key, data, &self.connection_info).await;
         if !ok {
@@ -234,49 +238,34 @@ impl<
             }
         };
 
-        match key.private_key() {
-            Some(private_key) => {
-                writebuf.push(msg::SIGN_RESPONSE);
-                let signature = private_key
-                    .try_sign(data)
-                    .or(Err(SSHAgentError::AgentFailure));
-                let Ok(signature) = signature else {
-                    writebuf.push(msg::FAILURE);
-                    return Ok((agent, false));
-                };
+        let Ok(signature) = key.sign(data, flags) else {
+            return Ok((agent, false));
+        };
 
-                let signature_name = match signature.algorithm() {
-                    ssh_key::Algorithm::Ed25519 => "ssh-ed25519",
-                    ssh_key::Algorithm::Rsa { hash: None } => "ssh-rsa",
-                    ssh_key::Algorithm::Rsa {
-                        hash: Some(HashAlg::Sha256),
-                    } => "rsa-sha2-256",
-                    ssh_key::Algorithm::Rsa {
-                        hash: Some(HashAlg::Sha512),
-                    } => "rsa-sha2-512",
-                    _ => {
-                        println!("Unsupported signing algorithm");
-                        writebuf.push(msg::FAILURE);
-                        return Ok((agent, false));
-                    }
-                };
-
-                writebuf.push_u32_be(
-                    signature_name.len() as u32 + signature.as_bytes().len() as u32 + 8,
-                );
-                writebuf.extend_ssh_string(signature_name.as_bytes());
-                writebuf.extend_ssh_string(signature.as_bytes());
-
-                let len = writebuf.len();
-                BigEndian::write_u32(writebuf, (len - 4) as u32);
-
-                Ok((agent, true))
+        let signature_name = match signature.algorithm() {
+            ssh_key::Algorithm::Ed25519 => "ssh-ed25519",
+            ssh_key::Algorithm::Rsa { hash: None } => "ssh-rsa",
+            ssh_key::Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            } => "rsa-sha2-256",
+            ssh_key::Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            } => "rsa-sha2-512",
+            _ => {
+                println!("Unsupported signing algorithm");
+                return Ok((agent, false));
             }
-            None => {
-                writebuf.push(msg::FAILURE);
-                Ok((agent, false))
-            }
-        }
+        };
+
+        writebuf.push(msg::SIGN_RESPONSE);
+        writebuf.push_u32_be(signature_name.len() as u32 + signature.as_bytes().len() as u32 + 8);
+        writebuf.extend_ssh_string(signature_name.as_bytes());
+        writebuf.extend_ssh_string(signature.as_bytes());
+
+        let len = writebuf.len();
+        BigEndian::write_u32(writebuf, (len - 4) as u32);
+
+        Ok((agent, true))
     }
 }
 
