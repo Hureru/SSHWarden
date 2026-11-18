@@ -424,6 +424,44 @@ fn write_user_ssh_config(config_path: &std::path::Path, content: &str) -> anyhow
     sshwarden_config::write_owner_only_file(&target, content)
 }
 
+/// True for a line that opens a `Host` or `Match` block.
+fn opens_host_or_match_block(trimmed: &str) -> bool {
+    let keyword = trimmed
+        .split(|c: char| c.is_whitespace() || c == '=')
+        .next()
+        .unwrap_or_default();
+    keyword.eq_ignore_ascii_case("Host") || keyword.eq_ignore_ascii_case("Match")
+}
+
+/// True when a line accepted by `is_include` comes before the first `Host` /
+/// `Match` line. OpenSSH reads an `Include` placed after such a line only when
+/// that block matches, so only an Include above all of them works for every host.
+fn include_precedes_first_block(content: &str, is_include: impl Fn(&str) -> bool) -> bool {
+    content
+        .lines()
+        .map(str::trim)
+        .take_while(|line| !opens_host_or_match_block(line))
+        .any(is_include)
+}
+
+/// Whether `ssh` reads the managed snippet for every host: the user's SSH
+/// config has SSHWarden's Include line before the first `Host` / `Match` block.
+pub(crate) fn sshwarden_include_is_active(
+    config_path: &std::path::Path,
+    include_path: &std::path::Path,
+) -> bool {
+    std::fs::read_to_string(config_path)
+        .map(|content| {
+            include_precedes_first_block(&content, |line| {
+                sshwarden_config::ssh_config::line_matches_sshwarden_include(line, include_path)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Put the marker and SSHWarden's `Include` line at the top of the user's SSH
+/// config, moving an older one (marked, or unmarked with our path) from
+/// wherever it was. No write when the wanted line is already above every block.
 pub(crate) fn write_sshwarden_include_line(
     config_path: &std::path::Path,
     include_path: &std::path::Path,
@@ -442,77 +480,27 @@ pub(crate) fn write_sshwarden_include_line(
         sshwarden_config::Config::load()?.ssh_config.path_style,
     );
     let existing = read_user_ssh_config(config_path)?;
-    // Return only when the desired line is already present. A legacy absolute
-    // line may still "match" SSHWarden's include semantically, but in
-    // home-relative multi-device mode we want the marked block below to rewrite
-    // it so a synced ~/.ssh/config works across different Windows usernames.
-    if existing.lines().any(|line| line.trim() == include_line) {
+    // Only the exact wanted line counts: a legacy absolute line still "matches"
+    // semantically, but in home-relative multi-device mode it must be rewritten
+    // so a synced ~/.ssh/config works across different Windows usernames.
+    if include_precedes_first_block(&existing, |line| line == include_line) {
         return Ok(());
     }
 
+    // Lines we did not write stay byte for byte when there is nothing to move.
+    let rest = strip_sshwarden_include(&existing, include_path).unwrap_or(existing);
+    let rest = rest.trim_start_matches(['\r', '\n']);
     const MARKER: &str = sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER;
-    let mut rewritten: Vec<String> = Vec::with_capacity(existing.lines().count() + 2);
-    let mut marker_waiting_for_include = false;
-    let mut replaced_marked_include = false;
-    let mut dropped_unmarked_include = false;
-
-    for line in existing.lines() {
-        let trimmed = line.trim();
-        if trimmed == MARKER {
-            marker_waiting_for_include = true;
-            rewritten.push(line.to_string());
-            continue;
-        }
-        if marker_waiting_for_include {
-            if trimmed.is_empty() {
-                rewritten.push(line.to_string());
-                continue;
-            }
-            if is_ssh_include_directive(trimmed)
-                || line_matches_current_or_legacy_sshwarden_include(trimmed, include_path)
-            {
-                rewritten.push(include_line.clone());
-                marker_waiting_for_include = false;
-                replaced_marked_include = true;
-                continue;
-            }
-            marker_waiting_for_include = false;
-        }
-        if line_matches_current_or_legacy_sshwarden_include(trimmed, include_path) {
-            // Drop unmarked older SSHWarden Include lines. A fresh marked line
-            // with the desired path style is appended below if no marked block
-            // was rewritten.
-            dropped_unmarked_include = true;
-            continue;
-        }
-        rewritten.push(line.to_string());
-    }
-
-    if replaced_marked_include {
-        let mut new_config = rewritten.join("\n");
-        if !new_config.is_empty() && !new_config.ends_with('\n') {
+    let mut new_config = format!("{MARKER}\n{include_line}\n");
+    if !rest.is_empty() {
+        new_config.push('\n');
+        new_config.push_str(rest);
+        if !new_config.ends_with('\n') {
             new_config.push('\n');
         }
-        write_user_ssh_config(config_path, &new_config)
-            .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
-        return Ok(());
     }
-
-    let mut new_config = if dropped_unmarked_include {
-        rewritten.join("\n")
-    } else {
-        existing
-    };
-    if !new_config.is_empty() && !new_config.ends_with('\n') {
-        new_config.push('\n');
-    }
-    new_config.push_str("\n# SSHWarden managed key selector snippets\n");
-    new_config.push_str(&include_line);
-    new_config.push('\n');
     write_user_ssh_config(config_path, &new_config)
-        .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
-
-    Ok(())
+        .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))
 }
 
 pub(crate) fn is_ssh_include_directive(line: &str) -> bool {
@@ -534,16 +522,10 @@ pub(crate) fn line_matches_current_or_legacy_sshwarden_include(
         .unwrap_or(false)
 }
 
-/// Remove the sshwarden `Include` line and its preceding marker comment from
-/// `~/.ssh/config`. Returns `true` if anything was changed.
-pub(crate) fn remove_sshwarden_include_line(
-    config_path: &std::path::Path,
-    include_path: &std::path::Path,
-) -> anyhow::Result<bool> {
-    if !config_path.exists() {
-        return Ok(false);
-    }
-    let existing = read_user_ssh_config(config_path)?;
+/// `existing` without SSHWarden's Include lines: the marker comment with the
+/// Include that follows it, and unmarked Includes of the managed snippet.
+/// `None` when there is none.
+fn strip_sshwarden_include(existing: &str, include_path: &std::path::Path) -> Option<String> {
     const MARKER: &str = sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER;
 
     let mut kept: Vec<&str> = Vec::with_capacity(existing.lines().count());
@@ -584,21 +566,28 @@ pub(crate) fn remove_sshwarden_include_line(
     }
 
     if !removed_any {
-        return Ok(false);
+        return None;
     }
-
     let mut new_config = kept.join("\n");
     if !new_config.is_empty() && !new_config.ends_with('\n') {
         new_config.push('\n');
     }
-    if let Some(parent) = config_path.parent() {
-        create_private_dir(parent).with_context(|| {
-            format!(
-                "Failed to prepare SSH config directory: {}",
-                parent.display()
-            )
-        })?;
+    Some(new_config)
+}
+
+/// Remove the sshwarden `Include` line and its preceding marker comment from
+/// `~/.ssh/config`. Returns `true` if anything was changed.
+pub(crate) fn remove_sshwarden_include_line(
+    config_path: &std::path::Path,
+    include_path: &std::path::Path,
+) -> anyhow::Result<bool> {
+    if !config_path.exists() {
+        return Ok(false);
     }
+    let existing = read_user_ssh_config(config_path)?;
+    let Some(new_config) = strip_sshwarden_include(&existing, include_path) else {
+        return Ok(false);
+    };
     write_user_ssh_config(config_path, &new_config)
         .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
     Ok(true)
@@ -735,6 +724,43 @@ mod tests {
 
         assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
         assert!(std::fs::read_to_string(&real).unwrap().contains("Include "));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit #6: an Include after a `Host` block is read only for that host,
+    /// so it must be written above every block, and moved there when older
+    /// versions appended it at the end.
+    #[test]
+    fn include_is_written_above_the_first_host_block() {
+        let dir = temp_dir("include-top");
+        let config_path = dir.join("config");
+        let include_path = dir.join("sshwarden_config");
+        let include_line = sshwarden_config::ssh_config::include_line(&include_path);
+        const MARKER: &str = sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER;
+        let user_part = "Host work\n    User me\n\nMatch host *.corp\n    Port 2222\n";
+
+        // Fresh config that starts with a Host block.
+        std::fs::write(&config_path, user_part).unwrap();
+        assert!(!sshwarden_include_is_active(&config_path, &include_path));
+        write_sshwarden_include_line(&config_path, &include_path).unwrap();
+        let expected = format!("{MARKER}\n{include_line}\n\n{user_part}");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), expected);
+        assert!(sshwarden_include_is_active(&config_path, &include_path));
+
+        // Second run changes nothing.
+        write_sshwarden_include_line(&config_path, &include_path).unwrap();
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), expected);
+
+        // An Include appended at the end by an older version is moved up.
+        std::fs::write(
+            &config_path,
+            format!("{user_part}\n{MARKER}\n{include_line}\n"),
+        )
+        .unwrap();
+        assert!(!sshwarden_include_is_active(&config_path, &include_path));
+        write_sshwarden_include_line(&config_path, &include_path).unwrap();
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), expected);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -142,18 +142,11 @@ pub(crate) async fn cmd_keys_list() -> anyhow::Result<()> {
     // these selectors.
     let include_path = managed_sshwarden_include_path()?;
     let config_path = user_ssh_config_path()?;
-    let has_include = std::fs::read_to_string(&config_path)
-        .map(|s| {
-            s.lines().any(|l| {
-                sshwarden_config::ssh_config::line_matches_sshwarden_include(l, &include_path)
-            })
-        })
-        .unwrap_or(false);
-    if has_include {
+    if crate::sshconfig::sshwarden_include_is_active(&config_path, &include_path) {
         out_line("\nssh-config: Include active (ssh will use the bound keys).");
     } else {
         out_line(format!(
-            "\nssh-config: not included — run `sshwarden ssh-config write` to wire {}.",
+            "\nssh-config: Include missing or placed after a Host/Match block — run `sshwarden ssh-config write` to wire {}.",
             config_path.display()
         ));
     }

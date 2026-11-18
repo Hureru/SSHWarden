@@ -532,16 +532,8 @@ pub(crate) async fn cmd_doctor(
                 ));
             }
 
-            let has_include = std::fs::read_to_string(&config_path)
-                .map(|content| {
-                    content.lines().any(|line| {
-                        sshwarden_config::ssh_config::line_matches_sshwarden_include(
-                            line,
-                            &include_path,
-                        )
-                    })
-                })
-                .unwrap_or(false);
+            let has_include =
+                crate::sshconfig::sshwarden_include_is_active(&config_path, &include_path);
 
             if fix && !has_include {
                 if let Some(parent) = include_path.parent() {
@@ -577,7 +569,10 @@ pub(crate) async fn cmd_doctor(
                 match write_sshwarden_include_line(&config_path, &include_path) {
                     Ok(()) => checks.push(DoctorCheck::ok(
                         "doctor.fix.include",
-                        format!("Added SSHWarden Include line to {}", config_path.display()),
+                        format!(
+                            "Put the SSHWarden Include line at the top of {}",
+                            config_path.display()
+                        ),
                     )),
                     Err(e) => checks.push(DoctorCheck::warn(
                         "doctor.fix.include",
@@ -589,16 +584,8 @@ pub(crate) async fn cmd_doctor(
                 }
             }
 
-            let has_include = std::fs::read_to_string(&config_path)
-                .map(|content| {
-                    content.lines().any(|line| {
-                        sshwarden_config::ssh_config::line_matches_sshwarden_include(
-                            line,
-                            &include_path,
-                        )
-                    })
-                })
-                .unwrap_or(false);
+            let has_include =
+                crate::sshconfig::sshwarden_include_is_active(&config_path, &include_path);
             if has_include {
                 checks.push(DoctorCheck::ok(
                     "ssh_config.include",
@@ -611,7 +598,7 @@ pub(crate) async fn cmd_doctor(
                 checks.push(DoctorCheck::warn(
                     "ssh_config.include",
                     format!(
-                        "{} does not include SSHWarden managed config; run `sshwarden ssh-config write` if desired",
+                        "{} does not include SSHWarden managed config before its first Host/Match block, so host bindings are not applied; run `sshwarden ssh-config write` if desired",
                         config_path.display()
                     ),
                 ));
