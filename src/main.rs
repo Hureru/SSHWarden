@@ -43,6 +43,36 @@ use process::{
 };
 use status::{cmd_doctor, cmd_status};
 
+/// Wipes every heap block when it is freed. `Zeroizing` covers the secrets we
+/// hold; this covers the copies that libraries leave in freed memory (a JSON
+/// buffer that grew, a key being parsed), which stayed readable after `lock`.
+struct WipeOnFree;
+
+// SAFETY: forwards to the system allocator; `dealloc` writes only inside the
+// block being freed, which is `layout.size()` bytes long.
+unsafe impl std::alloc::GlobalAlloc for WipeOnFree {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        std::alloc::System.alloc(layout)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        std::alloc::System.alloc_zeroed(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        std::ptr::write_bytes(ptr, 0, layout.size());
+        // Keeps the compiler from dropping the write as a dead store before `free`.
+        std::hint::black_box(ptr);
+        std::alloc::System.dealloc(ptr, layout)
+    }
+
+    // No `realloc`: the default allocates, copies and calls `dealloc`, so the
+    // old block is wiped too. The system `realloc` would free it unwiped.
+}
+
+#[global_allocator]
+static ALLOCATOR: WipeOnFree = WipeOnFree;
+
 fn main() -> anyhow::Result<()> {
     // Set Per-Monitor DPI Awareness V2 before any UI calls.
     // This prevents Win32 dialogs (CredUI) from being blurry on high-DPI displays.
