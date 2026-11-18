@@ -253,6 +253,21 @@ pub(crate) fn ssh_config_snippet_with_bindings(
 /// Pure snippet builder behind [`ssh_config_snippet_with_bindings`]: the
 /// selector directory and path style are injected so the generated content can
 /// be asserted in tests without touching the real config directory.
+/// A vault item id that is one plain token (Bitwarden ids are UUIDs).
+fn is_safe_cipher_id(cipher_id: &str) -> bool {
+    !cipher_id.is_empty()
+        && cipher_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// `text` with control characters (newlines above all) turned into spaces.
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 fn ssh_config_snippet_with_bindings_in(
     keys: &[ManagedKey],
     bindings: &sshwarden_config::bindings::HostBindingsFile,
@@ -268,24 +283,46 @@ fn ssh_config_snippet_with_bindings_in(
         String::new(),
     ];
 
-    let mut bound_keys: Vec<&ManagedKey> = Vec::new();
+    // Names and ids come from the vault server and hosts from a hand-editable
+    // file; ssh runs whatever lands here (`ProxyCommand`), so nothing unchecked
+    // may reach a line of its own.
+    let mut bound_keys: Vec<(&ManagedKey, Vec<&str>)> = Vec::new();
     let mut unbound_keys: Vec<&ManagedKey> = Vec::new();
     for key in keys {
-        match bindings.bindings.get(&key.cipher_id) {
-            Some(b) if !b.hosts.is_empty() => bound_keys.push(key),
-            _ => unbound_keys.push(key),
+        if !is_safe_cipher_id(&key.cipher_id) {
+            tracing::warn!(
+                "Key {:?} left out of the managed SSH config: its vault item id is not a plain id",
+                key.name
+            );
+            continue;
+        }
+        let hosts: Vec<&str> = bindings
+            .bindings
+            .get(&key.cipher_id)
+            .map(|b| b.hosts.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let (hosts, rejected): (Vec<&str>, Vec<&str>) = hosts
+            .into_iter()
+            .partition(|host| sshwarden_config::bindings::validate_host_pattern(host).is_ok());
+        if !rejected.is_empty() {
+            tracing::warn!(
+                "Host patterns of key {:?} left out of the managed SSH config: {:?}",
+                key.name,
+                rejected
+            );
+        }
+        if hosts.is_empty() {
+            unbound_keys.push(key);
+        } else {
+            bound_keys.push((key, hosts));
         }
     }
 
-    for key in &bound_keys {
+    for (key, hosts) in &bound_keys {
         let path = selector_dir.join(selector_file_name(&key.name, &key.cipher_id));
-        let binding = bindings
-            .bindings
-            .get(&key.cipher_id)
-            .expect("bound_keys filtered for presence");
         lines.push(format!("{}{}", SSHWARDEN_KEY_MARKER_PREFIX, key.cipher_id));
-        lines.push(format!("# {} ({})", key.name, key.cipher_id));
-        lines.push(format!("Host {}", binding.hosts.join(" ")));
+        lines.push(format!("# {} ({})", single_line(&key.name), key.cipher_id));
+        lines.push(format!("Host {}", hosts.join(" ")));
         lines.push(format!(
             "    IdentityFile {}",
             sshwarden_config::ssh_config::path_arg_with_style(&path, path_style)
@@ -300,7 +337,7 @@ fn ssh_config_snippet_with_bindings_in(
         for key in &unbound_keys {
             let path = selector_dir.join(selector_file_name(&key.name, &key.cipher_id));
             lines.push(format!("{}{}", SSHWARDEN_KEY_MARKER_PREFIX, key.cipher_id));
-            lines.push(format!("# {} ({})", key.name, key.cipher_id));
+            lines.push(format!("# {} ({})", single_line(&key.name), key.cipher_id));
             lines.push("# Host <host>".to_string());
             lines.push(format!(
                 "#     IdentityFile {}",
@@ -762,5 +799,70 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), expected);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit #22: a key name, a vault item id or a host pattern must never
+    /// become a config line of its own in the file ssh reads.
+    #[test]
+    fn snippet_cannot_be_injected_through_name_id_or_host() {
+        const PAYLOAD: &str = "x\nHost *\n  ProxyCommand evil";
+        let keys = [
+            ManagedKey {
+                name: PAYLOAD.to_string(),
+                cipher_id: "id-1".to_string(),
+            },
+            ManagedKey {
+                name: "Bad id".to_string(),
+                cipher_id: PAYLOAD.to_string(),
+            },
+            ManagedKey {
+                name: "Bad host".to_string(),
+                cipher_id: "id-3".to_string(),
+            },
+        ];
+        // Built by hand, as a hand-edited or synced bindings.json would be:
+        // set_hosts() would refuse these.
+        let mut bindings = sshwarden_config::bindings::HostBindingsFile::default();
+        for (id, hosts) in [
+            ("id-1", vec!["a.example"]),
+            (PAYLOAD, vec!["b.example"]),
+            ("id-3", vec!["c.example", PAYLOAD]),
+        ] {
+            bindings.bindings.insert(
+                id.to_string(),
+                sshwarden_config::bindings::KeyBinding {
+                    hosts: hosts.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let snippet = ssh_config_snippet_with_bindings_in(
+            &keys,
+            &bindings,
+            std::path::Path::new("/selectors"),
+            sshwarden_config::SshConfigPathStyle::Absolute,
+        );
+
+        let live: Vec<&str> = snippet
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert!(!snippet.contains("ProxyCommand evil\n"), "{snippet}");
+        assert!(
+            live.iter().all(|line| !line.contains("ProxyCommand")),
+            "{snippet}"
+        );
+        let host_lines: Vec<&str> = live
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("Host"))
+            .collect();
+        assert_eq!(
+            host_lines,
+            ["Host a.example", "Host c.example"],
+            "{snippet}"
+        );
     }
 }
