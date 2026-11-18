@@ -312,10 +312,7 @@ impl SshWardenAgent {
             .clear();
     }
 
-    pub fn set_keys(
-        &mut self,
-        new_keys: Vec<(String, String, String)>,
-    ) -> Result<(), anyhow::Error> {
+    pub fn set_keys(&mut self, new_keys: &[(String, String, String)]) -> Result<(), anyhow::Error> {
         if !self.is_running() {
             return Err(anyhow::anyhow!(
                 "[SshWardenAgent] Tried to set keys while agent is not running"
@@ -721,7 +718,7 @@ V1e7S3lMGgbgyKkAAAAQdGVzdEBleGFtcGxlLmNvbQECAw==
             "ed25519-key".to_string(),
             "ed25519-uuid".to_string(),
         )];
-        agent.set_keys(keys).expect("set_keys should succeed");
+        agent.set_keys(&keys).expect("set_keys should succeed");
 
         let keystore = agent.keystore.0.read().expect("RwLock is not poisoned");
         assert_eq!(keystore.len(), 1);
@@ -747,7 +744,7 @@ V1e7S3lMGgbgyKkAAAAQdGVzdEBleGFtcGxlLmNvbQECAw==
         let (mut agent, _request_rx, _response_tx) = create_test_agent();
         agent.is_running.store(true, Ordering::Relaxed);
         agent
-            .set_keys(vec![(
+            .set_keys(&[(
                 TEST_RSA_KEY.to_string(),
                 "rsa-key".to_string(),
                 "rsa-uuid".to_string(),
@@ -815,7 +812,7 @@ V1e7S3lMGgbgyKkAAAAQdGVzdEBleGFtcGxlLmNvbQECAw==
         let (mut agent, _request_rx, _response_tx) = create_test_agent();
         agent.is_running.store(true, Ordering::Relaxed);
         agent
-            .set_keys(vec![(
+            .set_keys(&[(
                 TEST_ED25519_KEY.to_string(),
                 "ed25519-key".to_string(),
                 "ed25519-uuid".to_string(),

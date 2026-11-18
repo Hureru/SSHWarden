@@ -135,12 +135,12 @@ pub(crate) async fn handle_ui_request(
                 match native_result {
                     Ok(Ok((keys_json, lck))) => {
                         if let Ok(keys) =
-                            serde_json::from_str::<Vec<(String, String, String)>>(&keys_json)
+                            serde_json::from_str(&keys_json).map(crate::runtime::KeyTuples::new)
                         {
                             let key_name = key_name_for_request(&request, &keys);
                             apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
                             let mut agent_for_unlock = agent.clone();
-                            if agent_for_unlock.set_keys(keys).is_ok() {
+                            if agent_for_unlock.set_keys(&keys).is_ok() {
                                 local_cache_key_state.write().await.set(lck);
                                 vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
                                 info!("Auto-unlocked via native local key cache");
@@ -186,12 +186,12 @@ pub(crate) async fn handle_ui_request(
                 match hello_result {
                     Ok(Ok((keys_json, lck))) => {
                         if let Ok(keys) =
-                            serde_json::from_str::<Vec<(String, String, String)>>(&keys_json)
+                            serde_json::from_str(&keys_json).map(crate::runtime::KeyTuples::new)
                         {
                             let key_name = key_name_for_request(&request, &keys);
                             apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
                             let mut agent_for_unlock = agent.clone();
-                            if agent_for_unlock.set_keys(keys).is_ok() {
+                            if agent_for_unlock.set_keys(&keys).is_ok() {
                                 local_cache_key_state.write().await.set(lck);
                                 vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
                                 info!("Auto-unlocked via Windows Hello envelope");
@@ -295,11 +295,11 @@ pub(crate) async fn handle_ui_request(
                     return;
                 }
             };
-            if let Ok(keys) = serde_json::from_str::<Vec<(String, String, String)>>(&keys_json) {
+            if let Ok(keys) = serde_json::from_str(&keys_json).map(crate::runtime::KeyTuples::new) {
                 let key_name = key_name_for_request(&request, &keys);
                 apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
                 let mut agent_for_unlock = agent.clone();
-                if agent_for_unlock.set_keys(keys).is_ok() {
+                if agent_for_unlock.set_keys(&keys).is_ok() {
                     if let Some(kh) = lck_holder {
                         let maybe_lck = kh.lock().unwrap_or_else(|e| e.into_inner()).take();
                         if let Some(lck) = maybe_lck {

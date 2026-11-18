@@ -37,7 +37,7 @@ pub(crate) fn try_hello_encrypt(plaintext: &str, challenge: &[u8; 16]) -> anyhow
 }
 
 pub(crate) type PinValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-pub(crate) type DecryptedCache = Arc<std::sync::Mutex<Option<String>>>;
+pub(crate) type DecryptedCache = Arc<std::sync::Mutex<Option<zeroize::Zeroizing<String>>>>;
 
 /// Wrap a PIN validator so every attempt shares the daemon-wide brute-force
 /// accounting (SEC-03) with `ControlAction::UnlockPin`: reject outright while a
@@ -421,8 +421,8 @@ pub(crate) async fn finish_unlock_with_json(
     key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
     success_msg: &str,
 ) -> sshwarden_agent::ControlResponse {
-    let keys: Vec<(String, String, String)> = match serde_json::from_str(keys_json) {
-        Ok(k) => k,
+    let keys: crate::runtime::KeyTuples = match serde_json::from_str(keys_json) {
+        Ok(k) => zeroize::Zeroizing::new(k),
         Err(e) => {
             return sshwarden_agent::ControlResponse::err(&format!(
                 "Failed to parse decrypted keys: {}",
@@ -435,13 +435,13 @@ pub(crate) async fn finish_unlock_with_json(
     {
         let mut names = key_names.write().await;
         names.clear();
-        for (_, name, cipher_id) in &keys {
+        for (_, name, cipher_id) in keys.iter() {
             names.insert(cipher_id.clone(), name.clone());
         }
     }
 
-    cached_key_tuples.write().await.set(keys.clone());
-    if let Err(e) = agent.set_keys(keys) {
+    cached_key_tuples.write().await.set(keys.to_vec());
+    if let Err(e) = agent.set_keys(&keys) {
         return sshwarden_agent::ControlResponse::err(&format!("Failed to reload keys: {}", e));
     }
     vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);

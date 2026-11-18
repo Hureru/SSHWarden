@@ -170,7 +170,6 @@ pub(crate) async fn run_foreground(
     // Cache key tuples for re-loading after unlock, track public key identities,
     // and track vault lock state.
     let cached_key_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
-    let public_key_identity_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
     let vault_locked = Arc::new(std::sync::atomic::AtomicBool::new(has_remembered_device));
     let api_client: Arc<RwLock<Option<sshwarden_api::BitwardenClient>>> =
         Arc::new(RwLock::new(api_client));
@@ -193,16 +192,17 @@ pub(crate) async fn run_foreground(
 
     // Load vault keys into agent
     if let Some(keys) = vault_keys {
-        let key_tuples: Vec<(String, String, String)> = keys
-            .iter()
-            .map(|k| {
-                (
-                    (*k.private_key_pem).clone(),
-                    k.name.clone(),
-                    k.cipher_id.clone(),
-                )
-            })
-            .collect();
+        let key_tuples: crate::runtime::KeyTuples = zeroize::Zeroizing::new(
+            keys.iter()
+                .map(|k| {
+                    (
+                        (*k.private_key_pem).clone(),
+                        k.name.clone(),
+                        k.cipher_id.clone(),
+                    )
+                })
+                .collect(),
+        );
         let count = key_tuples.len();
         if count > 0 {
             if let Err(e) = write_key_selector_files(&keys) {
@@ -211,14 +211,10 @@ pub(crate) async fn run_foreground(
             if let Err(e) = sync_managed_ssh_config_with_bindings(&keys) {
                 tracing::warn!("Failed to sync managed SSH config: {}", e);
             }
-            public_key_identity_tuples
-                .write()
-                .await
-                .set(key_tuples.clone());
-            cached_key_tuples.write().await.set(key_tuples.clone());
+            cached_key_tuples.write().await.set(key_tuples.to_vec());
             *key_material_fingerprints.write().await =
                 key_material_fingerprints_from_tuples(&key_tuples);
-            agent.set_keys(key_tuples)?;
+            agent.set_keys(&key_tuples)?;
             info!("Loaded {} SSH key(s) into agent", count);
 
             // After first login with keys loaded, offer to set up PIN for persistence
@@ -237,10 +233,6 @@ pub(crate) async fn run_foreground(
         let identities = key_tuples_from_cache_header(cache);
         let count = identities.len();
         if count > 0 {
-            public_key_identity_tuples
-                .write()
-                .await
-                .set(identities.clone());
             {
                 let mut names = key_names.write().await;
                 names.clear();
@@ -365,7 +357,6 @@ pub(crate) async fn run_foreground(
                         &mut agent,
                         &vault_locked,
                         &cached_key_tuples,
-                        &public_key_identity_tuples,
                         &api_client,
                         &local_key_cache_data,
                         &local_cache_key_state,
@@ -447,7 +438,6 @@ pub(crate) async fn run_foreground(
                             &pending_sync,
                             &api_client,
                             &cached_key_tuples,
-                            &public_key_identity_tuples,
                             &local_key_cache_data,
                             &local_cache_key_state,
                             &authorization_memory,
@@ -473,7 +463,6 @@ pub(crate) async fn run_foreground(
                             &pending_sync,
                             &api_client,
                             &cached_key_tuples,
-                            &public_key_identity_tuples,
                             &local_key_cache_data,
                             &local_cache_key_state,
                             &authorization_memory,
@@ -494,7 +483,6 @@ pub(crate) async fn run_foreground(
                             &pending_sync,
                             &api_client,
                             &cached_key_tuples,
-                            &public_key_identity_tuples,
                             &local_key_cache_data,
                             &local_cache_key_state,
                             &authorization_memory,
@@ -528,7 +516,7 @@ pub(crate) async fn run_foreground(
                             info!("Notification: cipher changed while locked; sync pending until unlock");
                         } else {
                             info!("Notification: cipher changed, syncing...");
-                            match do_sync(&api_client, &cached_key_tuples, &public_key_identity_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
+                            match do_sync(&api_client, &cached_key_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
                                 Ok(count) => {
                                     notification_state.write().await.last_event_at = Some(std::time::Instant::now());
                                     info!("Auto-synced: {} SSH keys", count)
@@ -551,7 +539,7 @@ pub(crate) async fn run_foreground(
                             info!("Notification degraded while locked; sync pending until unlock");
                         } else {
                             info!("Notification degraded or reconnected, running fallback sync...");
-                            match do_sync(&api_client, &cached_key_tuples, &public_key_identity_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
+                            match do_sync(&api_client, &cached_key_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
                                 Ok(count) => {
                                     notification_state.write().await.record_fallback_sync();
                                     info!("Fallback-synced: {} SSH keys", count)

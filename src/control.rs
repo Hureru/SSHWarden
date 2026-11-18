@@ -411,7 +411,6 @@ pub(crate) async fn handle_control_command(
     agent: &mut sshwarden_agent::SshWardenAgent,
     vault_locked: &Arc<std::sync::atomic::AtomicBool>,
     cached_key_tuples: &CachedKeyTuples,
-    public_key_identity_tuples: &CachedKeyTuples,
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
     local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
     local_cache_key_state: &LocalCacheKeyHandle,
@@ -490,7 +489,6 @@ pub(crate) async fn handle_control_command(
                         pending_sync,
                         api_client,
                         cached_key_tuples,
-                        public_key_identity_tuples,
                         local_key_cache_data,
                         local_cache_key_state,
                         authorization_memory,
@@ -534,7 +532,6 @@ pub(crate) async fn handle_control_command(
                                 pending_sync,
                                 api_client,
                                 cached_key_tuples,
-                                public_key_identity_tuples,
                                 local_key_cache_data,
                                 local_cache_key_state,
                                 authorization_memory,
@@ -640,7 +637,6 @@ pub(crate) async fn handle_control_command(
                                 pending_sync,
                                 api_client,
                                 cached_key_tuples,
-                                public_key_identity_tuples,
                                 local_key_cache_data,
                                 local_cache_key_state,
                                 authorization_memory,
@@ -691,7 +687,6 @@ pub(crate) async fn handle_control_command(
                     pending_sync,
                     api_client,
                     cached_key_tuples,
-                    public_key_identity_tuples,
                     local_key_cache_data,
                     local_cache_key_state,
                     authorization_memory,
@@ -739,7 +734,6 @@ pub(crate) async fn handle_control_command(
                                     pending_sync,
                                     api_client,
                                     cached_key_tuples,
-                                    public_key_identity_tuples,
                                     local_key_cache_data,
                                     local_cache_key_state,
                                     authorization_memory,
@@ -850,7 +844,6 @@ pub(crate) async fn handle_control_command(
                                     pending_sync,
                                     api_client,
                                     cached_key_tuples,
-                                    public_key_identity_tuples,
                                     local_key_cache_data,
                                     local_cache_key_state,
                                     authorization_memory,
@@ -908,16 +901,17 @@ pub(crate) async fn handle_control_command(
 
             match client.sync_ssh_keys().await {
                 Ok(keys) => {
-                    let key_tuples: Vec<(String, String, String)> = keys
-                        .iter()
-                        .map(|k| {
-                            (
-                                (*k.private_key_pem).clone(),
-                                k.name.clone(),
-                                k.cipher_id.clone(),
-                            )
-                        })
-                        .collect();
+                    let key_tuples: crate::runtime::KeyTuples = zeroize::Zeroizing::new(
+                        keys.iter()
+                            .map(|k| {
+                                (
+                                    (*k.private_key_pem).clone(),
+                                    k.name.clone(),
+                                    k.cipher_id.clone(),
+                                )
+                            })
+                            .collect(),
+                    );
                     let count = key_tuples.len();
                     if let Err(e) = write_key_selector_files(&keys) {
                         tracing::warn!("Failed to write key selector files: {}", e);
@@ -928,7 +922,6 @@ pub(crate) async fn handle_control_command(
                     reconcile_synced_key_state(
                         &key_tuples,
                         cached_key_tuples,
-                        public_key_identity_tuples,
                         local_key_cache_data,
                         local_cache_key_state,
                         authorization_memory,
@@ -946,7 +939,7 @@ pub(crate) async fn handle_control_command(
                         }
                     }
 
-                    if let Err(e) = agent.set_keys(key_tuples) {
+                    if let Err(e) = agent.set_keys(&key_tuples) {
                         return sshwarden_agent::ControlResponse::err(&format!(
                             "Login succeeded but failed to load keys: {}",
                             e
@@ -974,7 +967,6 @@ pub(crate) async fn handle_control_command(
                         pending_sync,
                         api_client,
                         cached_key_tuples,
-                        public_key_identity_tuples,
                         local_key_cache_data,
                         local_cache_key_state,
                         authorization_memory,
@@ -1029,7 +1021,6 @@ pub(crate) async fn handle_control_command(
             match do_sync(
                 api_client,
                 cached_key_tuples,
-                public_key_identity_tuples,
                 local_key_cache_data,
                 local_cache_key_state,
                 authorization_memory,
@@ -1105,7 +1096,6 @@ pub(crate) async fn handle_control_command(
 
             if remove_shared_cache {
                 *local_key_cache_data.write().await = None;
-                public_key_identity_tuples.write().await.clear();
                 key_names.write().await.clear();
                 let _ = agent.clear_keys();
             } else {
@@ -1116,7 +1106,6 @@ pub(crate) async fn handle_control_command(
                     .ok()
                     .flatten();
                 *local_key_cache_data.write().await = cache.clone();
-                public_key_identity_tuples.write().await.clear();
                 // Clear unconditionally (mirroring the shared-cache branch): if the
                 // shared cache fails to reload below, stale labels from the
                 // just-forgotten session must not linger in memory.
@@ -1130,10 +1119,6 @@ pub(crate) async fn handle_control_command(
                             e
                         );
                     }
-                    public_key_identity_tuples
-                        .write()
-                        .await
-                        .set(identities.clone());
                     let mut names = key_names.write().await;
                     for (_, name, vault_item_id) in identities {
                         names.insert(vault_item_id, name);
