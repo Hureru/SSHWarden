@@ -8,9 +8,9 @@ use crate::cache::load_managed_keys_from_cache;
 use crate::cli::KeysAction;
 use crate::control::cmd_control;
 use crate::sshconfig::{
-    load_host_bindings_importing_managed, managed_sshwarden_include_path, selector_path_for_key,
-    sync_managed_ssh_config_inner, user_ssh_config_path, with_host_bindings_locked,
-    write_sshwarden_include_line, ManagedKey,
+    load_host_bindings_importing_managed, managed_sshwarden_include_path,
+    regenerate_managed_ssh_config_after_change, selector_path_for_key, user_ssh_config_path,
+    with_host_bindings_locked, write_sshwarden_include_line, ManagedKey,
 };
 use crate::{err_line, out_line};
 /// Resolve a user-supplied `key` argument to a cipher_uuid.
@@ -180,7 +180,7 @@ pub(crate) async fn cmd_bindings_add(key: &str, hosts: &[String]) -> anyhow::Res
 
     // UX-7: a failed snippet regeneration means `ssh host` would route to the
     // wrong key (or none), so fail loudly rather than warn-and-continue.
-    sync_managed_ssh_config_inner(&keys, true)
+    regenerate_managed_ssh_config_after_change(&keys)
         .context("Bindings saved but managed snippet regeneration failed")?;
 
     // CFG-2: a binding does nothing unless ~/.ssh/config Includes the managed
@@ -231,7 +231,7 @@ pub(crate) async fn cmd_bindings_remove(
         anyhow::bail!("No matching host binding found for key {}", cipher_id);
     }
 
-    sync_managed_ssh_config_inner(&keys, true)
+    regenerate_managed_ssh_config_after_change(&keys)
         .context("Bindings saved but managed snippet regeneration failed")?;
 
     out_line(format!("Updated bindings for key {cipher_id}."));

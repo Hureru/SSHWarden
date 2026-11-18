@@ -160,20 +160,12 @@ These are not bugs per se — flag them during a real-world soak.
 
 ---
 
-## 7. Integration test idea
+## 7. Integration test — done
 
-Currently we have unit tests for:
-
-- `bindings.rs` — 9 tests on the data model
-- `main.rs` — SSH argv parsing plus managed SSH config import/include tests
-
-What's missing: an end-to-end test that goes
-`HostBindingsFile::add_host → sync_managed_ssh_config_inner →
-read the generated sshwarden_config → assert content`.
-
-**Suggested location:** `crates/sshwarden-config/tests/bindings_integration.rs`
-or a new `tests/` directory at the workspace root. Should use a temp dir via
-`SSHWARDEN_HOME` env to avoid touching the user's real config_dir.
+`tests/host_bindings_cli.rs` runs the real binary in a temp home
+(`SSHWARDEN_HOME` and `HOME` point into it): bind a, bind b, unbind a,
+unbind `--all`, checking `bindings.json` and the generated `sshwarden_config`
+after each step, plus one case for a hand-edited `Host` line.
 
 ---
 
@@ -182,6 +174,5 @@ or a new `tests/` directory at the workspace root. Should use a temp dir via
 If continuing incrementally:
 
 1. **Next** — Linux/macOS sysinfo validation (#3). Required before claiming non-Windows support.
-2. **Then** — broader integration tests (#7), ideally after moving more SSH config generation logic into `sshwarden-config`.
-3. **Later** — virtual scrolling/search (#2).
-4. **Deferred** — tray (#1).
+2. **Later** — virtual scrolling/search (#2).
+3. **Deferred** — tray (#1).

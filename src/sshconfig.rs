@@ -330,13 +330,34 @@ pub(crate) fn sync_managed_ssh_config_with_bindings(
 }
 
 /// Inner sync: optionally force write even when no bindings + no existing file
-/// (used by `ssh-config write`).
+/// (used by `ssh-config write`). Hand edits to `Host` lines in the old snippet
+/// are imported first.
 pub(crate) fn sync_managed_ssh_config_inner(
     keys: &[ManagedKey],
     force_write: bool,
 ) -> anyhow::Result<()> {
-    let mut bindings =
+    let bindings =
         load_host_bindings_importing_managed(keys).context("Failed to load host bindings")?;
+    write_managed_ssh_config(keys, bindings, force_write)
+}
+
+/// Rebuild the managed snippet right after a change made through
+/// [`with_host_bindings_locked`]. `bindings.json` is the truth here: the old
+/// snippet still shows the hosts from before the change, so importing it again
+/// would undo the change (hand edits were already imported before it).
+pub(crate) fn regenerate_managed_ssh_config_after_change(
+    keys: &[ManagedKey],
+) -> anyhow::Result<()> {
+    let bindings = sshwarden_config::bindings::HostBindingsFile::load()
+        .context("Failed to load host bindings")?;
+    write_managed_ssh_config(keys, bindings, true)
+}
+
+fn write_managed_ssh_config(
+    keys: &[ManagedKey],
+    mut bindings: sshwarden_config::bindings::HostBindingsFile,
+    force_write: bool,
+) -> anyhow::Result<()> {
     // UX-7/data-safety: an empty key set means we have no cache metadata to
     // classify orphans against — e.g. binding ahead of first sync (see
     // resolve_cipher_id), or the local key cache isn't loaded. Pruning against an
