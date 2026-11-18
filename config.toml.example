@@ -77,7 +77,8 @@ notification_reconnect_attempts_before_fallback = 3
 notification_reconnect_max_backoff = 60
 
 # 自动锁定超时（秒）
-# 无活动后自动锁定 Agent
+# 无活动后自动锁定 Agent。只有签名请求和解锁算活动，`status` 等命令不算；
+# 电脑睡眠的时间计入
 # 默认: 3600（1 小时）
 # 设置为 0 禁用自动锁定
 lock_timeout = 3600

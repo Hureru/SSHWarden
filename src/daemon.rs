@@ -278,7 +278,8 @@ pub(crate) async fn run_foreground(
     let auto_unlock = config.unlock.auto_unlock_on_request;
     let lock_timeout = config.agent.lock_timeout;
     let config = Arc::new(config);
-    let mut last_activity = tokio::time::Instant::now();
+    // Wall-clock time, so the hours a machine sleeps count as idle.
+    let mut last_activity = std::time::SystemTime::now();
     let mut lock_check_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     // Poll often enough that an access token is renewed shortly after it starts
     // expiring. The notification hub rejects a stale token with HTTP 401, so a
@@ -317,7 +318,6 @@ pub(crate) async fn run_foreground(
         tokio::select! {
             // Control commands from IPC
             Some(ctrl_req) = control_rx.recv() => {
-                last_activity = tokio::time::Instant::now();
                 // `stop` shuts the daemon down cleanly: ack, then break the loop
                 // so the cancel-token cleanup below runs (same path as Ctrl-C).
                 if matches!(ctrl_req.action, sshwarden_agent::ControlAction::Stop) {
@@ -349,6 +349,7 @@ pub(crate) async fn run_foreground(
                 // instead; dropping the future releases whatever it held.
                 let budget = control_action_timeout(&ctrl_req.action);
                 let label = control_action_label(&ctrl_req.action);
+                let is_activity = counts_as_activity(&ctrl_req.action);
                 let response = run_control_action(
                     label,
                     budget,
@@ -374,11 +375,16 @@ pub(crate) async fn run_foreground(
                     ),
                 )
                 .await;
+                // Stamped when the action ends: an unlock can wait on a PIN
+                // window for longer than the lock timeout.
+                if is_activity {
+                    last_activity = std::time::SystemTime::now();
+                }
                 let _ = ctrl_req.reply.send(response);
             }
             // UI requests from SSH agent
             Some(request) = request_rx.recv() => {
-                last_activity = tokio::time::Instant::now();
+                last_activity = std::time::SystemTime::now();
 
                 // CONC-6: mark a request in flight for the duration of the
                 // handler (which may open a long sign/unlock prompt).
@@ -423,6 +429,9 @@ pub(crate) async fn run_foreground(
             }
             // Runtime events from spawned SSH request handlers
             Some(event) = runtime_event_rx.recv() => {
+                // Every event is an unlock done by a sign request, whose PIN
+                // window may have been open for longer than the lock timeout.
+                last_activity = std::time::SystemTime::now();
                 match event {
                     #[cfg(windows)]
                     RuntimeEvent::AutoUnlockedWindowsHello => {
@@ -583,11 +592,17 @@ pub(crate) async fn run_foreground(
             }
             // Auto-lock check
             _ = lock_check_interval.tick() => {
-                if lock_timeout > 0
-                    && !vault_locked.load(std::sync::atomic::Ordering::Relaxed)
-                    && in_flight_prompts.load(std::sync::atomic::Ordering::Relaxed) == 0
-                    && last_activity.elapsed().as_secs() >= lock_timeout
-                {
+                // A clock set back makes `elapsed` fail: start counting again.
+                let idle_secs = last_activity.elapsed().map(|idle| idle.as_secs()).unwrap_or_else(|_| {
+                    last_activity = std::time::SystemTime::now();
+                    0
+                });
+                if should_auto_lock(
+                    lock_timeout,
+                    vault_locked.load(std::sync::atomic::Ordering::Relaxed),
+                    in_flight_prompts.load(std::sync::atomic::Ordering::Relaxed),
+                    idle_secs,
+                ) {
                     info!("Auto-locking vault due to inactivity ({} seconds)", lock_timeout);
                     let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, Some(&local_cache_key_state), Some(&authorization_memory)).await;
                 }
@@ -676,6 +691,31 @@ fn control_action_timeout(action: &sshwarden_agent::ControlAction) -> std::time:
         | ControlAction::BindHostsDialog => CONTROL_ACTION_USER_PROMPT_TIMEOUT,
         _ => CONTROL_ACTION_TIMEOUT,
     }
+}
+
+/// Whether a control command restarts the auto-lock timer. Only an unlock
+/// does: `status` polled by a script must not keep the vault unlocked.
+fn counts_as_activity(action: &sshwarden_agent::ControlAction) -> bool {
+    use sshwarden_agent::ControlAction;
+    matches!(
+        action,
+        ControlAction::Unlock
+            | ControlAction::UnlockPin { .. }
+            | ControlAction::UnlockHello
+            | ControlAction::UnlockNative
+            | ControlAction::UnlockPassword { .. }
+    )
+}
+
+/// The auto-lock decision. A `lock_timeout` of 0 turns auto-lock off, and an
+/// open sign or unlock prompt holds it off.
+fn should_auto_lock(
+    lock_timeout: u64,
+    locked: bool,
+    in_flight_prompts: usize,
+    idle_secs: u64,
+) -> bool {
+    lock_timeout > 0 && !locked && in_flight_prompts == 0 && idle_secs >= lock_timeout
 }
 
 /// Stable, secret-free label for logging and error messages.
@@ -794,5 +834,47 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.message.as_deref(), Some("all good"));
+    }
+
+    #[test]
+    fn only_unlocks_restart_the_auto_lock_timer() {
+        for action in [
+            ControlAction::Unlock,
+            ControlAction::UnlockHello,
+            ControlAction::UnlockNative,
+            ControlAction::UnlockPin { pin: "1".into() },
+            ControlAction::UnlockPassword {
+                password: "p".into(),
+            },
+        ] {
+            assert!(
+                counts_as_activity(&action),
+                "{}",
+                control_action_label(&action)
+            );
+        }
+        for action in [
+            ControlAction::Status { json: false },
+            ControlAction::Status { json: true },
+            ControlAction::Sync,
+            ControlAction::Lock,
+            ControlAction::BindHostsDialog,
+        ] {
+            assert!(
+                !counts_as_activity(&action),
+                "{}",
+                control_action_label(&action)
+            );
+        }
+    }
+
+    #[test]
+    fn auto_lock_needs_an_idle_unlocked_vault_without_prompts() {
+        assert!(should_auto_lock(60, false, 0, 60));
+        assert!(should_auto_lock(60, false, 0, 8 * 3600));
+        assert!(!should_auto_lock(60, false, 0, 59));
+        assert!(!should_auto_lock(0, false, 0, 8 * 3600), "0 turns it off");
+        assert!(!should_auto_lock(60, true, 0, 600), "already locked");
+        assert!(!should_auto_lock(60, false, 1, 600), "a prompt is open");
     }
 }
