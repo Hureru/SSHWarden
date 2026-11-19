@@ -785,6 +785,13 @@ pub(crate) async fn handle_control_command(
                         format!("Bitwarden session refreshed, {} SSH keys loaded", count)
                     };
                     info!("{}", message);
+                    let message = if state.notification_state.read().await.stale_cache {
+                        format!(
+                            "{message}\nWarning: the saved keys on disk were not updated (the vault was not unlocked with the PIN first). Run `sshwarden lock`, `sshwarden unlock`, then `sshwarden sync`."
+                        )
+                    } else {
+                        message
+                    };
                     sshwarden_agent::ControlResponse::ok(&message)
                 }
                 Err(e) => sshwarden_agent::ControlResponse::err(&format!(

@@ -10,6 +10,8 @@ use crate::cache::{
 };
 use crate::runtime::DaemonState;
 use crate::sshconfig::{sync_managed_ssh_config_with_bindings, write_key_selector_files};
+pub(crate) const CACHE_KEY_NOT_LOADED: &str = "Local Cache Key not loaded; cache not refreshed";
+
 pub(crate) async fn reconcile_synced_key_state(
     key_tuples: &[(String, String, String)],
     state: &DaemonState,
@@ -41,6 +43,16 @@ pub(crate) async fn reconcile_synced_key_state(
     // (tokio's RwLock is not reentrant).
     let existing_cache = state.local_key_cache_data.read().await.as_ref().cloned();
     let local_cache_key = state.local_cache_key_state.read().await.clone_key();
+    if existing_cache.is_some() && local_cache_key.is_none() {
+        // The agent has the new keys but the file keeps the old ones; without
+        // this flag a key deleted on the server would sign again after a restart.
+        state
+            .notification_state
+            .write()
+            .await
+            .mark_cache_stale(CACHE_KEY_NOT_LOADED);
+        tracing::warn!("{}", CACHE_KEY_NOT_LOADED);
+    }
     if let (Some(existing_cache), Some(local_cache_key)) = (existing_cache, local_cache_key) {
         match refresh_envelope_local_key_cache(key_tuples, &existing_cache, &local_cache_key) {
             Ok(cache) => {
@@ -305,6 +317,11 @@ mod tests {
             .clone_key()
             .is_some());
         assert!(!state.notification_state.read().await.stale_cache);
+
+        // A cache whose key is not in memory cannot be rewritten: say so.
+        state.local_cache_key_state.write().await.clear();
+        reconcile_synced_key_state(&key_tuples, &state).await;
+        assert!(state.notification_state.read().await.stale_cache);
 
         let _ = std::fs::remove_dir_all(&home);
     }
