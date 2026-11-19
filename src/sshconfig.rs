@@ -798,14 +798,17 @@ mod tests {
     fn a_marked_include_follows_the_snippet_to_its_new_path() {
         let dir = temp_dir("include-follow");
         let config_path = dir.join("config");
-        let new_path = dir.join("data").join("sshwarden_config");
-        write_sshwarden_include_line(&config_path, &dir.join("old").join("sshwarden_config"))
-            .unwrap();
+        let new_path = dir.join("after-move").join("sshwarden_config");
+        write_sshwarden_include_line(
+            &config_path,
+            &dir.join("before-move").join("sshwarden_config"),
+        )
+        .unwrap();
 
         assert!(follow_moved_include(&config_path, &new_path).unwrap());
         let config = std::fs::read_to_string(&config_path).unwrap();
         assert!(
-            config.contains("data") && !config.contains("old"),
+            config.contains("after-move") && !config.contains("before-move"),
             "{config}"
         );
         assert!(!follow_moved_include(&config_path, &new_path).unwrap());
