@@ -566,25 +566,32 @@ mod tests {
     }
 
     /// Audit #7: a server that accepts and never answers ends in a timeout.
-    /// The clock is paused, so the 30 s pass at once.
-    #[tokio::test(start_paused = true)]
+    /// The clock is paused once the server has the connection, so the 30 s
+    /// pass at once; paused earlier, the connect timeout can fire first.
+    #[tokio::test]
     async fn silent_server_times_out() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
+            let mut accepted_tx = Some(accepted_tx);
             let mut open = Vec::new();
             while let Ok(connection) = listener.accept().await {
                 open.push(connection);
+                if let Some(tx) = accepted_tx.take() {
+                    let _ = tx.send(());
+                }
             }
         });
 
         let client = BitwardenClient::new(&url, &url, &url);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            client.prelogin("a@b.c"),
-        )
-        .await
-        .expect("the request should give up by itself");
+        let request = tokio::spawn(async move { client.prelogin("a@b.c").await });
+        accepted_rx.await.unwrap();
+        tokio::time::pause();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(120), request)
+            .await
+            .expect("the request should give up by itself")
+            .unwrap();
         let error = format!("{:#}", result.unwrap_err());
         assert!(error.contains("timed out"), "got: {error}");
     }
