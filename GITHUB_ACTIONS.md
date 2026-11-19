@@ -20,7 +20,7 @@
 ```yaml
 - Windows (x86_64-pc-windows-msvc)
 - Linux (x86_64-unknown-linux-gnu)
-- macOS (x86_64-apple-darwin)
+- macOS (aarch64-apple-darwin)
 ```
 
 **缓存策略**:
@@ -34,7 +34,8 @@
 - 推送符合 `vMAJOR.MINOR.PATCH` 的 tag（例如 `v0.2.0`）
 
 **功能**:
-- 创建 GitHub Release
+- 先跑 `cargo test --workspace`，失败则不发布
+- 创建草稿 Release，三个平台都上传完成后才公开（某个平台构建失败时留下的是草稿）
 - 在三个平台上构建 release 版本
 - 打包并上传发布文件
 - 自动生成 release notes
@@ -42,7 +43,7 @@
 **发布产物**:
 - `sshwarden-{version}-windows-x64.zip`
 - `sshwarden-{version}-linux-x64.tar.gz`
-- `sshwarden-{version}-macos-x64.tar.gz`
+- `sshwarden-{version}-macos-arm64.tar.gz`
 
 ## 使用指南
 
