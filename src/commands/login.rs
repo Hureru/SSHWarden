@@ -73,7 +73,17 @@ pub(crate) fn create_client(
         .as_deref()
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}/identity", base));
-    sshwarden_api::BitwardenClient::new(base, &api_url, &identity_url)
+    // The device id of an earlier login, so the server sees one device and
+    // not a new one per login.
+    match sshwarden_config::session::SessionFile::load() {
+        Ok(Some(session)) => sshwarden_api::BitwardenClient::new_with_device_id(
+            base,
+            &api_url,
+            &identity_url,
+            &session.device_id,
+        ),
+        _ => sshwarden_api::BitwardenClient::new(base, &api_url, &identity_url),
+    }
 }
 
 /// Login command: authenticate and load keys into the running agent.

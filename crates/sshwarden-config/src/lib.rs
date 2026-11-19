@@ -142,25 +142,10 @@ fn default_notifications_url(base_url: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthConfig {
-    #[serde(default = "default_auth_method")]
-    pub method: String,
     #[serde(default)]
     pub email: String,
-}
-
-fn default_auth_method() -> String {
-    "password".to_string()
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            method: default_auth_method(),
-            email: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1223,5 +1208,12 @@ mod tests {
 
         let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
         assert_eq!(reparsed.rules[1].user.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn a_config_with_the_removed_auth_method_still_loads() {
+        let config: Config =
+            toml::from_str("[auth]\nmethod = \"api_key\"\nemail = \"a@b.c\"\n").unwrap();
+        assert_eq!(config.auth.email, "a@b.c");
     }
 }

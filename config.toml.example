@@ -29,11 +29,6 @@ base_url = "https://vault.bitwarden.com"
 # 认证配置
 # ============================================
 [auth]
-# 认证方法
-# 可选值: "password", "api_key"
-# 默认: "password"
-method = "password"
-
 # Bitwarden 账户邮箱
 # 留空则每次启动时提示输入
 email = ""
