@@ -16,11 +16,7 @@ pub fn get_peer_info(peer_pid: u32) -> Result<PeerInfo, String> {
             }
         };
 
-        return Ok(PeerInfo::new(
-            peer_pid,
-            process.pid().as_u32(),
-            peer_process_name,
-        ));
+        return Ok(PeerInfo::new(process.pid().as_u32(), peer_process_name));
     }
 
     Err("Failed to get process".to_string())

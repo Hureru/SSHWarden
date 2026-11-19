@@ -2,7 +2,6 @@ use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
-    uid: u32,
     pid: u32,
     process_name: String,
     is_forwarding: Arc<AtomicBool>,
@@ -12,9 +11,8 @@ pub struct PeerInfo {
 }
 
 impl PeerInfo {
-    pub fn new(uid: u32, pid: u32, process_name: String) -> Self {
+    pub fn new(pid: u32, process_name: String) -> Self {
         Self {
-            uid,
             pid,
             process_name,
             is_forwarding: Arc::new(AtomicBool::new(false)),
@@ -25,17 +23,12 @@ impl PeerInfo {
 
     pub fn unknown() -> Self {
         Self {
-            uid: 0,
             pid: 0,
             process_name: "Unknown application".to_string(),
             is_forwarding: Arc::new(AtomicBool::new(false)),
             host_key: Arc::new(Mutex::new(Vec::new())),
             picked: Arc::new(Mutex::new(None)),
         }
-    }
-
-    pub fn uid(&self) -> u32 {
-        self.uid
     }
 
     pub fn pid(&self) -> u32 {

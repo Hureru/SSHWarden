@@ -181,15 +181,6 @@ impl HostBindingsFile {
         }
     }
 
-    pub fn delete() -> anyhow::Result<()> {
-        let path = Self::path()?;
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("Failed to delete bindings file: {}", path.display()))?;
-        }
-        Ok(())
-    }
-
     /// Replace the host patterns bound to `cipher_uuid`. Empty list removes the entry.
     pub fn set_hosts(&mut self, cipher_uuid: &str, hosts: Vec<String>) -> anyhow::Result<()> {
         for h in &hosts {

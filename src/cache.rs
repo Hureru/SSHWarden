@@ -410,7 +410,6 @@ pub(crate) fn decrypt_envelope_payload(
     Ok((zeroize::Zeroizing::new(keys_json), local_cache_key))
 }
 
-#[allow(dead_code)]
 pub(crate) fn decrypt_envelope_local_key_cache_with_native(
     cache: &sshwarden_config::cache::LocalKeyCacheFile,
 ) -> anyhow::Result<(

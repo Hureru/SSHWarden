@@ -783,7 +783,7 @@ V1e7S3lMGgbgyKkAAAAQdGVzdEBleGFtcGxlLmNvbQECAw==
         use bitwarden_russh::ssh_agent::Agent as _;
 
         let (agent, _request_rx, _response_tx) = create_test_agent();
-        let info = PeerInfo::new(0, 1, "ssh".to_string());
+        let info = PeerInfo::new(1, "ssh".to_string());
         for (is_forwarding, host_key) in [(true, b"hop1".to_vec()), (false, b"hop2".to_vec())] {
             agent
                 .set_sessionbind_info(

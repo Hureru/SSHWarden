@@ -41,7 +41,6 @@ windows = { version = "0.61", features = [
     "Win32_Security_Credentials",
     "Win32_System_WinRT",
 ] }
-windows-core = "0.61"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

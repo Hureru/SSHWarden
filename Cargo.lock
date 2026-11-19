@@ -5192,7 +5192,6 @@ dependencies = [
  "ssh-key",
  "sshwarden-config",
  "sysinfo",
- "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
@@ -5252,7 +5251,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows 0.61.3",
- "windows-core 0.61.2",
  "winresource",
 ]
 
