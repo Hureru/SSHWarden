@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "sync", "macros", "net", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 sshwarden-config = { path = "../sshwarden-config" }
 
 [target.'cfg(windows)'.dependencies]

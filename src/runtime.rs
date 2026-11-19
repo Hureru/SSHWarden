@@ -263,6 +263,9 @@ pub(crate) fn notification_health_label(health: &NotificationHealth<'_>) -> Stri
     }
 }
 
+/// Decrypted `(private key PEM, name, vault item id)` tuples, wiped when dropped.
+pub(crate) type KeyTuples = zeroize::Zeroizing<Vec<(String, String, String)>>;
+
 /// Secure key cache: automatically zeroes PEM private keys on drop/clear.
 pub(crate) struct SecureKeyCache(pub(crate) Vec<(String, String, String)>);
 
@@ -305,8 +308,8 @@ impl SecureKeyCache {
         self.0.clear();
     }
 
-    pub(crate) fn clone_inner(&self) -> Vec<(String, String, String)> {
-        self.0.clone()
+    pub(crate) fn clone_inner(&self) -> KeyTuples {
+        zeroize::Zeroizing::new(self.0.clone())
     }
 }
 

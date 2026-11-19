@@ -411,7 +411,6 @@ pub(crate) async fn handle_control_command(
     agent: &mut sshwarden_agent::SshWardenAgent,
     vault_locked: &Arc<std::sync::atomic::AtomicBool>,
     cached_key_tuples: &CachedKeyTuples,
-    public_key_identity_tuples: &CachedKeyTuples,
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
     local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
     local_cache_key_state: &LocalCacheKeyHandle,
@@ -490,7 +489,6 @@ pub(crate) async fn handle_control_command(
                         pending_sync,
                         api_client,
                         cached_key_tuples,
-                        public_key_identity_tuples,
                         local_key_cache_data,
                         local_cache_key_state,
                         authorization_memory,
@@ -534,7 +532,6 @@ pub(crate) async fn handle_control_command(
                                 pending_sync,
                                 api_client,
                                 cached_key_tuples,
-                                public_key_identity_tuples,
                                 local_key_cache_data,
                                 local_cache_key_state,
                                 authorization_memory,
@@ -640,7 +637,6 @@ pub(crate) async fn handle_control_command(
                                 pending_sync,
                                 api_client,
                                 cached_key_tuples,
-                                public_key_identity_tuples,
                                 local_key_cache_data,
                                 local_cache_key_state,
                                 authorization_memory,
@@ -691,7 +687,6 @@ pub(crate) async fn handle_control_command(
                     pending_sync,
                     api_client,
                     cached_key_tuples,
-                    public_key_identity_tuples,
                     local_key_cache_data,
                     local_cache_key_state,
                     authorization_memory,
@@ -739,7 +734,6 @@ pub(crate) async fn handle_control_command(
                                     pending_sync,
                                     api_client,
                                     cached_key_tuples,
-                                    public_key_identity_tuples,
                                     local_key_cache_data,
                                     local_cache_key_state,
                                     authorization_memory,
@@ -780,7 +774,6 @@ pub(crate) async fn handle_control_command(
             .await
         }
         ControlAction::UnlockPin { pin } => {
-            let pin = zeroize::Zeroizing::new(pin);
             if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
@@ -850,7 +843,6 @@ pub(crate) async fn handle_control_command(
                                     pending_sync,
                                     api_client,
                                     cached_key_tuples,
-                                    public_key_identity_tuples,
                                     local_key_cache_data,
                                     local_cache_key_state,
                                     authorization_memory,
@@ -886,7 +878,6 @@ pub(crate) async fn handle_control_command(
             resp
         }
         ControlAction::UnlockPassword { password } => {
-            let password = zeroize::Zeroizing::new(password);
             let was_locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
 
             // Email from config (used for re-login).
@@ -908,16 +899,17 @@ pub(crate) async fn handle_control_command(
 
             match client.sync_ssh_keys().await {
                 Ok(keys) => {
-                    let key_tuples: Vec<(String, String, String)> = keys
-                        .iter()
-                        .map(|k| {
-                            (
-                                (*k.private_key_pem).clone(),
-                                k.name.clone(),
-                                k.cipher_id.clone(),
-                            )
-                        })
-                        .collect();
+                    let key_tuples: crate::runtime::KeyTuples = zeroize::Zeroizing::new(
+                        keys.iter()
+                            .map(|k| {
+                                (
+                                    (*k.private_key_pem).clone(),
+                                    k.name.clone(),
+                                    k.cipher_id.clone(),
+                                )
+                            })
+                            .collect(),
+                    );
                     let count = key_tuples.len();
                     if let Err(e) = write_key_selector_files(&keys) {
                         tracing::warn!("Failed to write key selector files: {}", e);
@@ -928,7 +920,6 @@ pub(crate) async fn handle_control_command(
                     reconcile_synced_key_state(
                         &key_tuples,
                         cached_key_tuples,
-                        public_key_identity_tuples,
                         local_key_cache_data,
                         local_cache_key_state,
                         authorization_memory,
@@ -946,7 +937,7 @@ pub(crate) async fn handle_control_command(
                         }
                     }
 
-                    if let Err(e) = agent.set_keys(key_tuples) {
+                    if let Err(e) = agent.set_keys(&key_tuples) {
                         return sshwarden_agent::ControlResponse::err(&format!(
                             "Login succeeded but failed to load keys: {}",
                             e
@@ -974,7 +965,6 @@ pub(crate) async fn handle_control_command(
                         pending_sync,
                         api_client,
                         cached_key_tuples,
-                        public_key_identity_tuples,
                         local_key_cache_data,
                         local_cache_key_state,
                         authorization_memory,
@@ -1001,16 +991,19 @@ pub(crate) async fn handle_control_command(
             }
         }
         ControlAction::Sync => {
-            // do_sync cannot load keys into the agent while the vault is locked
-            // (no private material is held); it only refreshes the on-disk cache.
-            // Report that honestly and mark a pending sync so the next unlock
-            // applies the keys, instead of claiming the running agent was updated.
-            let was_locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
+            // Locked means nothing is pulled or decrypted (ADR 0009): the sync
+            // waits as a Pending Sync, and the next unlock runs it.
+            if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+                pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                return sshwarden_agent::ControlResponse::ok(
+                    "Vault is locked; sync will run on next unlock",
+                );
+            }
             // Only multi-device mode needs the shared cache reconciled before a
             // manual sync. Gating this avoids a NEW PIN prompt (and a hard failure
             // on cancel) for legacy single-device users whose unlock path did not
             // keep the Local Cache Key in memory.
-            if !was_locked && multi_device_mode() {
+            if multi_device_mode() {
                 // If this unlocked session was restored without keeping the Local
                 // Cache Key in memory, a plain sync would update the live agent but
                 // leave `sshwarden keys` showing the old cache header. Prompt for
@@ -1029,7 +1022,6 @@ pub(crate) async fn handle_control_command(
             match do_sync(
                 api_client,
                 cached_key_tuples,
-                public_key_identity_tuples,
                 local_key_cache_data,
                 local_cache_key_state,
                 authorization_memory,
@@ -1042,14 +1034,7 @@ pub(crate) async fn handle_control_command(
             .await
             {
                 Ok(count) => {
-                    if was_locked {
-                        pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
-                        sshwarden_agent::ControlResponse::ok(&format!(
-                            "Synced {count} SSH keys to cache; they will load into the agent on next unlock"
-                        ))
-                    } else {
-                        sshwarden_agent::ControlResponse::ok(&format!("Synced {count} SSH keys"))
-                    }
+                    sshwarden_agent::ControlResponse::ok(&format!("Synced {count} SSH keys"))
                 }
                 Err(e) => sshwarden_agent::ControlResponse::err(&e),
             }
@@ -1105,7 +1090,6 @@ pub(crate) async fn handle_control_command(
 
             if remove_shared_cache {
                 *local_key_cache_data.write().await = None;
-                public_key_identity_tuples.write().await.clear();
                 key_names.write().await.clear();
                 let _ = agent.clear_keys();
             } else {
@@ -1116,7 +1100,6 @@ pub(crate) async fn handle_control_command(
                     .ok()
                     .flatten();
                 *local_key_cache_data.write().await = cache.clone();
-                public_key_identity_tuples.write().await.clear();
                 // Clear unconditionally (mirroring the shared-cache branch): if the
                 // shared cache fails to reload below, stale labels from the
                 // just-forgotten session must not linger in memory.
@@ -1130,10 +1113,6 @@ pub(crate) async fn handle_control_command(
                             e
                         );
                     }
-                    public_key_identity_tuples
-                        .write()
-                        .await
-                        .set(identities.clone());
                     let mut names = key_names.write().await;
                     for (_, name, vault_item_id) in identities {
                         names.insert(vault_item_id, name);
@@ -1157,7 +1136,6 @@ pub(crate) async fn handle_control_command(
             }
         }
         ControlAction::SetPin { pin } => {
-            let pin = zeroize::Zeroizing::new(pin);
             if pin.len() < 4 {
                 return sshwarden_agent::ControlResponse::err("PIN must be at least 4 characters");
             }

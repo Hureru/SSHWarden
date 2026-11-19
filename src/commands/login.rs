@@ -21,8 +21,16 @@ pub(crate) async fn cmd_set_pin() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cmd = format!("set-pin:{}", *pin);
-    cmd_control(&cmd).await
+    cmd_control(&secret_command("set-pin:", &pin)).await
+}
+
+/// `<prefix><secret>`, wiped when dropped. Built in one allocation: `format!`
+/// can grow its buffer and leave an unwiped copy of the secret behind.
+fn secret_command(prefix: &str, secret: &str) -> zeroize::Zeroizing<String> {
+    let mut cmd = zeroize::Zeroizing::new(String::with_capacity(prefix.len() + secret.len()));
+    cmd.push_str(prefix);
+    cmd.push_str(secret);
+    cmd
 }
 
 /// Prompt for a password from the terminal (hides input).
@@ -95,8 +103,11 @@ pub(crate) async fn cmd_login(
     // Prefer the running daemon: it performs the login + sync and loads keys
     // into the live agent. The control protocol carries only the password, so
     // the daemon uses its own configured server/email.
-    match sshwarden_agent::control::send_control_command(&format!("unlock-password:{}", *password))
-        .await
+    match sshwarden_agent::control::send_control_command(&secret_command(
+        "unlock-password:",
+        &password,
+    ))
+    .await
     {
         Ok(response) => {
             if response.ok {
@@ -192,7 +203,7 @@ pub(crate) async fn offer_pin_setup() -> anyhow::Result<()> {
         err_line("PINs do not match. Skipped — run `sshwarden set-pin` later.");
         return Ok(());
     }
-    match sshwarden_agent::control::send_control_command(&format!("set-pin:{}", *pin)).await {
+    match sshwarden_agent::control::send_control_command(&secret_command("set-pin:", &pin)).await {
         Ok(resp) if resp.ok => out_line("PIN set — this device is now remembered."),
         Ok(resp) => err_line(format!(
             "Could not set PIN: {}",

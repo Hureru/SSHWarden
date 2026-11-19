@@ -49,7 +49,9 @@ pub(crate) fn build_envelope_local_key_cache(
     hello_encrypted: Option<String>,
     native_encrypted: Option<String>,
 ) -> anyhow::Result<sshwarden_config::cache::LocalKeyCacheFile> {
-    let keys_json = serde_json::to_string(keys).context("Failed to serialize cache payload")?;
+    let keys_json = zeroize::Zeroizing::new(
+        serde_json::to_string(keys).context("Failed to serialize cache payload")?,
+    );
     let encrypted_payload =
         sshwarden_api::crypto::encrypt_enc_string(keys_json.as_bytes(), local_cache_key)?;
     let cache = sshwarden_config::cache::LocalKeyCacheFile {
@@ -400,19 +402,25 @@ pub(crate) fn encrypt_local_cache_key_with_hello(
 pub(crate) fn decrypt_envelope_payload(
     cache: &sshwarden_config::cache::LocalKeyCacheFile,
     local_cache_key: sshwarden_api::crypto::SymmetricKey,
-) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
+) -> anyhow::Result<(
+    zeroize::Zeroizing<String>,
+    sshwarden_api::crypto::SymmetricKey,
+)> {
     let payload =
         sshwarden_api::crypto::decrypt_enc_string(&cache.encrypted_payload, &local_cache_key)
             .context("Failed to decrypt local key cache payload")?;
     let keys_json =
         String::from_utf8(payload).context("Local key cache payload is not valid UTF-8")?;
-    Ok((keys_json, local_cache_key))
+    Ok((zeroize::Zeroizing::new(keys_json), local_cache_key))
 }
 
 #[allow(dead_code)]
 pub(crate) fn decrypt_envelope_local_key_cache_with_native(
     cache: &sshwarden_config::cache::LocalKeyCacheFile,
-) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
+) -> anyhow::Result<(
+    zeroize::Zeroizing<String>,
+    sshwarden_api::crypto::SymmetricKey,
+)> {
     let native_slot =
         current_native_unlock_slot(cache).context("Local key cache has no native unlock slot")?;
     let encoded_lck = sshwarden_ui::unlock::native::native_decrypt_local_cache_key(&native_slot)
@@ -451,7 +459,10 @@ pub(crate) async fn finish_native_unlock_response(
 pub(crate) fn decrypt_envelope_local_key_cache_with_pin(
     cache: &sshwarden_config::cache::LocalKeyCacheFile,
     pin: &str,
-) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
+) -> anyhow::Result<(
+    zeroize::Zeroizing<String>,
+    sshwarden_api::crypto::SymmetricKey,
+)> {
     let encrypted_lck = cache
         .local_cache_key
         .pin_encrypted
@@ -504,7 +515,10 @@ pub(crate) fn migrate_pin_salt_to_v3(
 #[cfg(windows)]
 pub(crate) fn decrypt_envelope_local_key_cache_with_hello(
     cache: &sshwarden_config::cache::LocalKeyCacheFile,
-) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
+) -> anyhow::Result<(
+    zeroize::Zeroizing<String>,
+    sshwarden_api::crypto::SymmetricKey,
+)> {
     let (challenge_b64, hello_encrypted) = current_hello_unlock_info(cache)
         .context("Local key cache has no Windows Hello unlock slot for this device")?;
     let challenge_bytes = base64::engine::general_purpose::STANDARD

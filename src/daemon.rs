@@ -170,7 +170,6 @@ pub(crate) async fn run_foreground(
     // Cache key tuples for re-loading after unlock, track public key identities,
     // and track vault lock state.
     let cached_key_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
-    let public_key_identity_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
     let vault_locked = Arc::new(std::sync::atomic::AtomicBool::new(has_remembered_device));
     let api_client: Arc<RwLock<Option<sshwarden_api::BitwardenClient>>> =
         Arc::new(RwLock::new(api_client));
@@ -193,16 +192,17 @@ pub(crate) async fn run_foreground(
 
     // Load vault keys into agent
     if let Some(keys) = vault_keys {
-        let key_tuples: Vec<(String, String, String)> = keys
-            .iter()
-            .map(|k| {
-                (
-                    (*k.private_key_pem).clone(),
-                    k.name.clone(),
-                    k.cipher_id.clone(),
-                )
-            })
-            .collect();
+        let key_tuples: crate::runtime::KeyTuples = zeroize::Zeroizing::new(
+            keys.iter()
+                .map(|k| {
+                    (
+                        (*k.private_key_pem).clone(),
+                        k.name.clone(),
+                        k.cipher_id.clone(),
+                    )
+                })
+                .collect(),
+        );
         let count = key_tuples.len();
         if count > 0 {
             if let Err(e) = write_key_selector_files(&keys) {
@@ -211,14 +211,10 @@ pub(crate) async fn run_foreground(
             if let Err(e) = sync_managed_ssh_config_with_bindings(&keys) {
                 tracing::warn!("Failed to sync managed SSH config: {}", e);
             }
-            public_key_identity_tuples
-                .write()
-                .await
-                .set(key_tuples.clone());
-            cached_key_tuples.write().await.set(key_tuples.clone());
+            cached_key_tuples.write().await.set(key_tuples.to_vec());
             *key_material_fingerprints.write().await =
                 key_material_fingerprints_from_tuples(&key_tuples);
-            agent.set_keys(key_tuples)?;
+            agent.set_keys(&key_tuples)?;
             info!("Loaded {} SSH key(s) into agent", count);
 
             // After first login with keys loaded, offer to set up PIN for persistence
@@ -237,10 +233,6 @@ pub(crate) async fn run_foreground(
         let identities = key_tuples_from_cache_header(cache);
         let count = identities.len();
         if count > 0 {
-            public_key_identity_tuples
-                .write()
-                .await
-                .set(identities.clone());
             {
                 let mut names = key_names.write().await;
                 names.clear();
@@ -286,7 +278,8 @@ pub(crate) async fn run_foreground(
     let auto_unlock = config.unlock.auto_unlock_on_request;
     let lock_timeout = config.agent.lock_timeout;
     let config = Arc::new(config);
-    let mut last_activity = tokio::time::Instant::now();
+    // Wall-clock time, so the hours a machine sleeps count as idle.
+    let mut last_activity = std::time::SystemTime::now();
     let mut lock_check_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     // Poll often enough that an access token is renewed shortly after it starts
     // expiring. The notification hub rejects a stale token with HTTP 401, so a
@@ -325,7 +318,6 @@ pub(crate) async fn run_foreground(
         tokio::select! {
             // Control commands from IPC
             Some(ctrl_req) = control_rx.recv() => {
-                last_activity = tokio::time::Instant::now();
                 // `stop` shuts the daemon down cleanly: ack, then break the loop
                 // so the cancel-token cleanup below runs (same path as Ctrl-C).
                 if matches!(ctrl_req.action, sshwarden_agent::ControlAction::Stop) {
@@ -357,6 +349,7 @@ pub(crate) async fn run_foreground(
                 // instead; dropping the future releases whatever it held.
                 let budget = control_action_timeout(&ctrl_req.action);
                 let label = control_action_label(&ctrl_req.action);
+                let is_activity = counts_as_activity(&ctrl_req.action);
                 let response = run_control_action(
                     label,
                     budget,
@@ -365,7 +358,6 @@ pub(crate) async fn run_foreground(
                         &mut agent,
                         &vault_locked,
                         &cached_key_tuples,
-                        &public_key_identity_tuples,
                         &api_client,
                         &local_key_cache_data,
                         &local_cache_key_state,
@@ -383,11 +375,16 @@ pub(crate) async fn run_foreground(
                     ),
                 )
                 .await;
+                // Stamped when the action ends: an unlock can wait on a PIN
+                // window for longer than the lock timeout.
+                if is_activity {
+                    last_activity = std::time::SystemTime::now();
+                }
                 let _ = ctrl_req.reply.send(response);
             }
             // UI requests from SSH agent
             Some(request) = request_rx.recv() => {
-                last_activity = tokio::time::Instant::now();
+                last_activity = std::time::SystemTime::now();
 
                 // CONC-6: mark a request in flight for the duration of the
                 // handler (which may open a long sign/unlock prompt).
@@ -432,6 +429,9 @@ pub(crate) async fn run_foreground(
             }
             // Runtime events from spawned SSH request handlers
             Some(event) = runtime_event_rx.recv() => {
+                // Every event is an unlock done by a sign request, whose PIN
+                // window may have been open for longer than the lock timeout.
+                last_activity = std::time::SystemTime::now();
                 match event {
                     #[cfg(windows)]
                     RuntimeEvent::AutoUnlockedWindowsHello => {
@@ -447,7 +447,6 @@ pub(crate) async fn run_foreground(
                             &pending_sync,
                             &api_client,
                             &cached_key_tuples,
-                            &public_key_identity_tuples,
                             &local_key_cache_data,
                             &local_cache_key_state,
                             &authorization_memory,
@@ -473,7 +472,6 @@ pub(crate) async fn run_foreground(
                             &pending_sync,
                             &api_client,
                             &cached_key_tuples,
-                            &public_key_identity_tuples,
                             &local_key_cache_data,
                             &local_cache_key_state,
                             &authorization_memory,
@@ -494,7 +492,6 @@ pub(crate) async fn run_foreground(
                             &pending_sync,
                             &api_client,
                             &cached_key_tuples,
-                            &public_key_identity_tuples,
                             &local_key_cache_data,
                             &local_cache_key_state,
                             &authorization_memory,
@@ -528,7 +525,7 @@ pub(crate) async fn run_foreground(
                             info!("Notification: cipher changed while locked; sync pending until unlock");
                         } else {
                             info!("Notification: cipher changed, syncing...");
-                            match do_sync(&api_client, &cached_key_tuples, &public_key_identity_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
+                            match do_sync(&api_client, &cached_key_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
                                 Ok(count) => {
                                     notification_state.write().await.last_event_at = Some(std::time::Instant::now());
                                     info!("Auto-synced: {} SSH keys", count)
@@ -551,7 +548,7 @@ pub(crate) async fn run_foreground(
                             info!("Notification degraded while locked; sync pending until unlock");
                         } else {
                             info!("Notification degraded or reconnected, running fallback sync...");
-                            match do_sync(&api_client, &cached_key_tuples, &public_key_identity_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
+                            match do_sync(&api_client, &cached_key_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
                                 Ok(count) => {
                                     notification_state.write().await.record_fallback_sync();
                                     info!("Fallback-synced: {} SSH keys", count)
@@ -595,11 +592,17 @@ pub(crate) async fn run_foreground(
             }
             // Auto-lock check
             _ = lock_check_interval.tick() => {
-                if lock_timeout > 0
-                    && !vault_locked.load(std::sync::atomic::Ordering::Relaxed)
-                    && in_flight_prompts.load(std::sync::atomic::Ordering::Relaxed) == 0
-                    && last_activity.elapsed().as_secs() >= lock_timeout
-                {
+                // A clock set back makes `elapsed` fail: start counting again.
+                let idle_secs = last_activity.elapsed().map(|idle| idle.as_secs()).unwrap_or_else(|_| {
+                    last_activity = std::time::SystemTime::now();
+                    0
+                });
+                if should_auto_lock(
+                    lock_timeout,
+                    vault_locked.load(std::sync::atomic::Ordering::Relaxed),
+                    in_flight_prompts.load(std::sync::atomic::Ordering::Relaxed),
+                    idle_secs,
+                ) {
                     info!("Auto-locking vault due to inactivity ({} seconds)", lock_timeout);
                     let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, Some(&local_cache_key_state), Some(&authorization_memory)).await;
                 }
@@ -690,6 +693,31 @@ fn control_action_timeout(action: &sshwarden_agent::ControlAction) -> std::time:
     }
 }
 
+/// Whether a control command restarts the auto-lock timer. Only an unlock
+/// does: `status` polled by a script must not keep the vault unlocked.
+fn counts_as_activity(action: &sshwarden_agent::ControlAction) -> bool {
+    use sshwarden_agent::ControlAction;
+    matches!(
+        action,
+        ControlAction::Unlock
+            | ControlAction::UnlockPin { .. }
+            | ControlAction::UnlockHello
+            | ControlAction::UnlockNative
+            | ControlAction::UnlockPassword { .. }
+    )
+}
+
+/// The auto-lock decision. A `lock_timeout` of 0 turns auto-lock off, and an
+/// open sign or unlock prompt holds it off.
+fn should_auto_lock(
+    lock_timeout: u64,
+    locked: bool,
+    in_flight_prompts: usize,
+    idle_secs: u64,
+) -> bool {
+    lock_timeout > 0 && !locked && in_flight_prompts == 0 && idle_secs >= lock_timeout
+}
+
 /// Stable, secret-free label for logging and error messages.
 ///
 /// Never derive this from `Debug`: the PIN/password variants hold credentials.
@@ -759,15 +787,19 @@ mod tests {
         let password = "hunter2".to_string();
 
         assert_eq!(
-            control_action_label(&ControlAction::UnlockPin { pin: pin.clone() }),
+            control_action_label(&ControlAction::UnlockPin {
+                pin: pin.clone().into()
+            }),
             "unlock-pin"
         );
         assert_eq!(
-            control_action_label(&ControlAction::SetPin { pin }),
+            control_action_label(&ControlAction::SetPin { pin: pin.into() }),
             "set-pin"
         );
         assert_eq!(
-            control_action_label(&ControlAction::UnlockPassword { password }),
+            control_action_label(&ControlAction::UnlockPassword {
+                password: password.into()
+            }),
             "unlock-password"
         );
         assert_eq!(
@@ -806,5 +838,49 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.message.as_deref(), Some("all good"));
+    }
+
+    #[test]
+    fn only_unlocks_restart_the_auto_lock_timer() {
+        for action in [
+            ControlAction::Unlock,
+            ControlAction::UnlockHello,
+            ControlAction::UnlockNative,
+            ControlAction::UnlockPin {
+                pin: String::from("1").into(),
+            },
+            ControlAction::UnlockPassword {
+                password: String::from("p").into(),
+            },
+        ] {
+            assert!(
+                counts_as_activity(&action),
+                "{}",
+                control_action_label(&action)
+            );
+        }
+        for action in [
+            ControlAction::Status { json: false },
+            ControlAction::Status { json: true },
+            ControlAction::Sync,
+            ControlAction::Lock,
+            ControlAction::BindHostsDialog,
+        ] {
+            assert!(
+                !counts_as_activity(&action),
+                "{}",
+                control_action_label(&action)
+            );
+        }
+    }
+
+    #[test]
+    fn auto_lock_needs_an_idle_unlocked_vault_without_prompts() {
+        assert!(should_auto_lock(60, false, 0, 60));
+        assert!(should_auto_lock(60, false, 0, 8 * 3600));
+        assert!(!should_auto_lock(60, false, 0, 59));
+        assert!(!should_auto_lock(0, false, 0, 8 * 3600), "0 turns it off");
+        assert!(!should_auto_lock(60, true, 0, 600), "already locked");
+        assert!(!should_auto_lock(60, false, 1, 600), "a prompt is open");
     }
 }

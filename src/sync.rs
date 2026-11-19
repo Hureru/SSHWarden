@@ -20,7 +20,6 @@ use crate::sshconfig::{sync_managed_ssh_config_with_bindings, write_key_selector
 pub(crate) async fn reconcile_synced_key_state(
     key_tuples: &[(String, String, String)],
     cached_key_tuples: &CachedKeyTuples,
-    public_key_identity_tuples: &CachedKeyTuples,
     local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
     local_cache_key_state: &LocalCacheKeyHandle,
     authorization_memory: &AuthorizationMemorySet,
@@ -41,10 +40,6 @@ pub(crate) async fn reconcile_synced_key_state(
         );
     }
 
-    public_key_identity_tuples
-        .write()
-        .await
-        .set(key_tuples.to_vec());
     cached_key_tuples.write().await.set(key_tuples.to_vec());
     *key_material_fingerprints.write().await = new_fingerprints;
 
@@ -81,7 +76,6 @@ pub(crate) async fn reconcile_synced_key_state(
 pub(crate) async fn do_sync(
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
     cached_key_tuples: &CachedKeyTuples,
-    public_key_identity_tuples: &CachedKeyTuples,
     local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
     local_cache_key_state: &LocalCacheKeyHandle,
     authorization_memory: &AuthorizationMemorySet,
@@ -109,16 +103,17 @@ pub(crate) async fn do_sync(
         .await
         .map_err(|e| format!("Sync failed: {}", e))?;
 
-    let key_tuples: Vec<(String, String, String)> = keys
-        .iter()
-        .map(|k| {
-            (
-                (*k.private_key_pem).clone(),
-                k.name.clone(),
-                k.cipher_id.clone(),
-            )
-        })
-        .collect();
+    let key_tuples: crate::runtime::KeyTuples = zeroize::Zeroizing::new(
+        keys.iter()
+            .map(|k| {
+                (
+                    (*k.private_key_pem).clone(),
+                    k.name.clone(),
+                    k.cipher_id.clone(),
+                )
+            })
+            .collect(),
+    );
     let count = key_tuples.len();
     if let Err(e) = write_key_selector_files(&keys) {
         tracing::warn!("Failed to write key selector files: {}", e);
@@ -129,7 +124,6 @@ pub(crate) async fn do_sync(
     reconcile_synced_key_state(
         &key_tuples,
         cached_key_tuples,
-        public_key_identity_tuples,
         local_key_cache_data,
         local_cache_key_state,
         authorization_memory,
@@ -150,7 +144,7 @@ pub(crate) async fn do_sync(
     drop(client_guard);
 
     if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
-        if let Err(e) = agent.set_keys(key_tuples) {
+        if let Err(e) = agent.set_keys(&key_tuples) {
             return Err(format!("Sync succeeded but failed to reload keys: {}", e));
         }
     }
@@ -166,7 +160,6 @@ pub(crate) async fn resolve_pending_sync(
     pending_sync: &Arc<std::sync::atomic::AtomicBool>,
     api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
     cached_key_tuples: &CachedKeyTuples,
-    public_key_identity_tuples: &CachedKeyTuples,
     local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
     local_cache_key_state: &LocalCacheKeyHandle,
     authorization_memory: &AuthorizationMemorySet,
@@ -184,7 +177,6 @@ pub(crate) async fn resolve_pending_sync(
     match do_sync(
         api_client,
         cached_key_tuples,
-        public_key_identity_tuples,
         local_key_cache_data,
         local_cache_key_state,
         authorization_memory,
@@ -280,8 +272,6 @@ mod tests {
         );
 
         let cached_key_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
-        let public_key_identity_tuples: CachedKeyTuples =
-            Arc::new(RwLock::new(SecureKeyCache::new()));
         let authorization_memory: AuthorizationMemorySet =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
         let key_material_fingerprints: KeyMaterialFingerprints =
@@ -322,7 +312,6 @@ mod tests {
             reconcile_synced_key_state(
                 &key_tuples,
                 &cached_key_tuples,
-                &public_key_identity_tuples,
                 &local_key_cache_data,
                 &local_cache_key_state,
                 &authorization_memory,
