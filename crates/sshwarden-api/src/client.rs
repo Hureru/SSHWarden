@@ -35,7 +35,8 @@ pub struct BitwardenClient {
     base_url: String,
     access_token: Option<String>,
     refresh_token: Option<String>,
-    token_expiry: Option<std::time::Instant>,
+    /// Wall clock, so time spent asleep counts (an `Instant` stops on Linux).
+    token_expiry: Option<std::time::SystemTime>,
     device_id: String,
     user_key: Option<SymmetricKey>,
 }
@@ -209,8 +210,9 @@ impl BitwardenClient {
         // Move (not clone) so no extra plaintext copy of the freshly issued token
         // lingers in token_resp on the heap until it drops.
         self.refresh_token = token_resp.refresh_token;
-        self.token_expiry =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(token_resp.expires_in));
+        self.token_expiry = Some(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(token_resp.expires_in),
+        );
 
         // 2e: Decrypt user symmetric key
         if let Some(ref encrypted_key) = token_resp.key {
@@ -227,6 +229,14 @@ impl BitwardenClient {
 
     /// Step 3: Sync vault and return all SSH key ciphers (decrypted).
     pub async fn sync_ssh_keys(&self) -> anyhow::Result<Vec<DecryptedSshKey>> {
+        Ok(self.sync_ssh_keys_counting_skipped().await?.0)
+    }
+
+    /// Like [`Self::sync_ssh_keys`], plus the number of SSH keys left out
+    /// because they could not be decrypted (organisation-owned keys).
+    pub async fn sync_ssh_keys_counting_skipped(
+        &self,
+    ) -> anyhow::Result<(Vec<DecryptedSshKey>, usize)> {
         let access_token = self
             .access_token
             .as_ref()
@@ -271,10 +281,12 @@ impl BitwardenClient {
         info!("Found {} SSH key ciphers", ssh_ciphers.len());
 
         let mut keys = Vec::new();
+        let mut skipped = 0;
         for cipher in ssh_ciphers {
             match self.decrypt_ssh_cipher(cipher, user_key) {
                 Ok(key) => keys.push(key),
                 Err(e) => {
+                    skipped += 1;
                     tracing::warn!(
                         cipher_id = %cipher.id,
                         error = %e,
@@ -285,7 +297,7 @@ impl BitwardenClient {
         }
 
         info!("Successfully decrypted {} SSH keys", keys.len());
-        Ok(keys)
+        Ok((keys, skipped))
     }
 
     fn decrypt_ssh_cipher(
@@ -447,13 +459,9 @@ impl BitwardenClient {
     /// Check if the access token is expiring within 5 minutes.
     pub fn is_token_expiring_soon(&self) -> bool {
         match self.token_expiry {
-            Some(expiry) => {
-                let now = std::time::Instant::now();
-                if now >= expiry {
-                    return true;
-                }
-                expiry.duration_since(now) < std::time::Duration::from_secs(300)
-            }
+            Some(expiry) => expiry
+                .duration_since(std::time::SystemTime::now())
+                .map_or(true, |left| left < std::time::Duration::from_secs(300)),
             // No expiry tracked: a token of unknown age, or a restored session
             // whose first refresh failed. Both need a refresh.
             None => self.access_token.is_some() || self.refresh_token.is_some(),
@@ -509,8 +517,9 @@ impl BitwardenClient {
         if let Some(new_refresh) = token_resp.refresh_token {
             self.set_refresh_token(new_refresh);
         }
-        self.token_expiry =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(token_resp.expires_in));
+        self.token_expiry = Some(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(token_resp.expires_in),
+        );
 
         info!("Access token refreshed successfully");
         Ok(())

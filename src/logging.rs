@@ -22,10 +22,18 @@ pub(crate) struct RotatingFileWriter {
     rotation_warned: bool,
 }
 
+/// Open the log for appending, readable by its owner only: it names hosts,
+/// keys and the programs that asked for a signature.
+fn open_log(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let _ = sshwarden_config::ssh_config::ensure_private_file_permissions(path);
+    Ok(file)
+}
+
 impl RotatingFileWriter {
     /// Open (creating if needed) `path` for appending with size-based rotation.
     pub(crate) fn open(path: &Path, max_bytes: u64) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = open_log(path)?;
         let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         Ok(Self {
             path: path.to_path_buf(),
@@ -53,10 +61,7 @@ impl RotatingFileWriter {
             Err(e) => return Err(e),
         }
         std::fs::rename(&self.path, &backup)?;
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        self.file = open_log(&self.path)?;
         self.written = 0;
         self.rotation_warned = false;
         Ok(())

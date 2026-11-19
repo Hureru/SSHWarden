@@ -354,6 +354,35 @@ impl Config {
             .with_context(|| format!("Failed to write config file: {}", path.display()))?;
         Ok(())
     }
+
+    /// Store `[auth] email` in `config.toml`. Only that key changes: the
+    /// user's comments and layout stay (`save` would rewrite the whole file).
+    pub fn save_email(email: &str) -> anyhow::Result<()> {
+        let path = config_path()?;
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("Failed to read config file: {}", path.display())))
+            }
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
+        }
+        std::fs::write(&path, with_email(&existing, email)?)
+            .with_context(|| format!("Failed to write config file: {}", path.display()))
+    }
+}
+
+fn with_email(config_toml: &str, email: &str) -> anyhow::Result<String> {
+    let mut doc: toml_edit::DocumentMut =
+        config_toml.parse().context("Failed to parse config file")?;
+    let auth = doc.entry("auth").or_insert(toml_edit::table());
+    auth["email"] = toml_edit::value(email);
+    Ok(doc.to_string())
 }
 
 /// Get the shared base directory for persistent SSHWarden configuration/data.
@@ -1183,6 +1212,15 @@ mod tests {
         let config: Config =
             toml::from_str("[auth]\nmethod = \"api_key\"\nemail = \"a@b.c\"\n").unwrap();
         assert_eq!(config.auth.email, "a@b.c");
+    }
+
+    #[test]
+    fn saving_the_email_keeps_comments_and_other_keys() {
+        let before = "# my server\n[server]\nbase_url = \"https://x\" # home\n\n[auth]\n# who\nemail = \"\"\n";
+        let after = with_email(before, "a@b.c").unwrap();
+        assert_eq!(after, before.replace("email = \"\"", "email = \"a@b.c\""));
+        let fresh: Config = toml::from_str(&with_email("", "a@b.c").unwrap()).unwrap();
+        assert_eq!(fresh.auth.email, "a@b.c");
     }
 
     /// `[unlock] method = "native"` used to stop every command with a TOML

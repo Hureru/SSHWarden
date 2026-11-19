@@ -454,9 +454,18 @@ pub(crate) async fn sync_response(
         }
     }
     match do_sync(state, agent).await {
-        Ok(count) => sshwarden_agent::ControlResponse::ok(&format!("Synced {count} SSH keys")),
+        Ok((count, skipped)) => sshwarden_agent::ControlResponse::ok(&sync_reply(count, skipped)),
         Err(e) => sshwarden_agent::ControlResponse::err(&e),
     }
+}
+
+fn sync_reply(count: usize, skipped: usize) -> String {
+    if skipped == 0 {
+        return format!("Synced {count} SSH keys");
+    }
+    format!(
+        "Synced {count} SSH keys; {skipped} skipped (could not be decrypted: organisation-owned keys are not supported; details in the log)"
+    )
 }
 
 /// Handle a control command from the IPC channel.
@@ -989,5 +998,16 @@ pub(crate) async fn bind_hosts_dialog_response(
             "Failed to open bind-hosts dialog: {}",
             e
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sync_reply;
+
+    #[test]
+    fn the_sync_reply_names_skipped_keys() {
+        assert_eq!(sync_reply(3, 0), "Synced 3 SSH keys");
+        assert!(sync_reply(3, 2).contains("2 skipped"));
     }
 }

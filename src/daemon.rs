@@ -72,7 +72,7 @@ pub(crate) async fn run_foreground(
                 None
             } else {
                 config.auth.email = email;
-                if let Err(e) = config.save() {
+                if let Err(e) = sshwarden_config::Config::save_email(&config.auth.email) {
                     tracing::warn!("Failed to save config: {}", e);
                 } else {
                     info!("Email saved to config.toml");
@@ -590,7 +590,7 @@ fn spawn_auto_sync(state: &DaemonState, agent: &sshwarden_agent::SshWardenAgent,
     let (state, mut agent) = (state.clone(), agent.clone());
     tokio::spawn(async move {
         match do_sync(&state, &mut agent).await {
-            Ok(count) => {
+            Ok((count, _)) => {
                 let mut notification_state = state.notification_state.write().await;
                 if fallback {
                     notification_state.record_fallback_sync();

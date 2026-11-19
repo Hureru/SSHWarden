@@ -30,6 +30,7 @@ pub(crate) async fn reconcile_synced_key_state(
         );
     }
 
+    let unchanged = state.cached_key_tuples.read().await.0 == key_tuples;
     state
         .cached_key_tuples
         .write()
@@ -43,6 +44,11 @@ pub(crate) async fn reconcile_synced_key_state(
     // (tokio's RwLock is not reentrant).
     let existing_cache = state.local_key_cache_data.read().await.as_ref().cloned();
     let local_cache_key = state.local_cache_key_state.read().await.clone_key();
+    // Same keys as the last write and no failed write to repair: leave the
+    // file alone (every sync used to re-encrypt and rewrite it).
+    if unchanged && existing_cache.is_some() && !state.notification_state.read().await.stale_cache {
+        return;
+    }
     if existing_cache.is_some() && local_cache_key.is_none() {
         // The agent has the new keys but the file keeps the old ones; without
         // this flag a key deleted on the server would sign again after a restart.
@@ -87,14 +93,15 @@ pub(crate) async fn reconcile_synced_key_state(
     }
 }
 
-/// Sync SSH keys from the Bitwarden API and reload into the agent.
+/// Sync SSH keys from the Bitwarden API and reload into the agent. Returns
+/// (keys loaded, keys skipped because they could not be decrypted).
 ///
 /// The fetch can wait 30 s on a silent server, so callers run this in its own
 /// task, and it holds no lock that the main loop needs while it waits.
 pub(crate) async fn do_sync(
     state: &DaemonState,
     agent: &mut sshwarden_agent::SshWardenAgent,
-) -> Result<usize, String> {
+) -> Result<(usize, usize), String> {
     let _one_sync = state.sync_lock.lock().await;
     // A copy: the fetch must not hold the client's lock.
     let client = match state.api_client.read().await.as_ref() {
@@ -109,8 +116,8 @@ pub(crate) async fn do_sync(
         );
     }
 
-    let keys = client
-        .sync_ssh_keys()
+    let (keys, skipped) = client
+        .sync_ssh_keys_counting_skipped()
         .await
         .map_err(|e| format!("Sync failed: {}", e))?;
 
@@ -170,7 +177,7 @@ pub(crate) async fn do_sync(
         .await
         .record_successful_sync();
     info!("Vault synced: {} SSH keys", count);
-    Ok(count)
+    Ok((count, skipped))
 }
 
 /// Start the sync that waited for an unlock. It runs in its own task, so the
@@ -187,7 +194,7 @@ pub(crate) fn resolve_pending_sync(state: &DaemonState, agent: &sshwarden_agent:
     let (state, mut agent) = (state.clone(), agent.clone());
     tokio::spawn(async move {
         match do_sync(&state, &mut agent).await {
-            Ok(count) => info!("Pending sync resolved: {} SSH keys", count),
+            Ok((count, _)) => info!("Pending sync resolved: {} SSH keys", count),
             Err(e) => {
                 state
                     .pending_sync
@@ -318,9 +325,18 @@ mod tests {
             .is_some());
         assert!(!state.notification_state.read().await.stale_cache);
 
+        // The same keys again: the file is not rewritten (a rewrite would
+        // change it, the encryption uses a fresh IV).
+        let cache_path = sshwarden_config::cache::LocalKeyCacheFile::path().unwrap();
+        let written = std::fs::read(&cache_path).unwrap();
+        reconcile_synced_key_state(&key_tuples, &state).await;
+        assert_eq!(std::fs::read(&cache_path).unwrap(), written);
+
         // A cache whose key is not in memory cannot be rewritten: say so.
         state.local_cache_key_state.write().await.clear();
-        reconcile_synced_key_state(&key_tuples, &state).await;
+        let mut changed = key_tuples.clone();
+        changed[0].1 = "renamed".to_string();
+        reconcile_synced_key_state(&changed, &state).await;
         assert!(state.notification_state.read().await.stale_cache);
 
         let _ = std::fs::remove_dir_all(&home);
