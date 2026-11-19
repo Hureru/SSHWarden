@@ -45,6 +45,19 @@ pub(crate) fn spawn_background_agent(exe: &std::path::Path) -> anyhow::Result<()
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        // Its own process group and no terminal on stdio: Ctrl+C in the
+        // starting shell does not reach it, and it does not write there.
+        // shortcut: still in the terminal's session (no setsid, that needs
+        // libc + unsafe); upgrade if closing the terminal ever kills the agent.
+        cmd.process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
     cmd.spawn()
         .with_context(|| format!("Failed to start background agent: {}", exe.display()))?;
     Ok(())
