@@ -341,6 +341,12 @@ pub(crate) struct DaemonState {
     pub(crate) notification_state: Arc<RwLock<NotificationRuntimeState>>,
     pub(crate) pin_failures: crate::control::PinFailureHandle,
     pub(crate) ui_request_tx: UIRequestTx,
+    /// Held from the fetch to the load of a sync: syncs run one at a time.
+    pub(crate) sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a control command, a lock or the load of a finished sync
+    /// changes the state. A sync runs beside the main loop, so without this
+    /// its load could land in the middle of a `lock` or a `set-pin`.
+    pub(crate) change_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[cfg(test)]
@@ -361,6 +367,8 @@ impl DaemonState {
             notification_state: Arc::default(),
             pin_failures: Arc::default(),
             ui_request_tx: Arc::new(tokio::sync::mpsc::channel(1).0),
+            sync_lock: Arc::default(),
+            change_lock: Arc::default(),
         }
     }
 }

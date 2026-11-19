@@ -393,6 +393,45 @@ pub(crate) async fn build_status_response(
     resp
 }
 
+/// The `sync` command. The main loop runs it in its own task: the fetch can
+/// wait 30 s on a silent server, and signing must go on meanwhile.
+pub(crate) async fn sync_response(
+    state: &DaemonState,
+    agent: &mut sshwarden_agent::SshWardenAgent,
+) -> sshwarden_agent::ControlResponse {
+    reload_shared_local_cache_from_disk_if_multi_device(&state.local_key_cache_data).await;
+    // Locked means nothing is pulled or decrypted (ADR 0009): the sync
+    // waits as a Pending Sync, and the next unlock runs it.
+    if state
+        .vault_locked
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        state
+            .pending_sync
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        return sshwarden_agent::ControlResponse::ok(
+            "Vault is locked; sync will run on next unlock",
+        );
+    }
+    // Only multi-device mode needs the shared cache reconciled before a
+    // manual sync. Gating this avoids a NEW PIN prompt (and a hard failure
+    // on cancel) for legacy single-device users whose unlock path did not
+    // keep the Local Cache Key in memory.
+    if multi_device_mode() {
+        // If this unlocked session was restored without keeping the Local
+        // Cache Key in memory, a plain sync would update the live agent but
+        // leave `sshwarden keys` showing the old cache header. Prompt for
+        // PIN first so the synced key set can be persisted atomically.
+        if let Err(e) = ensure_local_cache_key_for_manual_sync(state).await {
+            return sshwarden_agent::ControlResponse::err(&e);
+        }
+    }
+    match do_sync(state, agent).await {
+        Ok(count) => sshwarden_agent::ControlResponse::ok(&format!("Synced {count} SSH keys")),
+        Err(e) => sshwarden_agent::ControlResponse::err(&e),
+    }
+}
+
 /// Handle a control command from the IPC channel.
 pub(crate) async fn handle_control_command(
     action: sshwarden_agent::ControlAction,
@@ -409,7 +448,6 @@ pub(crate) async fn handle_control_command(
             | ControlAction::UnlockNative
             | ControlAction::UnlockHello
             | ControlAction::UnlockPin { .. }
-            | ControlAction::Sync
     ) {
         reload_shared_local_cache_from_disk_if_multi_device(&state.local_key_cache_data).await;
     }
@@ -455,7 +493,7 @@ pub(crate) async fn handle_control_command(
                 )
                 .await;
                 if resp.ok {
-                    resolve_pending_sync(state, agent).await;
+                    resolve_pending_sync(state, agent);
                     return resp;
                 }
                 tracing::warn!("Platform-native local key cache unlock failed");
@@ -485,7 +523,7 @@ pub(crate) async fn handle_control_command(
                                 notification_client,
                             )
                             .await;
-                            resolve_pending_sync(state, agent).await;
+                            resolve_pending_sync(state, agent);
                         }
                         return resp;
                     }
@@ -522,7 +560,7 @@ pub(crate) async fn handle_control_command(
                             notification_client,
                         )
                         .await;
-                        resolve_pending_sync(state, agent).await;
+                        resolve_pending_sync(state, agent);
                         return sshwarden_agent::ControlResponse::ok(
                             "Vault unlocked via PIN dialog",
                         );
@@ -559,7 +597,7 @@ pub(crate) async fn handle_control_command(
             .await;
 
             if resp.ok {
-                resolve_pending_sync(state, agent).await;
+                resolve_pending_sync(state, agent);
             }
 
             resp
@@ -596,7 +634,7 @@ pub(crate) async fn handle_control_command(
                                     notification_client,
                                 )
                                 .await;
-                                resolve_pending_sync(state, agent).await;
+                                resolve_pending_sync(state, agent);
                             }
                             return resp;
                         }
@@ -647,7 +685,7 @@ pub(crate) async fn handle_control_command(
             }
             if resp.ok {
                 try_restore_api_session(state, &pin, notification_rx, notification_client).await;
-                resolve_pending_sync(state, agent).await;
+                resolve_pending_sync(state, agent);
             }
             resp
         }
@@ -730,7 +768,7 @@ pub(crate) async fn handle_control_command(
                     }
 
                     *state.api_client.write().await = Some(client);
-                    resolve_pending_sync(state, agent).await;
+                    resolve_pending_sync(state, agent);
 
                     let message = if was_locked {
                         format!("Vault unlocked, {} SSH keys loaded", count)
@@ -746,39 +784,11 @@ pub(crate) async fn handle_control_command(
                 )),
             }
         }
+        // Intercepted by the main loop, which runs `sync_response` in its own
+        // task; this arm is only defensive (calling it here would wait on the
+        // change lock that the loop holds for this command).
         ControlAction::Sync => {
-            // Locked means nothing is pulled or decrypted (ADR 0009): the sync
-            // waits as a Pending Sync, and the next unlock runs it.
-            if state
-                .vault_locked
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                state
-                    .pending_sync
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                return sshwarden_agent::ControlResponse::ok(
-                    "Vault is locked; sync will run on next unlock",
-                );
-            }
-            // Only multi-device mode needs the shared cache reconciled before a
-            // manual sync. Gating this avoids a NEW PIN prompt (and a hard failure
-            // on cancel) for legacy single-device users whose unlock path did not
-            // keep the Local Cache Key in memory.
-            if multi_device_mode() {
-                // If this unlocked session was restored without keeping the Local
-                // Cache Key in memory, a plain sync would update the live agent but
-                // leave `sshwarden keys` showing the old cache header. Prompt for
-                // PIN first so the synced key set can be persisted atomically.
-                if let Err(e) = ensure_local_cache_key_for_manual_sync(state).await {
-                    return sshwarden_agent::ControlResponse::err(&e);
-                }
-            }
-            match do_sync(state, agent).await {
-                Ok(count) => {
-                    sshwarden_agent::ControlResponse::ok(&format!("Synced {count} SSH keys"))
-                }
-                Err(e) => sshwarden_agent::ControlResponse::err(&e),
-            }
+            sshwarden_agent::ControlResponse::err("sync is run by the main loop")
         }
         ControlAction::Forget { shared } => {
             // EH-06: accumulate failures to delete on-disk material so a

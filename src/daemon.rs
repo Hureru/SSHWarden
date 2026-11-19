@@ -327,6 +327,8 @@ pub(crate) async fn run_foreground(
         notification_state,
         pin_failures,
         ui_request_tx,
+        sync_lock: Arc::default(),
+        change_lock: Arc::default(),
     };
 
     loop {
@@ -357,18 +359,35 @@ pub(crate) async fn run_foreground(
                     });
                     continue;
                 }
+                let budget = control_action_timeout(&ctrl_req.action);
+                let label = control_action_label(&ctrl_req.action);
+                // `sync` can wait 30 s on a silent server, so it too runs beside
+                // the loop, under the same watchdog.
+                if matches!(ctrl_req.action, sshwarden_agent::ControlAction::Sync) {
+                    let (state, mut agent) = (state.clone(), agent.clone());
+                    tokio::spawn(async move {
+                        let response = run_control_action(
+                            label,
+                            budget,
+                            crate::control::sync_response(&state, &mut agent),
+                        ).await;
+                        let _ = ctrl_req.reply.send(response);
+                    });
+                    continue;
+                }
                 // Watchdog: control actions run serially here, so an action that
                 // never returns (a lock wait, a network call without a timeout)
                 // would otherwise wedge every later command — including `stop` —
                 // until the process is killed. Bound it and report the timeout
                 // instead; dropping the future releases whatever it held.
-                let budget = control_action_timeout(&ctrl_req.action);
-                let label = control_action_label(&ctrl_req.action);
                 let is_activity = counts_as_activity(&ctrl_req.action);
                 let response = run_control_action(
                     label,
                     budget,
-                    handle_control_command(ctrl_req.action, &mut agent, &state, &mut notification_rx, &mut _notification_client),
+                    async {
+                        let _change = state.change_lock.lock().await;
+                        handle_control_command(ctrl_req.action, &mut agent, &state, &mut notification_rx, &mut _notification_client).await
+                    },
                 ).await;
                 // Stamped when the action ends: an unlock can wait on a PIN
                 // window for longer than the lock timeout.
@@ -415,18 +434,18 @@ pub(crate) async fn run_foreground(
                     #[cfg(windows)]
                     RuntimeEvent::AutoUnlockedWindowsHello => {
                         try_restore_api_session_hello(&state, &mut notification_rx, &mut _notification_client).await;
-                        resolve_pending_sync(&state, &mut agent).await;
+                        resolve_pending_sync(&state, &agent);
                     }
                     RuntimeEvent::AutoUnlockedPin { pin } => {
                         try_restore_api_session(&state, &pin, &mut notification_rx, &mut _notification_client).await;
-                        resolve_pending_sync(&state, &mut agent).await;
+                        resolve_pending_sync(&state, &agent);
                     }
                     RuntimeEvent::AutoUnlockedNative => {
                         // Native (Keychain / Secret Service / DPAPI) unlock cannot
                         // currently restore an API session — SessionFile has no
                         // native_encrypted_token slot — so we only resolve any
                         // sync that was deferred while the vault was locked.
-                        resolve_pending_sync(&state, &mut agent).await;
+                        resolve_pending_sync(&state, &agent);
                     }
                 }
             }
@@ -450,21 +469,13 @@ pub(crate) async fn run_foreground(
                             info!("Notification: cipher changed while locked; sync pending until unlock");
                         } else {
                             info!("Notification: cipher changed, syncing...");
-                            match do_sync(&state, &mut agent).await {
-                                Ok(count) => {
-                                    state.notification_state.write().await.last_event_at = Some(std::time::Instant::now());
-                                    info!("Auto-synced: {} SSH keys", count)
-                                },
-                                Err(e) => {
-                                    state.pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!("Auto-sync failed: {}; sync remains pending", e);
-                                }
-                            }
+                            spawn_auto_sync(&state, &agent, false);
                         }
                     }
                     sshwarden_api::SyncEvent::LogOut => {
                         state.notification_state.write().await.record_event();
                         info!("Notification: remote logout");
+                        let _change = state.change_lock.lock().await;
                         let _ = lock_vault(&mut agent, &state).await;
                     }
                     sshwarden_api::SyncEvent::FallbackSyncDue => {
@@ -473,16 +484,7 @@ pub(crate) async fn run_foreground(
                             info!("Notification degraded while locked; sync pending until unlock");
                         } else {
                             info!("Notification degraded or reconnected, running fallback sync...");
-                            match do_sync(&state, &mut agent).await {
-                                Ok(count) => {
-                                    state.notification_state.write().await.record_fallback_sync();
-                                    info!("Fallback-synced: {} SSH keys", count)
-                                },
-                                Err(e) => {
-                                    state.pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!("Fallback sync failed: {}; sync remains pending", e);
-                                }
-                            }
+                            spawn_auto_sync(&state, &agent, true);
                         }
                     }
                 }
@@ -529,6 +531,7 @@ pub(crate) async fn run_foreground(
                     idle_secs,
                 ) {
                     info!("Auto-locking vault due to inactivity ({} seconds)", lock_timeout);
+                    let _change = state.change_lock.lock().await;
                     let _ = lock_vault(&mut agent, &state).await;
                 }
             }
@@ -575,6 +578,32 @@ const CONTROL_ACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// forever.
 const CONTROL_ACTION_USER_PROMPT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(15 * 60);
+
+/// A sync asked for by the notification hub (`fallback`: because the hub is
+/// degraded). It runs in its own task: the fetch can wait 30 s on a silent
+/// server, and the main loop must keep serving sign requests and commands.
+fn spawn_auto_sync(state: &DaemonState, agent: &sshwarden_agent::SshWardenAgent, fallback: bool) {
+    let (state, mut agent) = (state.clone(), agent.clone());
+    tokio::spawn(async move {
+        match do_sync(&state, &mut agent).await {
+            Ok(count) => {
+                let mut notification_state = state.notification_state.write().await;
+                if fallback {
+                    notification_state.record_fallback_sync();
+                } else {
+                    notification_state.last_event_at = Some(std::time::Instant::now());
+                }
+                info!("Auto-synced: {} SSH keys", count)
+            }
+            Err(e) => {
+                state
+                    .pending_sync
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!("Auto-sync failed: {}; sync remains pending", e);
+            }
+        }
+    });
+}
 
 /// Run one control action under its watchdog budget, turning a stall into an
 /// error reply instead of a wedged control channel.

@@ -7,6 +7,7 @@ use crate::crypto::{self, SymmetricKey};
 use crate::models::{Cipher, CipherType, PreloginResponse, SyncResponse, TokenResponse};
 
 /// Bitwarden API client
+#[derive(Clone)]
 pub struct BitwardenClient {
     http: HttpClient,
     api_url: String,

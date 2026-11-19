@@ -76,13 +76,17 @@ pub(crate) async fn reconcile_synced_key_state(
 }
 
 /// Sync SSH keys from the Bitwarden API and reload into the agent.
+///
+/// The fetch can wait 30 s on a silent server, so callers run this in its own
+/// task, and it holds no lock that the main loop needs while it waits.
 pub(crate) async fn do_sync(
     state: &DaemonState,
     agent: &mut sshwarden_agent::SshWardenAgent,
 ) -> Result<usize, String> {
-    let client_guard = state.api_client.read().await;
-    let client = match *client_guard {
-        Some(ref c) => c,
+    let _one_sync = state.sync_lock.lock().await;
+    // A copy: the fetch must not hold the client's lock.
+    let client = match state.api_client.read().await.as_ref() {
+        Some(c) => c.clone(),
         None => return Err("Not authenticated. Run 'sshwarden login'.".to_string()),
     };
 
@@ -97,6 +101,22 @@ pub(crate) async fn do_sync(
         .sync_ssh_keys()
         .await
         .map_err(|e| format!("Sync failed: {}", e))?;
+
+    // `lock` or `forget` may have run during the fetch: check again before any
+    // key is loaded, and keep them out until the load is done.
+    let _change = state.change_lock.lock().await;
+    if state
+        .vault_locked
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        state
+            .pending_sync
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        return Err("Vault was locked during the sync; it will run on next unlock".to_string());
+    }
+    if state.api_client.read().await.is_none() {
+        return Err("Logged out during the sync".to_string());
+    }
 
     let key_tuples: crate::runtime::KeyTuples = zeroize::Zeroizing::new(
         keys.iter()
@@ -127,15 +147,8 @@ pub(crate) async fn do_sync(
         }
     }
 
-    drop(client_guard);
-
-    if !state
-        .vault_locked
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        if let Err(e) = agent.set_keys(&key_tuples) {
-            return Err(format!("Sync succeeded but failed to reload keys: {}", e));
-        }
+    if let Err(e) = agent.set_keys(&key_tuples) {
+        return Err(format!("Sync succeeded but failed to reload keys: {}", e));
     }
     // Baseline for `status`'s sync row: without it, "no pending sync" cannot be
     // distinguished from "never synced at all".
@@ -148,31 +161,29 @@ pub(crate) async fn do_sync(
     Ok(count)
 }
 
-pub(crate) async fn resolve_pending_sync(
-    state: &DaemonState,
-    agent: &mut sshwarden_agent::SshWardenAgent,
-) -> bool {
+/// Start the sync that waited for an unlock. It runs in its own task, so the
+/// unlock reply and the main loop do not wait for the server.
+pub(crate) fn resolve_pending_sync(state: &DaemonState, agent: &sshwarden_agent::SshWardenAgent) {
     if !state
         .pending_sync
         .swap(false, std::sync::atomic::Ordering::Relaxed)
     {
-        return false;
+        return;
     }
 
     info!("Resolving pending sync after unlock...");
-    match do_sync(state, agent).await {
-        Ok(count) => {
-            info!("Pending sync resolved: {} SSH keys", count);
-            true
+    let (state, mut agent) = (state.clone(), agent.clone());
+    tokio::spawn(async move {
+        match do_sync(&state, &mut agent).await {
+            Ok(count) => info!("Pending sync resolved: {} SSH keys", count),
+            Err(e) => {
+                state
+                    .pending_sync
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!("Pending sync failed: {}; sync remains pending", e);
+            }
         }
-        Err(e) => {
-            state
-                .pending_sync
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!("Pending sync failed: {}; sync remains pending", e);
-            false
-        }
-    }
+    });
 }
 
 #[cfg(test)]
