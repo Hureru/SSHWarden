@@ -162,6 +162,8 @@ sshwarden set-pin
 
 > 主密码只在 `sshwarden login` 中使用；不再有 `unlock --password`。
 
+> `lock`（手动或超时自动锁）之后，签名请求和不带方法的 `sshwarden unlock` 不再走钥匙串静默解锁，必须输入 PIN；只有显式的 `unlock --method native` 仍使用钥匙串，重启 daemon 后恢复默认行为。注意：锁定期间 Local Cache Key 仍保存在登录钥匙串里，同一用户的其他进程读得到它——这是登录钥匙串的工作方式，SSHWarden 改变不了。不希望如此就不要启用 native unlock，只用 PIN。
+
 ### ④ Key 与 Host 绑定（离线对象操作）
 
 当 Bitwarden 里有多把 SSH Key 时，OpenSSH 可能会因为 `MaxAuthTries` 在尝试完所有 agent key 前断开连接。把 vault key 绑定到 SSH Host 可避免该问题（绑定会生成公开 `.pub` selector 文件与托管 SSH config）：

@@ -7,12 +7,13 @@ use tracing::info;
 
 use crate::control::cmd_control;
 use crate::process::is_daemon_running;
+use crate::unlock::{check_new_pin, MIN_PIN_LEN};
 use crate::{err_line, has_remembered_device_on_disk, out_line};
 /// Set PIN command: prompt for PIN and send to daemon.
 pub(crate) async fn cmd_set_pin() -> anyhow::Result<()> {
-    let pin = prompt_password("Enter new PIN: ")?;
-    if pin.len() < 4 {
-        err_line("PIN must be at least 4 characters");
+    let pin = prompt_password(&format!("Enter new PIN (>= {MIN_PIN_LEN} chars): "))?;
+    if let Err(e) = check_new_pin(&pin) {
+        err_line(e);
         return Ok(());
     }
     let pin_confirm = prompt_password("Confirm PIN: ")?;
@@ -193,9 +194,9 @@ pub(crate) async fn offer_pin_setup() -> anyhow::Result<()> {
         out_line("Skipped PIN setup. You can set it later with `sshwarden set-pin`.");
         return Ok(());
     }
-    let pin = prompt_password("Enter new PIN (>= 4 chars): ")?;
-    if pin.len() < 4 {
-        err_line("PIN must be at least 4 characters. Skipped — run `sshwarden set-pin` later.");
+    let pin = prompt_password(&format!("Enter new PIN (>= {MIN_PIN_LEN} chars): "))?;
+    if let Err(e) = check_new_pin(&pin) {
+        err_line(format!("{e}. Skipped — run `sshwarden set-pin` later."));
         return Ok(());
     }
     let confirm = prompt_password("Confirm PIN: ")?;

@@ -9,7 +9,7 @@ use base64::Engine;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::runtime::{AuthorizationMemorySet, CachedKeyTuples, LocalCacheKeyHandle};
+use crate::runtime::AuthorizationMemorySet;
 use crate::sshconfig::ManagedKey;
 use crate::unlock::finish_unlock_with_json;
 #[cfg(windows)]
@@ -263,23 +263,6 @@ pub(crate) fn current_hello_unlock_info(
     }
 }
 
-#[cfg(windows)]
-pub(crate) fn current_hello_challenge_b64() -> Option<String> {
-    let device_challenge = load_device_unlock_slots().and_then(|slots| slots.hello_challenge);
-    if multi_device_mode() {
-        device_challenge
-    } else {
-        device_challenge.or_else(|| {
-            // The Hello challenge lives in the envelope cache
-            // (local-key-cache.json).
-            sshwarden_config::cache::LocalKeyCacheFile::load()
-                .ok()
-                .flatten()
-                .and_then(|cache| cache.local_cache_key.hello_challenge)
-        })
-    }
-}
-
 pub(crate) fn enroll_native_for_local_key_cache(
     cache: &mut sshwarden_config::cache::LocalKeyCacheFile,
     local_cache_key: &sshwarden_api::crypto::SymmetricKey,
@@ -433,24 +416,17 @@ pub(crate) fn decrypt_envelope_local_key_cache_with_native(
 pub(crate) async fn finish_native_unlock_response(
     cache: sshwarden_config::cache::LocalKeyCacheFile,
     agent: &mut sshwarden_agent::SshWardenAgent,
-    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    cached_key_tuples: &CachedKeyTuples,
-    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
-    local_cache_key_state: &LocalCacheKeyHandle,
+    state: &crate::runtime::DaemonState,
     success_msg: &str,
 ) -> sshwarden_agent::ControlResponse {
     match decrypt_envelope_local_key_cache_with_native(&cache) {
         Ok((keys_json, local_cache_key)) => {
-            local_cache_key_state.write().await.set(local_cache_key);
-            finish_unlock_with_json(
-                &keys_json,
-                agent,
-                vault_locked,
-                cached_key_tuples,
-                key_names,
-                success_msg,
-            )
-            .await
+            state
+                .local_cache_key_state
+                .write()
+                .await
+                .set(local_cache_key);
+            finish_unlock_with_json(&keys_json, agent, state, success_msg).await
         }
         Err(e) => sshwarden_agent::ControlResponse::err(&format!("Native unlock failed: {}", e)),
     }

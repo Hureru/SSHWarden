@@ -324,15 +324,68 @@ pub(crate) type CachedKeyTuples = Arc<RwLock<SecureKeyCache>>;
 /// Type alias for the UI request sender passed through the system.
 pub(crate) type UIRequestTx = Arc<tokio::sync::mpsc::Sender<sshwarden_ui::UIRequest>>;
 
-/// Internal events emitted by spawned SSH request handlers back to the main loop.
-#[allow(clippy::enum_variant_names)]
+/// The daemon's shared handles. Cloning it clones the `Arc`s, not the data.
+#[derive(Clone)]
+pub(crate) struct DaemonState {
+    pub(crate) config: Arc<sshwarden_config::Config>,
+    pub(crate) vault_locked: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) pending_sync: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) cached_key_tuples: CachedKeyTuples,
+    pub(crate) key_names: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    pub(crate) key_material_fingerprints: KeyMaterialFingerprints,
+    pub(crate) api_client: Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
+    pub(crate) local_key_cache_data:
+        Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    pub(crate) local_cache_key_state: LocalCacheKeyHandle,
+    pub(crate) authorization_memory: AuthorizationMemorySet,
+    pub(crate) notification_state: Arc<RwLock<NotificationRuntimeState>>,
+    pub(crate) pin_failures: crate::control::PinFailureHandle,
+    pub(crate) ui_request_tx: UIRequestTx,
+    /// Held from the fetch to the load of a sync: syncs run one at a time.
+    pub(crate) sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a control command, a lock or the load of a finished sync
+    /// changes the state. A sync runs beside the main loop, so without this
+    /// its load could land in the middle of a `lock` or a `set-pin`.
+    pub(crate) change_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a sign request unlocks the vault, so the requests that
+    /// arrive meanwhile wait instead of opening a PIN dialog each.
+    pub(crate) unlock_lock: Arc<tokio::sync::Mutex<()>>,
+    /// True from the start of the daemon until the first lock. After a lock
+    /// (by hand or by timeout) the keyring must not unlock the vault without
+    /// the user asking for it, or the lock would undo itself (ADR 0014).
+    pub(crate) keyring_auto_unlock: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl DaemonState {
+    /// An unlocked daemon with no keys, no cache and no session.
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            config: Arc::default(),
+            vault_locked: Arc::default(),
+            pending_sync: Arc::default(),
+            cached_key_tuples: Arc::new(RwLock::new(SecureKeyCache::new())),
+            key_names: Arc::default(),
+            key_material_fingerprints: Arc::default(),
+            api_client: Arc::default(),
+            local_key_cache_data: Arc::default(),
+            local_cache_key_state: Arc::default(),
+            authorization_memory: Arc::default(),
+            notification_state: Arc::default(),
+            pin_failures: Arc::default(),
+            ui_request_tx: Arc::new(tokio::sync::mpsc::channel(1).0),
+            sync_lock: Arc::default(),
+            change_lock: Arc::default(),
+            unlock_lock: Arc::default(),
+            keyring_auto_unlock: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+}
+
+/// Sent by a sign request's handler to the main loop.
 pub(crate) enum RuntimeEvent {
-    #[cfg(windows)]
-    AutoUnlockedWindowsHello,
-    AutoUnlockedPin {
-        pin: String,
-    },
-    AutoUnlockedNative,
+    /// The request unlocked the vault: restore the session, run a waiting sync.
+    AutoUnlocked,
 }
 
 #[cfg(test)]

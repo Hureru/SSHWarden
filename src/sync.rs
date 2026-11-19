@@ -3,34 +3,24 @@
 //!
 //! Moved out of `main.rs` as part of the incremental module split (M1 step 4c).
 
-use std::sync::Arc;
-
-use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::cache::{
     clear_authorization_memory_for_changed_keys_async, refresh_envelope_local_key_cache,
 };
-use crate::runtime::{
-    AuthorizationMemorySet, CachedKeyTuples, KeyMaterialFingerprints, LocalCacheKeyHandle,
-    NotificationRuntimeState,
-};
+use crate::runtime::DaemonState;
 use crate::sshconfig::{sync_managed_ssh_config_with_bindings, write_key_selector_files};
-#[allow(clippy::too_many_arguments)]
+pub(crate) const CACHE_KEY_NOT_LOADED: &str = "Local Cache Key not loaded; cache not refreshed";
+
 pub(crate) async fn reconcile_synced_key_state(
     key_tuples: &[(String, String, String)],
-    cached_key_tuples: &CachedKeyTuples,
-    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
-    local_cache_key_state: &LocalCacheKeyHandle,
-    authorization_memory: &AuthorizationMemorySet,
-    key_material_fingerprints: &KeyMaterialFingerprints,
-    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
+    state: &DaemonState,
 ) {
-    let old_fingerprints = key_material_fingerprints.read().await.clone();
+    let old_fingerprints = state.key_material_fingerprints.read().await.clone();
     let (cleared_memory, new_fingerprints) = clear_authorization_memory_for_changed_keys_async(
         &old_fingerprints,
         key_tuples,
-        authorization_memory,
+        &state.authorization_memory,
     )
     .await;
     if cleared_memory > 0 {
@@ -40,28 +30,54 @@ pub(crate) async fn reconcile_synced_key_state(
         );
     }
 
-    cached_key_tuples.write().await.set(key_tuples.to_vec());
-    *key_material_fingerprints.write().await = new_fingerprints;
+    state
+        .cached_key_tuples
+        .write()
+        .await
+        .set(key_tuples.to_vec());
+    *state.key_material_fingerprints.write().await = new_fingerprints;
 
     // Bind the guards' results to locals first: a `read().await` guard used as a
     // temporary inside the `if let` scrutinee would otherwise live until the end
     // of the whole statement and self-deadlock on the `write().await` below
     // (tokio's RwLock is not reentrant).
-    let existing_cache = local_key_cache_data.read().await.as_ref().cloned();
-    let local_cache_key = local_cache_key_state.read().await.clone_key();
+    let existing_cache = state.local_key_cache_data.read().await.as_ref().cloned();
+    let local_cache_key = state.local_cache_key_state.read().await.clone_key();
+    if existing_cache.is_some() && local_cache_key.is_none() {
+        // The agent has the new keys but the file keeps the old ones; without
+        // this flag a key deleted on the server would sign again after a restart.
+        state
+            .notification_state
+            .write()
+            .await
+            .mark_cache_stale(CACHE_KEY_NOT_LOADED);
+        tracing::warn!("{}", CACHE_KEY_NOT_LOADED);
+    }
     if let (Some(existing_cache), Some(local_cache_key)) = (existing_cache, local_cache_key) {
         match refresh_envelope_local_key_cache(key_tuples, &existing_cache, &local_cache_key) {
             Ok(cache) => {
-                *local_key_cache_data.write().await = Some(cache);
-                local_cache_key_state.write().await.set(local_cache_key);
+                *state.local_key_cache_data.write().await = Some(cache);
+                state
+                    .local_cache_key_state
+                    .write()
+                    .await
+                    .set(local_cache_key);
                 // Clears a staleness flag from an earlier failed refresh: the
                 // flag describes the *current* cache, not a permanent defect.
-                notification_state.write().await.mark_cache_refreshed();
+                state
+                    .notification_state
+                    .write()
+                    .await
+                    .mark_cache_refreshed();
                 tracing::info!("Local key cache refreshed after sync");
             }
             Err(e) => {
                 let error = e.to_string();
-                notification_state.write().await.mark_cache_stale(&error);
+                state
+                    .notification_state
+                    .write()
+                    .await
+                    .mark_cache_stale(&error);
                 tracing::warn!(
                     "Sync succeeded but local key cache refresh failed: {}",
                     error
@@ -72,22 +88,17 @@ pub(crate) async fn reconcile_synced_key_state(
 }
 
 /// Sync SSH keys from the Bitwarden API and reload into the agent.
-#[allow(clippy::too_many_arguments)]
+///
+/// The fetch can wait 30 s on a silent server, so callers run this in its own
+/// task, and it holds no lock that the main loop needs while it waits.
 pub(crate) async fn do_sync(
-    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
-    cached_key_tuples: &CachedKeyTuples,
-    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
-    local_cache_key_state: &LocalCacheKeyHandle,
-    authorization_memory: &AuthorizationMemorySet,
-    key_material_fingerprints: &KeyMaterialFingerprints,
-    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
+    state: &DaemonState,
     agent: &mut sshwarden_agent::SshWardenAgent,
-    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
-    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
 ) -> Result<usize, String> {
-    let client_guard = api_client.read().await;
-    let client = match *client_guard {
-        Some(ref c) => c,
+    let _one_sync = state.sync_lock.lock().await;
+    // A copy: the fetch must not hold the client's lock.
+    let client = match state.api_client.read().await.as_ref() {
+        Some(c) => c.clone(),
         None => return Err("Not authenticated. Run 'sshwarden login'.".to_string()),
     };
 
@@ -102,6 +113,22 @@ pub(crate) async fn do_sync(
         .sync_ssh_keys()
         .await
         .map_err(|e| format!("Sync failed: {}", e))?;
+
+    // `lock` or `forget` may have run during the fetch: check again before any
+    // key is loaded, and keep them out until the load is done.
+    let _change = state.change_lock.lock().await;
+    if state
+        .vault_locked
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        state
+            .pending_sync
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        return Err("Vault was locked during the sync; it will run on next unlock".to_string());
+    }
+    if state.api_client.read().await.is_none() {
+        return Err("Logged out during the sync".to_string());
+    }
 
     let key_tuples: crate::runtime::KeyTuples = zeroize::Zeroizing::new(
         keys.iter()
@@ -121,83 +148,54 @@ pub(crate) async fn do_sync(
     if let Err(e) = sync_managed_ssh_config_with_bindings(&keys) {
         tracing::warn!("Failed to sync managed SSH config: {}", e);
     }
-    reconcile_synced_key_state(
-        &key_tuples,
-        cached_key_tuples,
-        local_key_cache_data,
-        local_cache_key_state,
-        authorization_memory,
-        key_material_fingerprints,
-        notification_state,
-    )
-    .await;
+    reconcile_synced_key_state(&key_tuples, state).await;
 
-    // Update key_names
+    // Update &state.key_names
     {
-        let mut names = key_names.write().await;
+        let mut names = state.key_names.write().await;
         names.clear();
         for k in &keys {
             names.insert(k.cipher_id.clone(), k.name.clone());
         }
     }
 
-    drop(client_guard);
-
-    if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
-        if let Err(e) = agent.set_keys(&key_tuples) {
-            return Err(format!("Sync succeeded but failed to reload keys: {}", e));
-        }
+    if let Err(e) = agent.set_keys(&key_tuples) {
+        return Err(format!("Sync succeeded but failed to reload keys: {}", e));
     }
     // Baseline for `status`'s sync row: without it, "no pending sync" cannot be
     // distinguished from "never synced at all".
-    notification_state.write().await.record_successful_sync();
+    state
+        .notification_state
+        .write()
+        .await
+        .record_successful_sync();
     info!("Vault synced: {} SSH keys", count);
     Ok(count)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn resolve_pending_sync(
-    pending_sync: &Arc<std::sync::atomic::AtomicBool>,
-    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
-    cached_key_tuples: &CachedKeyTuples,
-    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
-    local_cache_key_state: &LocalCacheKeyHandle,
-    authorization_memory: &AuthorizationMemorySet,
-    key_material_fingerprints: &KeyMaterialFingerprints,
-    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    agent: &mut sshwarden_agent::SshWardenAgent,
-    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
-    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
-) -> bool {
-    if !pending_sync.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        return false;
+/// Start the sync that waited for an unlock. It runs in its own task, so the
+/// unlock reply and the main loop do not wait for the server.
+pub(crate) fn resolve_pending_sync(state: &DaemonState, agent: &sshwarden_agent::SshWardenAgent) {
+    if !state
+        .pending_sync
+        .swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
     }
 
     info!("Resolving pending sync after unlock...");
-    match do_sync(
-        api_client,
-        cached_key_tuples,
-        local_key_cache_data,
-        local_cache_key_state,
-        authorization_memory,
-        key_material_fingerprints,
-        vault_locked,
-        agent,
-        key_names,
-        notification_state,
-    )
-    .await
-    {
-        Ok(count) => {
-            info!("Pending sync resolved: {} SSH keys", count);
-            true
+    let (state, mut agent) = (state.clone(), agent.clone());
+    tokio::spawn(async move {
+        match do_sync(&state, &mut agent).await {
+            Ok(count) => info!("Pending sync resolved: {} SSH keys", count),
+            Err(e) => {
+                state
+                    .pending_sync
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!("Pending sync failed: {}; sync remains pending", e);
+            }
         }
-        Err(e) => {
-            pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!("Pending sync failed: {}; sync remains pending", e);
-            false
-        }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -205,7 +203,6 @@ pub(crate) async fn resolve_pending_sync(
 mod tests {
     use super::*;
     use crate::cache::build_envelope_local_key_cache;
-    use crate::runtime::{LocalCacheKeyState, SecureKeyCache};
 
     /// Set by the parent test run on the child process it spawns, so the child
     /// takes the branch that performs the actual check.
@@ -271,12 +268,7 @@ mod tests {
             resolved.display()
         );
 
-        let cached_key_tuples: CachedKeyTuples = Arc::new(RwLock::new(SecureKeyCache::new()));
-        let authorization_memory: AuthorizationMemorySet =
-            Arc::new(RwLock::new(std::collections::HashSet::new()));
-        let key_material_fingerprints: KeyMaterialFingerprints =
-            Arc::new(RwLock::new(std::collections::HashMap::new()));
-        let notification_state = Arc::new(RwLock::new(NotificationRuntimeState::default()));
+        let state = DaemonState::for_tests();
 
         let key_tuples = vec![(
             "-----BEGIN OPENSSH PRIVATE KEY-----\nnot-a-real-key\n-----END OPENSSH PRIVATE KEY-----\n"
@@ -302,30 +294,34 @@ mod tests {
             None,
         )
         .unwrap();
-        let local_key_cache_data = Arc::new(RwLock::new(Some(existing_cache)));
-        let mut state = LocalCacheKeyState::default();
-        state.set(local_cache_key);
-        let local_cache_key_state = Arc::new(RwLock::new(state));
+        *state.local_key_cache_data.write().await = Some(existing_cache);
+        state
+            .local_cache_key_state
+            .write()
+            .await
+            .set(local_cache_key);
 
         let done = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            reconcile_synced_key_state(
-                &key_tuples,
-                &cached_key_tuples,
-                &local_key_cache_data,
-                &local_cache_key_state,
-                &authorization_memory,
-                &key_material_fingerprints,
-                &notification_state,
-            ),
+            reconcile_synced_key_state(&key_tuples, &state),
         )
         .await;
         assert!(done.is_ok(), "reconcile_synced_key_state deadlocked");
 
         // The refresh really happened (Ok branch, not the "stale cache" error path).
-        assert!(local_key_cache_data.read().await.is_some());
-        assert!(local_cache_key_state.read().await.clone_key().is_some());
-        assert!(!notification_state.read().await.stale_cache);
+        assert!(state.local_key_cache_data.read().await.is_some());
+        assert!(state
+            .local_cache_key_state
+            .read()
+            .await
+            .clone_key()
+            .is_some());
+        assert!(!state.notification_state.read().await.stale_cache);
+
+        // A cache whose key is not in memory cannot be rewritten: say so.
+        state.local_cache_key_state.write().await.clear();
+        reconcile_synced_key_state(&key_tuples, &state).await;
+        assert!(state.notification_state.read().await.stale_cache);
 
         let _ = std::fs::remove_dir_all(&home);
     }
