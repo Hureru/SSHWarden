@@ -13,14 +13,13 @@ use crate::bindings_cli::prompt_authorization_with_bind_flow;
 use crate::cache::{current_hello_unlock_info, decrypt_envelope_local_key_cache_with_hello};
 use crate::cache::{
     current_native_unlock_slot, decrypt_envelope_local_key_cache_with_native,
-    decrypt_envelope_local_key_cache_with_pin, enroll_device_platform_slots_if_missing,
     write_envelope_local_key_cache,
 };
 use crate::commands::login::{create_client, prompt_password};
 use crate::runtime::{
     CachedKeyTuples, DaemonState, LocalCacheKeyHandle, RuntimeEvent, UIRequestTx,
 };
-use crate::unlock::{gate_pin_validator, save_device_session, DecryptedCache, PinValidator};
+use crate::unlock::{pin_dialog_validator, save_device_session, unlock_with_pin};
 /// Resolve the human-friendly key name for an SSH UI request, given the
 /// freshly-decrypted key list. Falls back to "Unknown key" when no `cipher_id`
 /// match is found.
@@ -241,37 +240,15 @@ pub(crate) async fn handle_ui_request(
                 .cloned()
         };
 
-        let (validator, decrypted_cache, lck_holder): (PinValidator, DecryptedCache, _) =
-            if let Some(cache) = envelope_cache {
-                let dc: DecryptedCache = Arc::new(std::sync::Mutex::new(None));
-                let kh: Arc<std::sync::Mutex<Option<sshwarden_api::crypto::SymmetricKey>>> =
-                    Arc::new(std::sync::Mutex::new(None));
-                let dc_inner = dc.clone();
-                let kh_inner = kh.clone();
-                let v: PinValidator = Arc::new(move |pin: &str| -> bool {
-                    match decrypt_envelope_local_key_cache_with_pin(&cache, pin) {
-                        Ok((keys_json, lck)) => {
-                            *dc_inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(keys_json);
-                            *kh_inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(lck);
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                });
-                (v, dc, Some(kh))
-            } else {
-                // No PIN credentials — bail out.
-                info!(
-                    request_id = request.request_id,
-                    "Auto-unlock failed: no PIN credentials available"
-                );
-                let _ = response_tx.send((request.request_id, false));
-                return;
-            };
-
-        // SEC-03: share the daemon-wide PIN brute-force lockout with the control
-        // channel so repeated wrong PINs in the SSH-request dialog also count.
-        let validator = gate_pin_validator(validator, &state.pin_failures);
+        let Some(cache) = envelope_cache else {
+            info!(
+                request_id = request.request_id,
+                "Auto-unlock failed: no PIN credentials available"
+            );
+            let _ = response_tx.send((request.request_id, false));
+            return;
+        };
+        let (validator, holder) = pin_dialog_validator(cache, &state.pin_failures);
 
         let context_key_name = {
             let names = state.key_names.read().await;
@@ -290,38 +267,19 @@ pub(crate) async fn handle_ui_request(
         .await;
 
         if let Some(pin) = pin_result {
-            let keys_json = match decrypted_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                Some(j) => j,
-                None => {
-                    tracing::warn!("PIN validator reported success but cache was empty");
-                    let _ = response_tx.send((request.request_id, false));
-                    return;
-                }
-            };
-            if let Ok(keys) = serde_json::from_str(&keys_json).map(crate::runtime::KeyTuples::new) {
-                let key_name = key_name_for_request(&request, &keys);
-                apply_decrypted_keys_state(&state.key_names, &state.cached_key_tuples, &keys).await;
-                let mut agent_for_unlock = agent.clone();
-                if agent_for_unlock.set_keys(&keys).is_ok() {
-                    if let Some(kh) = lck_holder {
-                        let maybe_lck = kh.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        if let Some(lck) = maybe_lck {
-                            // Multi-device: seed this device's own platform unlock
-                            // slot from the freshly recovered key, mirroring the
-                            // explicit unlock-pin control path (no-op in
-                            // single-device mode or if a slot already exists).
-                            enroll_device_platform_slots_if_missing(&lck);
-                            state.local_cache_key_state.write().await.set(lck);
-                        }
-                    }
-                    state
-                        .vault_locked
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
+            let decrypted = holder.lock().unwrap_or_else(|e| e.into_inner()).take();
+            match unlock_with_pin(&state, &mut agent.clone(), &pin, decrypted).await {
+                Ok(()) => {
                     info!("Auto-unlocked via PIN dialog");
+                    let key_name = {
+                        let names = state.key_names.read().await;
+                        request
+                            .cipher_id
+                            .as_ref()
+                            .and_then(|cid| names.get(cid))
+                            .cloned()
+                            .unwrap_or_else(|| "Unknown key".to_string())
+                    };
                     let _ = runtime_event_tx
                         .send(RuntimeEvent::AutoUnlockedPin { pin })
                         .await;
@@ -335,6 +293,7 @@ pub(crate) async fn handle_ui_request(
                     let _ = response_tx.send((request.request_id, approved));
                     return;
                 }
+                Err(e) => tracing::warn!("PIN auto-unlock failed: {}", e),
             }
         }
 

@@ -14,8 +14,9 @@ use base64::Engine;
 #[cfg(windows)]
 use crate::cache::current_hello_challenge_b64;
 use crate::cache::{
-    decrypt_envelope_local_key_cache_with_pin, decrypt_envelope_payload, multi_device_mode,
-    reload_shared_local_cache_from_disk_if_multi_device,
+    decrypt_envelope_local_key_cache_with_pin, decrypt_envelope_payload,
+    enroll_device_platform_slots_if_missing, migrate_pin_salt_to_v3, multi_device_mode,
+    needs_pin_salt_migration, reload_shared_local_cache_from_disk_if_multi_device,
 };
 use crate::control::{pin_lockout_remaining, record_pin_attempt, PinFailureHandle};
 use crate::notifications::connect_notification_client;
@@ -36,7 +37,11 @@ pub(crate) fn try_hello_encrypt(plaintext: &str, challenge: &[u8; 16]) -> anyhow
 }
 
 pub(crate) type PinValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-pub(crate) type DecryptedCache = Arc<std::sync::Mutex<Option<zeroize::Zeroizing<String>>>>;
+/// What a correct PIN recovers: the decrypted key list and the Local Cache Key.
+pub(crate) type PinDecrypted = (
+    zeroize::Zeroizing<String>,
+    sshwarden_api::crypto::SymmetricKey,
+);
 
 /// Wrap a PIN validator so every attempt shares the daemon-wide brute-force
 /// accounting (SEC-03) with `ControlAction::UnlockPin`: reject outright while a
@@ -45,10 +50,7 @@ pub(crate) type DecryptedCache = Arc<std::sync::Mutex<Option<zeroize::Zeroizing<
 /// path is an unthrottled brute-force bypass. The wrapper runs inside the
 /// dialog's validation thread (not a tokio worker), so the failure accounting is
 /// intentionally clock-agnostic (std::time::Instant).
-pub(crate) fn gate_pin_validator(
-    inner: PinValidator,
-    pin_failures: &PinFailureHandle,
-) -> PinValidator {
+fn gate_pin_validator(inner: PinValidator, pin_failures: &PinFailureHandle) -> PinValidator {
     let pin_failures = pin_failures.clone();
     Arc::new(move |pin: &str| -> bool {
         if pin_lockout_remaining(&pin_failures).is_some() {
@@ -58,6 +60,90 @@ pub(crate) fn gate_pin_validator(
         let _ = record_pin_attempt(&pin_failures, ok);
         ok
     })
+}
+
+/// The validator for a PIN dialog over `cache`. It counts attempts (SEC-03) and
+/// keeps what the correct PIN decrypted, so the caller does not run Argon2 twice.
+pub(crate) fn pin_dialog_validator(
+    cache: sshwarden_config::cache::LocalKeyCacheFile,
+    pin_failures: &PinFailureHandle,
+) -> (PinValidator, Arc<std::sync::Mutex<Option<PinDecrypted>>>) {
+    let holder = Arc::new(std::sync::Mutex::new(None));
+    let holder_inner = holder.clone();
+    let validator: PinValidator = Arc::new(move |pin: &str| -> bool {
+        match decrypt_envelope_local_key_cache_with_pin(&cache, pin) {
+            Ok(decrypted) => {
+                *holder_inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(decrypted);
+                true
+            }
+            Err(_) => false,
+        }
+    });
+    (gate_pin_validator(validator, pin_failures), holder)
+}
+
+/// Unlock the vault with a PIN. Every PIN path ends here: `unlock-pin`, the
+/// `unlock` dialog and the dialog a sign request opens. `decrypted` is what the
+/// dialog's validator already recovered; `None` decrypts here. Throttling, the
+/// reply text and the session restore stay with the caller.
+pub(crate) async fn unlock_with_pin(
+    state: &DaemonState,
+    agent: &mut sshwarden_agent::SshWardenAgent,
+    pin: &str,
+    decrypted: Option<PinDecrypted>,
+) -> Result<(), String> {
+    // A local copy, so no read guard is held across the writes below.
+    let cache = state
+        .local_key_cache_data
+        .read()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or("No PIN configured. Use 'sshwarden set-pin' first.")?;
+    let (keys_json, local_cache_key) = match decrypted {
+        Some(decrypted) => decrypted,
+        None => {
+            let (cache, pin) = (cache.clone(), zeroize::Zeroizing::new(pin.to_string()));
+            // Argon2 takes about 100 ms: keep it off the async workers.
+            tokio::task::spawn_blocking(move || {
+                decrypt_envelope_local_key_cache_with_pin(&cache, &pin)
+            })
+            .await
+            .map_err(|e| format!("PIN unlock task failed: {e}"))?
+            .map_err(|e| {
+                tracing::warn!("PIN unlock from local key cache failed: {}", e);
+                "Invalid PIN".to_string()
+            })?
+        }
+    };
+
+    // SEC-04: with the key and a verified PIN in hand, upgrade a pre-v3 (fixed
+    // salt) cache to a random per-cache salt.
+    if needs_pin_salt_migration(&cache) {
+        match migrate_pin_salt_to_v3(&cache, &local_cache_key, pin) {
+            Ok(migrated) => {
+                *state.local_key_cache_data.write().await = Some(migrated);
+                info!("Migrated local key cache PIN slot to v3 (random salt)");
+            }
+            Err(e) => tracing::warn!("PIN salt v3 migration failed (non-fatal): {e}"),
+        }
+    }
+    // Multi-device: seed this device's own platform unlock slot, so a device
+    // that joined later is not PIN-only for ever. No-op otherwise.
+    enroll_device_platform_slots_if_missing(&local_cache_key);
+    state
+        .local_cache_key_state
+        .write()
+        .await
+        .set(local_cache_key);
+    let resp = finish_unlock_with_json(&keys_json, agent, state, "Vault unlocked via PIN").await;
+    if !resp.ok {
+        state.local_cache_key_state.write().await.clear();
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "PIN unlock failed".to_string()));
+    }
+    Ok(())
 }
 
 /// Manual `sync` is user-initiated and should not leave the live agent newer
@@ -95,27 +181,15 @@ pub(crate) async fn ensure_local_cache_key_for_manual_sync(
     }
 
     info!("Manual sync needs PIN to refresh the Local Key Cache");
-    let key_holder: Arc<std::sync::Mutex<Option<sshwarden_api::crypto::SymmetricKey>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let key_holder_inner = key_holder.clone();
-    let validator: PinValidator = Arc::new(move |pin: &str| -> bool {
-        match decrypt_envelope_local_key_cache_with_pin(&cache, pin) {
-            Ok((_keys_json, local_cache_key)) => {
-                *key_holder_inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(local_cache_key);
-                true
-            }
-            Err(_) => false,
-        }
-    });
-    let validator = gate_pin_validator(validator, &state.pin_failures);
+    let (validator, holder) = pin_dialog_validator(cache, &state.pin_failures);
 
     match sshwarden_ui::unlock::request_pin_dialog(&state.ui_request_tx, validator).await {
         Some(_) => {
             // Take the recovered key OUT of the guard before awaiting, so no
             // std::sync::MutexGuard is held across the .await (clippy::await_holding_lock).
-            let recovered = key_holder.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let recovered = holder.lock().unwrap_or_else(|e| e.into_inner()).take();
             match recovered {
-                Some(local_cache_key) => {
+                Some((_keys_json, local_cache_key)) => {
                     state.local_cache_key_state.write().await.set(local_cache_key);
                     Ok(())
                 }
@@ -439,4 +513,46 @@ pub(crate) async fn finish_unlock_with_json(
         .store(false, std::sync::atomic::Ordering::Relaxed);
     info!("{}", success_msg);
     sshwarden_agent::ControlResponse::ok(success_msg)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_dialog_validator_keeps_what_the_right_pin_decrypted() {
+        let lck = sshwarden_api::crypto::SymmetricKey {
+            enc_key: vec![7u8; 32],
+            mac_key: vec![9u8; 32],
+        };
+        let (pin_encrypted, pin_salt) =
+            crate::cache::encrypt_local_cache_key_with_pin(&lck, "73915824").unwrap();
+        let keys = vec![(
+            "private".to_string(),
+            "name".to_string(),
+            "cipher-1".to_string(),
+        )];
+        let cache = crate::cache::build_envelope_local_key_cache(
+            &keys,
+            "user@example.com",
+            "https://vault.example.com",
+            &lck,
+            Some(pin_encrypted),
+            Some(pin_salt),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let failures = PinFailureHandle::default();
+        let (validator, holder) = pin_dialog_validator(cache, &failures);
+
+        assert!(!validator("00000000"));
+        assert!(holder.lock().unwrap().is_none());
+        assert!(validator("73915824"));
+        let (keys_json, recovered) = holder.lock().unwrap().take().unwrap();
+        assert!(keys_json.contains("cipher-1"));
+        assert_eq!(recovered.enc_key, lck.enc_key);
+    }
 }
