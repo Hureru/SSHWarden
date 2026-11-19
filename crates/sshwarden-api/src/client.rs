@@ -451,7 +451,9 @@ impl BitwardenClient {
                 }
                 expiry.duration_since(now) < std::time::Duration::from_secs(300)
             }
-            None => self.access_token.is_some(), // No expiry tracked, assume expiring
+            // No expiry tracked: a token of unknown age, or a restored session
+            // whose first refresh failed. Both need a refresh.
+            None => self.access_token.is_some() || self.refresh_token.is_some(),
         }
     }
 

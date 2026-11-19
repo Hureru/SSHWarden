@@ -373,15 +373,10 @@ impl DaemonState {
     }
 }
 
-/// Internal events emitted by spawned SSH request handlers back to the main loop.
-#[allow(clippy::enum_variant_names)]
+/// Sent by a sign request's handler to the main loop.
 pub(crate) enum RuntimeEvent {
-    #[cfg(windows)]
-    AutoUnlockedWindowsHello,
-    AutoUnlockedPin {
-        pin: String,
-    },
-    AutoUnlockedNative,
+    /// The request unlocked the vault: restore the session, run a waiting sync.
+    AutoUnlocked,
 }
 
 #[cfg(test)]

@@ -24,9 +24,7 @@ use crate::runtime::{
 use crate::sshconfig::{sync_managed_ssh_config_with_bindings, write_key_selector_files};
 use crate::sync::{do_sync, resolve_pending_sync};
 use crate::ui::{fetch_vault_keys_with_client, handle_ui_request, prompt_setup_pin};
-#[cfg(windows)]
-use crate::unlock::try_restore_api_session_hello;
-use crate::unlock::{save_device_session, try_restore_api_session};
+use crate::unlock::{restore_api_session, save_device_session};
 
 pub(crate) async fn run_foreground(
     mut config: sshwarden_config::Config,
@@ -308,7 +306,8 @@ pub(crate) async fn run_foreground(
                 .await;
 
                 // Save device session for this host
-                save_device_session(client, &config, None).await;
+                let local_cache_key = local_cache_key_state.read().await.clone_key();
+                save_device_session(client, local_cache_key.as_ref()).await;
             }
         }
     }
@@ -430,24 +429,11 @@ pub(crate) async fn run_foreground(
                 // Every event is an unlock done by a sign request, whose PIN
                 // window may have been open for longer than the lock timeout.
                 last_activity = std::time::SystemTime::now();
-                match event {
-                    #[cfg(windows)]
-                    RuntimeEvent::AutoUnlockedWindowsHello => {
-                        try_restore_api_session_hello(&state, &mut notification_rx, &mut _notification_client).await;
-                        resolve_pending_sync(&state, &agent);
-                    }
-                    RuntimeEvent::AutoUnlockedPin { pin } => {
-                        try_restore_api_session(&state, &pin, &mut notification_rx, &mut _notification_client).await;
-                        resolve_pending_sync(&state, &agent);
-                    }
-                    RuntimeEvent::AutoUnlockedNative => {
-                        // Native (Keychain / Secret Service / DPAPI) unlock cannot
-                        // currently restore an API session — SessionFile has no
-                        // native_encrypted_token slot — so we only resolve any
-                        // sync that was deferred while the vault was locked.
-                        resolve_pending_sync(&state, &agent);
-                    }
-                }
+                let RuntimeEvent::AutoUnlocked = event;
+                let _change = state.change_lock.lock().await;
+                // The hint has no reader here: `status` shows the session.
+                let _ = restore_api_session(&state, &mut notification_rx, &mut _notification_client).await;
+                resolve_pending_sync(&state, &agent);
             }
             // Notification hub events
             Some(event) = async {
@@ -498,7 +484,8 @@ pub(crate) async fn run_foreground(
                             Ok(()) => {
                                 info!("Access token refreshed");
                                 // Update session file with new refresh token
-                                save_device_session(client, &state.config, None).await;
+                                let local_cache_key = state.local_cache_key_state.read().await.clone_key();
+                                save_device_session(client, local_cache_key.as_ref()).await;
                                 if let Some(token) = client.access_token().map(str::to_string) {
                                     connect_notification_client(
                                         &state.config,

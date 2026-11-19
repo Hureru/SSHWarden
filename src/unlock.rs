@@ -1,5 +1,5 @@
 //! Vault unlock paths: PIN validators, manual-sync Local Key Cache refresh,
-//! API session restore (PIN + Windows Hello), device session save, and the
+//! API session restore, device session save, and the
 //! final unlock response plumbing.
 //!
 //! Moved out of `main.rs` as part of the incremental module split (M1 step 4b).
@@ -8,11 +8,6 @@ use std::sync::Arc;
 
 use tracing::info;
 
-#[cfg(windows)]
-use base64::Engine;
-
-#[cfg(windows)]
-use crate::cache::current_hello_challenge_b64;
 use crate::cache::{
     decrypt_envelope_local_key_cache_with_pin, decrypt_envelope_payload,
     enroll_device_platform_slots_if_missing, migrate_pin_salt_to_v3, multi_device_mode,
@@ -203,153 +198,142 @@ pub(crate) async fn ensure_local_cache_key_for_manual_sync(
     }
 }
 
-/// Try to restore an API session from the device session file after Hello unlock.
-///
-/// Uses the Hello-encrypted refresh token stored in the session file.
-#[cfg(windows)]
-pub(crate) async fn try_restore_api_session_hello(
-    state: &DaemonState,
-    notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
-    notification_client: &mut Option<sshwarden_api::NotificationClient>,
-) {
-    if state.api_client.read().await.is_some() {
-        return;
-    }
-
-    let session = match sshwarden_config::session::SessionFile::load() {
-        Ok(Some(s)) => s,
-        _ => return,
-    };
-
-    // Need hello_encrypted_token and this device's Hello challenge.
-    let hello_enc_token = match session.hello_encrypted_token {
-        Some(ref t) => t.clone(),
-        None => {
-            info!("Session file has no Hello-encrypted token, skipping API restore");
-            return;
-        }
-    };
-
-    let challenge_b64 = match current_hello_challenge_b64() {
-        Some(c) => c,
-        None => return,
-    };
-
-    let challenge_bytes = match base64::engine::general_purpose::STANDARD.decode(&challenge_b64) {
-        Ok(b) if b.len() == 16 => {
-            let mut arr = [0u8; 16];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return,
-    };
-
-    // Decrypt with Hello
-    let hello_result = tokio::task::spawn_blocking(move || {
-        sshwarden_ui::unlock::hello_crypto::hello_decrypt_keys(&hello_enc_token, &challenge_bytes)
-    })
-    .await;
-
-    let refresh_token = match hello_result {
-        Ok(Ok(token)) => token,
-        _ => {
-            info!("Hello decrypt of session token failed");
-            return;
-        }
-    };
-
-    let base = &state.config.server.base_url;
-    let api_url = state.config.server.api_url();
-    let mut client = sshwarden_api::BitwardenClient::new_with_device_id(
-        base,
-        &api_url,
-        &session.identity_url,
-        &session.device_id,
+/// What a session needs to come back: the refresh token and the user key,
+/// encrypted with the Local Cache Key (ADR 0028).
+fn encrypt_session_secrets(
+    refresh_token: &str,
+    user_key: &sshwarden_api::crypto::SymmetricKey,
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+) -> anyhow::Result<String> {
+    let json = zeroize::Zeroizing::new(
+        serde_json::json!({
+            "refresh_token": refresh_token,
+            "user_key": sshwarden_api::crypto::encode_symmetric_key(user_key),
+        })
+        .to_string(),
     );
-    client.set_refresh_token(refresh_token);
+    sshwarden_api::crypto::encrypt_enc_string(json.as_bytes(), local_cache_key)
+}
 
-    match client.refresh_access_token().await {
-        Ok(()) => {
-            info!("Restored API session from device session file (Hello)");
+fn decrypt_session_secrets(
+    encrypted: &str,
+    local_cache_key: &sshwarden_api::crypto::SymmetricKey,
+) -> anyhow::Result<(String, sshwarden_api::crypto::SymmetricKey)> {
+    let json = zeroize::Zeroizing::new(sshwarden_api::crypto::decrypt_enc_string_to_string(
+        encrypted,
+        local_cache_key,
+    )?);
+    let secrets: serde_json::Value = serde_json::from_str(&json)?;
+    let field = |name: &str| {
+        secrets[name]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Session file has no {name}"))
+    };
+    Ok((
+        field("refresh_token")?.to_string(),
+        sshwarden_api::crypto::decode_symmetric_key(field("user_key")?)?,
+    ))
+}
 
-            if let Some(token) = client.access_token() {
-                connect_notification_client(
-                    &state.config,
-                    Some(&client),
-                    token,
-                    notification_rx,
-                    notification_client,
-                    &state.notification_state,
-                )
-                .await;
+/// Save the client's session for this device. It needs the Local Cache Key, a
+/// refresh token and the user key; without all three the file is left alone.
+pub(crate) async fn save_device_session(
+    client: &sshwarden_api::BitwardenClient,
+    local_cache_key: Option<&sshwarden_api::crypto::SymmetricKey>,
+) {
+    let (Some(local_cache_key), Some(refresh_token), Some(user_key)) =
+        (local_cache_key, client.refresh_token(), client.user_key())
+    else {
+        return;
+    };
+    let lck_encrypted_session =
+        match encrypt_session_secrets(refresh_token, user_key, local_cache_key) {
+            Ok(encrypted) => Some(encrypted),
+            Err(e) => {
+                tracing::warn!("Failed to encrypt device session: {}", e);
+                return;
             }
-
-            *state.api_client.write().await = Some(client);
-        }
-        Err(e) => {
-            tracing::warn!("Hello session restore failed: {}", e);
-        }
+        };
+    let session = sshwarden_config::session::SessionFile {
+        version: 2,
+        device_id: client.device_id().to_string(),
+        identity_url: client.identity_url().to_string(),
+        lck_encrypted_session,
+    };
+    match session.save() {
+        Ok(()) => info!("Device session saved"),
+        Err(e) => tracing::warn!("Failed to save device session: {}", e),
     }
 }
 
-/// Try to restore an API session from the device session file after PIN unlock.
-///
-/// Decrypts the stored refresh_token using the PIN, refreshes the access token,
-/// and connects to the notification hub.
-pub(crate) async fn try_restore_api_session(
+/// Get the Bitwarden session back after an unlock, from the session file and
+/// the Local Cache Key that the unlock just loaded. Every unlock path calls
+/// this. After a restart it builds the client and refreshes the token; after a
+/// lock it only gives the client its user key back. Returns a line for the
+/// user when they have to act.
+pub(crate) async fn restore_api_session(
     state: &DaemonState,
-    pin: &str,
     notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
     notification_client: &mut Option<sshwarden_api::NotificationClient>,
-) {
-    // Only restore if we don't already have an API client
-    if state.api_client.read().await.is_some() {
-        return;
-    }
+) -> Option<String> {
+    const LOGIN_HINT: &str =
+        "The saved Bitwarden session cannot be used. Run `sshwarden login` once to turn sync back on.";
 
-    let session = match sshwarden_config::session::SessionFile::load() {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            info!("No device session file found, skipping API session restore");
-            return;
+    if let Some(client) = state.api_client.read().await.as_ref() {
+        if client.has_user_key() {
+            return None;
         }
+    }
+    let local_cache_key = state.local_cache_key_state.read().await.clone_key()?;
+    let session = match sshwarden_config::session::SessionFile::load() {
+        Ok(Some(session)) => session,
+        Ok(None) => return None,
         Err(e) => {
             tracing::warn!("Failed to load session file: {}", e);
-            return;
+            return None;
+        }
+    };
+    let Some(encrypted) = session.lck_encrypted_session.as_deref() else {
+        if session.version >= 2 {
+            return None;
+        }
+        // A version 1 file: its tokens are not read any more. Write it back
+        // without them, so that the device id survives for the next login.
+        let stripped = sshwarden_config::session::SessionFile {
+            version: 2,
+            ..session
+        };
+        if let Err(e) = stripped.save() {
+            tracing::warn!("Failed to rewrite the old session file: {}", e);
+        }
+        return Some(LOGIN_HINT.to_string());
+    };
+    let (refresh_token, user_key) = match decrypt_session_secrets(encrypted, &local_cache_key) {
+        Ok(secrets) => secrets,
+        Err(e) => {
+            tracing::warn!("Session file does not open with the Local Cache Key: {}", e);
+            return Some(LOGIN_HINT.to_string());
         }
     };
 
-    // Decrypt refresh token using PIN
-    let refresh_token = match session.pin_encrypted_token {
-        Some(ref enc) => match sshwarden_api::crypto::pin_decrypt(enc, pin) {
-            Ok(token) => token,
-            Err(e) => {
-                tracing::warn!("Failed to decrypt session refresh token: {}", e);
-                return;
-            }
-        },
-        None => {
-            info!("Session file has no PIN-encrypted token");
-            return;
-        }
-    };
+    if let Some(client) = state.api_client.write().await.as_mut() {
+        // After a lock: the client and its tokens stayed, only the key went.
+        client.set_user_key(user_key);
+        save_device_session(client, Some(&local_cache_key)).await;
+        return None;
+    }
 
-    // Create client with stored device_id and try to refresh
-    let base = &state.config.server.base_url;
-    let api_url = state.config.server.api_url();
     let mut client = sshwarden_api::BitwardenClient::new_with_device_id(
-        base,
-        &api_url,
+        &state.config.server.base_url,
+        &state.config.server.api_url(),
         &session.identity_url,
         &session.device_id,
     );
     client.set_refresh_token(refresh_token);
-
+    client.set_user_key(user_key);
     match client.refresh_access_token().await {
         Ok(()) => {
             info!("Restored API session from device session file");
-
-            // Connect to notification hub
             if let Some(token) = client.access_token() {
                 connect_notification_client(
                     &state.config,
@@ -361,132 +345,22 @@ pub(crate) async fn try_restore_api_session(
                 )
                 .await;
             }
-
-            // Update session file with new refresh token
-            save_device_session(&client, &state.config, Some(pin)).await;
-
-            *state.api_client.write().await = Some(client);
+            save_device_session(&client, Some(&local_cache_key)).await;
         }
         Err(e) => {
             tracing::warn!("API session restore failed (token refresh): {}", e);
-            delete_session_if_rejected(&e);
+            if e.downcast_ref::<sshwarden_api::RefreshRejected>().is_some() {
+                if let Err(e) = sshwarden_config::session::SessionFile::delete() {
+                    tracing::warn!("Failed to delete stale session file: {}", e);
+                }
+                return Some(LOGIN_HINT.to_string());
+            }
+            // The server did not answer: keep the client, the token refresh
+            // timer tries again.
         }
     }
-}
-
-/// Delete the session file only when the server refused its token. A network
-/// error or a 5xx passes; deleting then would force a new `sshwarden login`.
-fn delete_session_if_rejected(error: &anyhow::Error) {
-    if error
-        .downcast_ref::<sshwarden_api::RefreshRejected>()
-        .is_none()
-    {
-        return;
-    }
-    if let Err(e) = sshwarden_config::session::SessionFile::delete() {
-        tracing::warn!("Failed to delete stale session file: {}", e);
-    }
-}
-
-/// Save the current API client's device session to disk.
-///
-/// If `pin` is provided, the refresh token is encrypted with it.
-/// Otherwise, the existing session file's encrypted tokens are preserved.
-pub(crate) async fn save_device_session(
-    client: &sshwarden_api::BitwardenClient,
-    _config: &sshwarden_config::Config,
-    pin: Option<&str>,
-) {
-    let refresh_token = match client.refresh_token() {
-        Some(t) => t.to_string(),
-        None => return, // No refresh token to save
-    };
-
-    // Load existing session to preserve hello_encrypted_token if present
-    let existing = sshwarden_config::session::SessionFile::load()
-        .ok()
-        .flatten();
-
-    let pin_encrypted_token = if let Some(pin) = pin {
-        match sshwarden_api::crypto::pin_encrypt(&refresh_token, pin) {
-            Ok(enc) => Some(enc),
-            Err(e) => {
-                tracing::warn!("Failed to encrypt refresh token with PIN: {}", e);
-                // Fall back to existing
-                existing
-                    .as_ref()
-                    .and_then(|s| s.pin_encrypted_token.clone())
-            }
-        }
-    } else {
-        // Re-encrypt with existing PIN is not possible without the PIN.
-        // Keep existing encrypted token if available.
-        existing
-            .as_ref()
-            .and_then(|s| s.pin_encrypted_token.clone())
-    };
-
-    let hello_encrypted_token = create_or_preserve_hello_encrypted_token(
-        &refresh_token,
-        existing
-            .as_ref()
-            .and_then(|s| s.hello_encrypted_token.clone()),
-    );
-
-    let session = sshwarden_config::session::SessionFile {
-        version: 1,
-        device_id: client.device_id().to_string(),
-        pin_encrypted_token,
-        hello_encrypted_token,
-        identity_url: client.identity_url().to_string(),
-    };
-
-    if let Err(e) = session.save() {
-        tracing::warn!("Failed to save device session: {}", e);
-    } else {
-        info!(
-            "Device session saved to {}",
-            sshwarden_config::session::SessionFile::path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "unknown".to_string())
-        );
-    }
-}
-
-pub(crate) fn create_or_preserve_hello_encrypted_token(
-    refresh_token: &str,
-    existing: Option<String>,
-) -> Option<String> {
-    #[cfg(windows)]
-    {
-        let challenge_b64 = match current_hello_challenge_b64() {
-            Some(challenge) => challenge,
-            None => return existing,
-        };
-        let challenge_bytes = match base64::engine::general_purpose::STANDARD.decode(&challenge_b64)
-        {
-            Ok(bytes) if bytes.len() == 16 => {
-                let mut challenge = [0u8; 16];
-                challenge.copy_from_slice(&bytes);
-                challenge
-            }
-            _ => return existing,
-        };
-
-        match try_hello_encrypt(refresh_token, &challenge_bytes) {
-            Ok(encrypted) => Some(encrypted),
-            Err(e) => {
-                tracing::warn!("Failed to encrypt refresh token with Windows Hello: {}", e);
-                existing
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = refresh_token;
-        existing
-    }
+    *state.api_client.write().await = Some(client);
+    None
 }
 
 /// Finish an unlock by parsing keys JSON and loading into agent.
@@ -530,6 +404,23 @@ pub(crate) async fn finish_unlock_with_json(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_secrets_open_only_with_the_key_that_closed_them() {
+        let key = |n: u8| sshwarden_api::crypto::SymmetricKey {
+            enc_key: vec![n; 32],
+            mac_key: vec![n + 1; 32],
+        };
+        let encrypted = encrypt_session_secrets("refresh-1", &key(1), &key(7)).unwrap();
+        assert!(!encrypted.contains("refresh-1"));
+
+        let (refresh_token, user_key) = decrypt_session_secrets(&encrypted, &key(7)).unwrap();
+        assert_eq!(refresh_token, "refresh-1");
+        assert_eq!(user_key.enc_key, key(1).enc_key);
+        assert_eq!(user_key.mac_key, key(1).mac_key);
+
+        assert!(decrypt_session_secrets(&encrypted, &key(8)).is_err());
+    }
 
     #[test]
     fn pin_dialog_validator_keeps_what_the_right_pin_decrypted() {

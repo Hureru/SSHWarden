@@ -22,12 +22,12 @@ use crate::process::{is_daemon_running, spawn_background_agent};
 use crate::runtime::{DaemonState, UIRequestTx};
 use crate::sshconfig::{sync_managed_ssh_config_with_bindings, write_key_selector_files};
 use crate::sync::{do_sync, reconcile_synced_key_state, resolve_pending_sync};
-use crate::unlock::{
-    ensure_local_cache_key_for_manual_sync, pin_dialog_validator, save_device_session,
-    try_restore_api_session, unlock_with_pin,
-};
 #[cfg(windows)]
-use crate::unlock::{finish_unlock_with_json, try_restore_api_session_hello};
+use crate::unlock::finish_unlock_with_json;
+use crate::unlock::{
+    ensure_local_cache_key_for_manual_sync, pin_dialog_validator, restore_api_session,
+    save_device_session, unlock_with_pin,
+};
 use crate::{err_line, out_line};
 pub(crate) async fn cmd_control(cmd: &str) -> anyhow::Result<()> {
     match sshwarden_agent::control::send_control_command(cmd).await {
@@ -201,6 +201,11 @@ pub(crate) async fn lock_vault(
     state.cached_key_tuples.write().await.clear();
     state.local_cache_key_state.write().await.clear();
     state.authorization_memory.write().await.clear();
+    // The user key opens the whole vault. The tokens stay: they are refreshed
+    // while locked, and the next unlock loads the key again (ADR 0028).
+    if let Some(client) = state.api_client.write().await.as_mut() {
+        client.clear_user_key();
+    }
     Ok(())
 }
 
@@ -393,6 +398,24 @@ pub(crate) async fn build_status_response(
     resp
 }
 
+/// What every successful unlock does next: get the Bitwarden session back and
+/// start the sync that waited. A problem with the session goes into the reply.
+async fn after_unlock(
+    mut resp: sshwarden_agent::ControlResponse,
+    state: &DaemonState,
+    agent: &sshwarden_agent::SshWardenAgent,
+    notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
+    notification_client: &mut Option<sshwarden_api::NotificationClient>,
+) -> sshwarden_agent::ControlResponse {
+    if resp.ok {
+        if let Some(hint) = restore_api_session(state, notification_rx, notification_client).await {
+            resp.message = Some(format!("{}\n{hint}", resp.message.unwrap_or_default()));
+        }
+        resolve_pending_sync(state, agent);
+    }
+    resp
+}
+
 /// The `sync` command. The main loop runs it in its own task: the fetch can
 /// wait 30 s on a silent server, and signing must go on meanwhile.
 pub(crate) async fn sync_response(
@@ -493,8 +516,8 @@ pub(crate) async fn handle_control_command(
                 )
                 .await;
                 if resp.ok {
-                    resolve_pending_sync(state, agent);
-                    return resp;
+                    return after_unlock(resp, state, agent, notification_rx, notification_client)
+                        .await;
                 }
                 tracing::warn!("Platform-native local key cache unlock failed");
             }
@@ -516,16 +539,14 @@ pub(crate) async fn handle_control_command(
                             "Vault unlocked via Windows Hello local key cache",
                         )
                         .await;
-                        if resp.ok {
-                            try_restore_api_session_hello(
-                                state,
-                                notification_rx,
-                                notification_client,
-                            )
-                            .await;
-                            resolve_pending_sync(state, agent);
-                        }
-                        return resp;
+                        return after_unlock(
+                            resp,
+                            state,
+                            agent,
+                            notification_rx,
+                            notification_client,
+                        )
+                        .await;
                     }
                     Err(e) => tracing::warn!("Windows Hello local key cache unlock failed: {}", e),
                 }
@@ -553,17 +574,14 @@ pub(crate) async fn handle_control_command(
                         {
                             return sshwarden_agent::ControlResponse::err(&e);
                         }
-                        try_restore_api_session(
+                        return after_unlock(
+                            sshwarden_agent::ControlResponse::ok("Vault unlocked via PIN dialog"),
                             state,
-                            entered_pin,
+                            agent,
                             notification_rx,
                             notification_client,
                         )
                         .await;
-                        resolve_pending_sync(state, agent);
-                        return sshwarden_agent::ControlResponse::ok(
-                            "Vault unlocked via PIN dialog",
-                        );
                     }
                 }
                 return sshwarden_agent::ControlResponse::err(
@@ -596,11 +614,7 @@ pub(crate) async fn handle_control_command(
             )
             .await;
 
-            if resp.ok {
-                resolve_pending_sync(state, agent);
-            }
-
-            resp
+            after_unlock(resp, state, agent, notification_rx, notification_client).await
         }
         ControlAction::UnlockHello => {
             if !state
@@ -627,16 +641,14 @@ pub(crate) async fn handle_control_command(
                                 "Vault unlocked via Windows Hello local key cache",
                             )
                             .await;
-                            if resp.ok {
-                                try_restore_api_session_hello(
-                                    state,
-                                    notification_rx,
-                                    notification_client,
-                                )
-                                .await;
-                                resolve_pending_sync(state, agent);
-                            }
-                            return resp;
+                            return after_unlock(
+                                resp,
+                                state,
+                                agent,
+                                notification_rx,
+                                notification_client,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             tracing::warn!("Windows Hello local key cache unlock failed: {}", e)
@@ -683,11 +695,7 @@ pub(crate) async fn handle_control_command(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            if resp.ok {
-                try_restore_api_session(state, &pin, notification_rx, notification_client).await;
-                resolve_pending_sync(state, agent);
-            }
-            resp
+            after_unlock(resp, state, agent, notification_rx, notification_client).await
         }
         ControlAction::UnlockPassword { password } => {
             let was_locked = state
@@ -753,7 +761,8 @@ pub(crate) async fn handle_control_command(
                         .store(false, std::sync::atomic::Ordering::Relaxed);
 
                     // Save device session + connect notifications
-                    save_device_session(&client, &state.config, None).await;
+                    let local_cache_key = state.local_cache_key_state.read().await.clone_key();
+                    save_device_session(&client, local_cache_key.as_ref()).await;
 
                     if let Some(token) = client.access_token() {
                         connect_notification_client(
@@ -926,12 +935,9 @@ pub(crate) async fn handle_control_command(
                         .set(local_cache_key);
                     info!("Envelope local key cache saved");
 
-                    // Save device session with PIN-encrypted refresh token
-                    {
-                        let client_guard = state.api_client.read().await;
-                        if let Some(ref client) = *client_guard {
-                            save_device_session(client, &state.config, Some(&pin)).await;
-                        }
+                    if let Some(client) = state.api_client.read().await.as_ref() {
+                        let local_cache_key = state.local_cache_key_state.read().await.clone_key();
+                        save_device_session(client, local_cache_key.as_ref()).await;
                     }
 
                     sshwarden_agent::ControlResponse::ok(

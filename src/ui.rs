@@ -143,9 +143,7 @@ pub(crate) async fn handle_ui_request(
                                     .vault_locked
                                     .store(false, std::sync::atomic::Ordering::Relaxed);
                                 info!("Auto-unlocked via native local key cache");
-                                let _ = runtime_event_tx
-                                    .send(RuntimeEvent::AutoUnlockedNative)
-                                    .await;
+                                let _ = runtime_event_tx.send(RuntimeEvent::AutoUnlocked).await;
                                 let approved = run_authorization_prompt(
                                     &request,
                                     key_name,
@@ -201,9 +199,7 @@ pub(crate) async fn handle_ui_request(
                                     .vault_locked
                                     .store(false, std::sync::atomic::Ordering::Relaxed);
                                 info!("Auto-unlocked via Windows Hello envelope");
-                                let _ = runtime_event_tx
-                                    .send(RuntimeEvent::AutoUnlockedWindowsHello)
-                                    .await;
+                                let _ = runtime_event_tx.send(RuntimeEvent::AutoUnlocked).await;
                                 let approved = run_authorization_prompt(
                                     &request,
                                     key_name,
@@ -280,9 +276,7 @@ pub(crate) async fn handle_ui_request(
                             .cloned()
                             .unwrap_or_else(|| "Unknown key".to_string())
                     };
-                    let _ = runtime_event_tx
-                        .send(RuntimeEvent::AutoUnlockedPin { pin })
-                        .await;
+                    let _ = runtime_event_tx.send(RuntimeEvent::AutoUnlocked).await;
                     let approved = run_authorization_prompt(
                         &request,
                         key_name,
@@ -523,11 +517,8 @@ pub(crate) async fn prompt_setup_pin(
         }
     }
 
-    // Save device session with PIN-encrypted refresh token
-    {
-        let client_guard = api_client.read().await;
-        if let Some(ref client) = *client_guard {
-            save_device_session(client, config, Some(&pin)).await;
-        }
+    if let Some(client) = api_client.read().await.as_ref() {
+        let local_cache_key = local_cache_key_state.read().await.clone_key();
+        save_device_session(client, local_cache_key.as_ref()).await;
     }
 }

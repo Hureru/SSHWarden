@@ -11,28 +11,26 @@ use serde::{Deserialize, Serialize};
 /// token/session state. Without multi-device mode it remains in the historical
 /// shared data directory.
 ///
-/// The session file stores an encrypted refresh token that allows the daemon to
-/// restore a Bitwarden API session after a PIN/Hello unlock without requiring
-/// the master password.
+/// The session file lets the daemon get its Bitwarden session back after a
+/// restart or a lock, without the master password (ADR 0028).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionFile {
-    /// File format version (currently 1).
+    /// File format version (currently 2).
     pub version: u32,
     /// Persistent device UUID — unique per machine, stable across restarts.
     pub device_id: String,
-    /// PIN-encrypted Bitwarden refresh_token (type 2 EncString).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pin_encrypted_token: Option<String>,
-    /// Hello-encrypted Bitwarden refresh_token (type 2 EncString).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hello_encrypted_token: Option<String>,
     /// Identity URL used for token refresh (`{base}/identity`).
     pub identity_url: String,
+    /// `{"refresh_token","user_key"}` as a type 2 EncString under the Local
+    /// Cache Key. Absent in a version 1 file, whose PIN- and Hello-encrypted
+    /// tokens are no longer read: that session needs one new `sshwarden login`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lck_encrypted_session: Option<String>,
 }
 
 impl SessionFile {
     /// Supported on-disk format versions for the device session file.
-    const SUPPORTED_VERSIONS: &'static [u32] = &[1];
+    const SUPPORTED_VERSIONS: &'static [u32] = &[1, 2];
 
     /// Path to the current device's session file.
     pub fn path() -> anyhow::Result<PathBuf> {
@@ -130,4 +128,23 @@ fn gethostname() -> Result<String, std::env::VarError> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or(std::env::VarError::NotPresent)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_version_1_file_loads_without_session_secrets() {
+        let v1 =
+            r#"{"version":1,"device_id":"d","pin_encrypted_token":"2.a|b|c","identity_url":"u"}"#;
+        let session: SessionFile = serde_json::from_str(v1).unwrap();
+        assert_eq!(session.device_id, "d");
+        assert!(session.lck_encrypted_session.is_none());
+        // Written back, the old token is gone.
+        assert!(!serde_json::to_string(&session)
+            .unwrap()
+            .contains("pin_encrypted_token"));
+    }
 }

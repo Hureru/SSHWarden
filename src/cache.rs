@@ -263,23 +263,6 @@ pub(crate) fn current_hello_unlock_info(
     }
 }
 
-#[cfg(windows)]
-pub(crate) fn current_hello_challenge_b64() -> Option<String> {
-    let device_challenge = load_device_unlock_slots().and_then(|slots| slots.hello_challenge);
-    if multi_device_mode() {
-        device_challenge
-    } else {
-        device_challenge.or_else(|| {
-            // The Hello challenge lives in the envelope cache
-            // (local-key-cache.json).
-            sshwarden_config::cache::LocalKeyCacheFile::load()
-                .ok()
-                .flatten()
-                .and_then(|cache| cache.local_cache_key.hello_challenge)
-        })
-    }
-}
-
 pub(crate) fn enroll_native_for_local_key_cache(
     cache: &mut sshwarden_config::cache::LocalKeyCacheFile,
     local_cache_key: &sshwarden_api::crypto::SymmetricKey,
