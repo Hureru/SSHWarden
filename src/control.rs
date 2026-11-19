@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::bindings_cli::dispatch_standalone_bind_hosts_dialog;
@@ -22,10 +21,7 @@ use crate::cache::{
 use crate::commands::login::create_client;
 use crate::notifications::connect_notification_client;
 use crate::process::{is_daemon_running, spawn_background_agent};
-use crate::runtime::{
-    AuthorizationMemorySet, CachedKeyTuples, KeyMaterialFingerprints, LocalCacheKeyHandle,
-    NotificationRuntimeState, UIRequestTx,
-};
+use crate::runtime::{DaemonState, UIRequestTx};
 use crate::sshconfig::{sync_managed_ssh_config_with_bindings, write_key_selector_files};
 use crate::sync::{do_sync, reconcile_synced_key_state, resolve_pending_sync};
 #[cfg(windows)]
@@ -198,20 +194,15 @@ pub(crate) async fn cmd_restart() -> anyhow::Result<()> {
 /// in the SSH agent so locked remembered devices remain listable.
 pub(crate) async fn lock_vault(
     agent: &mut sshwarden_agent::SshWardenAgent,
-    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    cached_key_tuples: &CachedKeyTuples,
-    local_cache_key_state: Option<&LocalCacheKeyHandle>,
-    authorization_memory: Option<&AuthorizationMemorySet>,
+    state: &DaemonState,
 ) -> Result<(), anyhow::Error> {
     agent.lock()?;
-    vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
-    cached_key_tuples.write().await.clear();
-    if let Some(state) = local_cache_key_state {
-        state.write().await.clear();
-    }
-    if let Some(memory) = authorization_memory {
-        memory.write().await.clear();
-    }
+    state
+        .vault_locked
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.cached_key_tuples.write().await.clear();
+    state.local_cache_key_state.write().await.clear();
+    state.authorization_memory.write().await.clear();
     Ok(())
 }
 
@@ -273,32 +264,32 @@ pub(crate) fn record_pin_attempt(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_status_response(
     json: bool,
     agent: &sshwarden_agent::SshWardenAgent,
-    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
-    pending_sync: &Arc<std::sync::atomic::AtomicBool>,
-    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
-    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    state: &DaemonState,
 ) -> sshwarden_agent::ControlResponse {
-    let locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
+    let locked = state
+        .vault_locked
+        .load(std::sync::atomic::Ordering::Relaxed);
     let count = agent.key_count();
     let signable = agent.signable_key_count();
     let agent_running = agent.is_running();
     // SEC: PIN availability lives in the v3 local key cache
     // (`local_cache_key.pin_encrypted`).
-    let has_pin = local_key_cache_data
+    let has_pin = state
+        .local_key_cache_data
         .read()
         .await
         .as_ref()
         .map(|c| c.local_cache_key.pin_encrypted.is_some())
         .unwrap_or(false);
-    let has_local_key_cache = local_key_cache_data.read().await.is_some();
-    let authenticated = api_client.read().await.is_some();
-    let pending = pending_sync.load(std::sync::atomic::Ordering::Relaxed);
-    let notification = notification_state.read().await.clone();
+    let has_local_key_cache = state.local_key_cache_data.read().await.is_some();
+    let authenticated = state.api_client.read().await.is_some();
+    let pending = state
+        .pending_sync
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let notification = state.notification_state.read().await.clone();
     // P1-3 / multi-device: surface both the shared Bitwarden-projection
     // directory and this device's runtime/session directory so users can tell
     // exactly which OneDrive files are shared and which are device-local.
@@ -405,26 +396,12 @@ pub(crate) async fn build_status_response(
 }
 
 /// Handle a control command from the IPC channel.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_control_command(
     action: sshwarden_agent::ControlAction,
     agent: &mut sshwarden_agent::SshWardenAgent,
-    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    cached_key_tuples: &CachedKeyTuples,
-    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
-    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
-    local_cache_key_state: &LocalCacheKeyHandle,
-    key_material_fingerprints: &KeyMaterialFingerprints,
-    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
-    config: &Arc<sshwarden_config::Config>,
-    auto_unlock: bool,
-    ui_request_tx: &UIRequestTx,
+    state: &DaemonState,
     notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
     notification_client: &mut Option<sshwarden_api::NotificationClient>,
-    pending_sync: &Arc<std::sync::atomic::AtomicBool>,
-    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
-    authorization_memory: &AuthorizationMemorySet,
-    pin_failures: &PinFailureHandle,
 ) -> sshwarden_agent::ControlResponse {
     use sshwarden_agent::ControlAction;
 
@@ -436,7 +413,7 @@ pub(crate) async fn handle_control_command(
             | ControlAction::UnlockPin { .. }
             | ControlAction::Sync
     ) {
-        reload_shared_local_cache_from_disk_if_multi_device(local_key_cache_data).await;
+        reload_shared_local_cache_from_disk_if_multi_device(&state.local_key_cache_data).await;
     }
 
     match action {
@@ -444,18 +421,13 @@ pub(crate) async fn handle_control_command(
         // to run the cancel-token cleanup); this arm is only defensive.
         ControlAction::Stop => sshwarden_agent::ControlResponse::ok("Stopping agent"),
         ControlAction::Lock => {
-            if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+            if state
+                .vault_locked
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 sshwarden_agent::ControlResponse::ok("Vault is already locked")
             } else {
-                match lock_vault(
-                    agent,
-                    vault_locked,
-                    cached_key_tuples,
-                    Some(local_cache_key_state),
-                    Some(authorization_memory),
-                )
-                .await
-                {
+                match lock_vault(agent, state).await {
                     Ok(()) => {
                         info!("Vault locked via control command");
                         sshwarden_agent::ControlResponse::ok("Vault locked")
@@ -467,38 +439,25 @@ pub(crate) async fn handle_control_command(
             }
         }
         ControlAction::Unlock => {
-            if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+            if !state
+                .vault_locked
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
 
             // Try platform-native Local Key Cache first, then Windows Hello.
             #[cfg(not(windows))]
-            if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
+            if let Some(cache) = state.local_key_cache_data.read().await.as_ref().cloned() {
                 let resp = finish_native_unlock_response(
                     cache,
                     agent,
-                    vault_locked,
-                    cached_key_tuples,
-                    key_names,
-                    local_cache_key_state,
+                    state,
                     "Vault unlocked via platform-native local key cache",
                 )
                 .await;
                 if resp.ok {
-                    resolve_pending_sync(
-                        pending_sync,
-                        api_client,
-                        cached_key_tuples,
-                        local_key_cache_data,
-                        local_cache_key_state,
-                        authorization_memory,
-                        key_material_fingerprints,
-                        vault_locked,
-                        agent,
-                        key_names,
-                        notification_state,
-                    )
-                    .await;
+                    resolve_pending_sync(state, agent).await;
                     return resp;
                 }
                 tracing::warn!("Platform-native local key cache unlock failed");
@@ -506,42 +465,29 @@ pub(crate) async fn handle_control_command(
 
             // Try envelope Local Key Cache Windows Hello.
             #[cfg(windows)]
-            if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
+            if let Some(cache) = state.local_key_cache_data.read().await.as_ref().cloned() {
                 match decrypt_envelope_local_key_cache_with_hello(&cache) {
                     Ok((keys_json, local_cache_key)) => {
-                        local_cache_key_state.write().await.set(local_cache_key);
+                        state
+                            .local_cache_key_state
+                            .write()
+                            .await
+                            .set(local_cache_key);
                         let resp = finish_unlock_with_json(
                             &keys_json,
                             agent,
-                            vault_locked,
-                            cached_key_tuples,
-                            key_names,
+                            state,
                             "Vault unlocked via Windows Hello local key cache",
                         )
                         .await;
                         if resp.ok {
                             try_restore_api_session_hello(
-                                api_client,
-                                config,
+                                state,
                                 notification_rx,
                                 notification_client,
-                                notification_state,
                             )
                             .await;
-                            resolve_pending_sync(
-                                pending_sync,
-                                api_client,
-                                cached_key_tuples,
-                                local_key_cache_data,
-                                local_cache_key_state,
-                                authorization_memory,
-                                key_material_fingerprints,
-                                vault_locked,
-                                agent,
-                                key_names,
-                                notification_state,
-                            )
-                            .await;
+                            resolve_pending_sync(state, agent).await;
                         }
                         return resp;
                     }
@@ -550,10 +496,10 @@ pub(crate) async fn handle_control_command(
             }
 
             // Fall back to the PIN dialog (v3 local key cache only).
-            if auto_unlock {
+            if state.config.unlock.auto_unlock_on_request {
                 info!("Trying PIN dialog fallback");
                 let envelope_cache = {
-                    let guard = local_key_cache_data.read().await;
+                    let guard = state.local_key_cache_data.read().await;
                     guard
                         .as_ref()
                         .filter(|c| c.local_cache_key.pin_encrypted.is_some())
@@ -585,9 +531,10 @@ pub(crate) async fn handle_control_command(
                 if let Some((validator, decrypted_cache, lck_holder)) = validator_parts {
                     // SEC-03: share the daemon-wide PIN brute-force lockout with
                     // `unlock --pin` so dialog attempts can't bypass the cap.
-                    let validator = gate_pin_validator(validator, pin_failures);
+                    let validator = gate_pin_validator(validator, &state.pin_failures);
                     let pin_result =
-                        sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator).await;
+                        sshwarden_ui::unlock::request_pin_dialog(&state.ui_request_tx, validator)
+                            .await;
 
                     if let Some(ref entered_pin) = pin_result {
                         let keys_json = match decrypted_cache
@@ -610,43 +557,26 @@ pub(crate) async fn handle_control_command(
                         if let Some(kh) = lck_holder {
                             let maybe_lck = kh.lock().unwrap_or_else(|e| e.into_inner()).take();
                             if let Some(lck) = maybe_lck {
-                                local_cache_key_state.write().await.set(lck);
+                                state.local_cache_key_state.write().await.set(lck);
                             }
                         }
                         let resp = finish_unlock_with_json(
                             &keys_json,
                             agent,
-                            vault_locked,
-                            cached_key_tuples,
-                            key_names,
+                            state,
                             "Vault unlocked via PIN dialog",
                         )
                         .await;
 
                         if resp.ok {
                             try_restore_api_session(
-                                api_client,
-                                config,
+                                state,
                                 entered_pin,
                                 notification_rx,
                                 notification_client,
-                                notification_state,
                             )
                             .await;
-                            resolve_pending_sync(
-                                pending_sync,
-                                api_client,
-                                cached_key_tuples,
-                                local_key_cache_data,
-                                local_cache_key_state,
-                                authorization_memory,
-                                key_material_fingerprints,
-                                vault_locked,
-                                agent,
-                                key_names,
-                                notification_state,
-                            )
-                            .await;
+                            resolve_pending_sync(state, agent).await;
                         }
 
                         return resp;
@@ -662,11 +592,14 @@ pub(crate) async fn handle_control_command(
             )
         }
         ControlAction::UnlockNative => {
-            if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+            if !state
+                .vault_locked
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
 
-            let cache = match local_key_cache_data.read().await.as_ref().cloned() {
+            let cache = match state.local_key_cache_data.read().await.as_ref().cloned() {
                 Some(cache) => cache,
                 None => return sshwarden_agent::ControlResponse::err("No Local Key Cache found"),
             };
@@ -674,76 +607,50 @@ pub(crate) async fn handle_control_command(
             let resp = finish_native_unlock_response(
                 cache,
                 agent,
-                vault_locked,
-                cached_key_tuples,
-                key_names,
-                local_cache_key_state,
+                state,
                 "Vault unlocked via platform-native local key cache",
             )
             .await;
 
             if resp.ok {
-                resolve_pending_sync(
-                    pending_sync,
-                    api_client,
-                    cached_key_tuples,
-                    local_key_cache_data,
-                    local_cache_key_state,
-                    authorization_memory,
-                    key_material_fingerprints,
-                    vault_locked,
-                    agent,
-                    key_names,
-                    notification_state,
-                )
-                .await;
+                resolve_pending_sync(state, agent).await;
             }
 
             resp
         }
         ControlAction::UnlockHello => {
-            if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+            if !state
+                .vault_locked
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
 
             #[cfg(windows)]
             {
-                if let Some(cache) = local_key_cache_data.read().await.as_ref().cloned() {
+                if let Some(cache) = state.local_key_cache_data.read().await.as_ref().cloned() {
                     match decrypt_envelope_local_key_cache_with_hello(&cache) {
                         Ok((keys_json, local_cache_key)) => {
-                            local_cache_key_state.write().await.set(local_cache_key);
+                            state
+                                .local_cache_key_state
+                                .write()
+                                .await
+                                .set(local_cache_key);
                             let resp = finish_unlock_with_json(
                                 &keys_json,
                                 agent,
-                                vault_locked,
-                                cached_key_tuples,
-                                key_names,
+                                state,
                                 "Vault unlocked via Windows Hello local key cache",
                             )
                             .await;
                             if resp.ok {
                                 try_restore_api_session_hello(
-                                    api_client,
-                                    config,
+                                    state,
                                     notification_rx,
                                     notification_client,
-                                    notification_state,
                                 )
                                 .await;
-                                resolve_pending_sync(
-                                    pending_sync,
-                                    api_client,
-                                    cached_key_tuples,
-                                    local_key_cache_data,
-                                    local_cache_key_state,
-                                    authorization_memory,
-                                    key_material_fingerprints,
-                                    vault_locked,
-                                    agent,
-                                    key_names,
-                                    notification_state,
-                                )
-                                .await;
+                                resolve_pending_sync(state, agent).await;
                             }
                             return resp;
                         }
@@ -761,26 +668,18 @@ pub(crate) async fn handle_control_command(
             #[cfg(not(windows))]
             sshwarden_agent::ControlResponse::err("Windows Hello is only supported on Windows")
         }
-        ControlAction::Status { json } => {
-            build_status_response(
-                json,
-                agent,
-                vault_locked,
-                api_client,
-                pending_sync,
-                notification_state,
-                local_key_cache_data,
-            )
-            .await
-        }
+        ControlAction::Status { json } => build_status_response(json, agent, state).await,
         ControlAction::UnlockPin { pin } => {
-            if !vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+            if !state
+                .vault_locked
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 return sshwarden_agent::ControlResponse::ok("Vault is already unlocked");
             }
 
             // SEC-03: reject outright while a brute-force lockout is active (no
             // Argon2 work performed) so the control channel can't be hammered.
-            if let Some(wait) = pin_lockout_remaining(pin_failures) {
+            if let Some(wait) = pin_lockout_remaining(&state.pin_failures) {
                 return sshwarden_agent::ControlResponse::err(&format!(
                     "Too many failed PIN attempts; locked for {}s",
                     wait.as_secs() + 1
@@ -790,7 +689,7 @@ pub(crate) async fn handle_control_command(
             let resp = 'unlock: {
                 // Bind to a local first so the read guard is released at the end of
                 // this statement, before the `write().await` on the same lock below.
-                let cache_opt = local_key_cache_data.read().await.as_ref().cloned();
+                let cache_opt = state.local_key_cache_data.read().await.as_ref().cloned();
                 if let Some(cache) = cache_opt {
                     match decrypt_envelope_local_key_cache_with_pin(&cache, &pin) {
                         Ok((keys_json, local_cache_key)) => {
@@ -800,7 +699,7 @@ pub(crate) async fn handle_control_command(
                             if needs_pin_salt_migration(&cache) {
                                 match migrate_pin_salt_to_v3(&cache, &local_cache_key, &pin) {
                                     Ok(migrated) => {
-                                        *local_key_cache_data.write().await = Some(migrated);
+                                        *state.local_key_cache_data.write().await = Some(migrated);
                                         info!(
                                             "Migrated local key cache PIN slot to v3 (random salt)"
                                         );
@@ -818,41 +717,28 @@ pub(crate) async fn handle_control_command(
                             // stripped of platform slots. No-op in single-device mode
                             // or when a slot already exists.
                             enroll_device_platform_slots_if_missing(&local_cache_key);
-                            local_cache_key_state.write().await.set(local_cache_key);
+                            state
+                                .local_cache_key_state
+                                .write()
+                                .await
+                                .set(local_cache_key);
                             let resp = finish_unlock_with_json(
                                 &keys_json,
                                 agent,
-                                vault_locked,
-                                cached_key_tuples,
-                                key_names,
+                                state,
                                 "Vault unlocked via PIN local key cache",
                             )
                             .await;
 
                             if resp.ok {
                                 try_restore_api_session(
-                                    api_client,
-                                    config,
+                                    state,
                                     &pin,
                                     notification_rx,
                                     notification_client,
-                                    notification_state,
                                 )
                                 .await;
-                                resolve_pending_sync(
-                                    pending_sync,
-                                    api_client,
-                                    cached_key_tuples,
-                                    local_key_cache_data,
-                                    local_cache_key_state,
-                                    authorization_memory,
-                                    key_material_fingerprints,
-                                    vault_locked,
-                                    agent,
-                                    key_names,
-                                    notification_state,
-                                )
-                                .await;
+                                resolve_pending_sync(state, agent).await;
                             }
 
                             break 'unlock resp;
@@ -871,17 +757,19 @@ pub(crate) async fn handle_control_command(
 
             // SEC-03: record the outcome — reset on success, otherwise apply an
             // escalating delay and arm a lockout once the threshold is reached.
-            let delay = record_pin_attempt(pin_failures, resp.ok);
+            let delay = record_pin_attempt(&state.pin_failures, resp.ok);
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
             resp
         }
         ControlAction::UnlockPassword { password } => {
-            let was_locked = vault_locked.load(std::sync::atomic::Ordering::Relaxed);
+            let was_locked = state
+                .vault_locked
+                .load(std::sync::atomic::Ordering::Relaxed);
 
-            // Email from config (used for re-login).
-            let email = config.auth.email.clone();
+            // Email from &state.config (used for re-login).
+            let email = state.config.auth.email.clone();
 
             if email.is_empty() {
                 return sshwarden_agent::ControlResponse::err(
@@ -889,7 +777,7 @@ pub(crate) async fn handle_control_command(
                 );
             }
 
-            let mut client = create_client(config.as_ref(), None);
+            let mut client = create_client(state.config.as_ref(), None);
             match client.login_password(&email, &password).await {
                 Ok(()) => {}
                 Err(e) => {
@@ -917,20 +805,11 @@ pub(crate) async fn handle_control_command(
                     if let Err(e) = sync_managed_ssh_config_with_bindings(&keys) {
                         tracing::warn!("Failed to sync managed SSH config: {}", e);
                     }
-                    reconcile_synced_key_state(
-                        &key_tuples,
-                        cached_key_tuples,
-                        local_key_cache_data,
-                        local_cache_key_state,
-                        authorization_memory,
-                        key_material_fingerprints,
-                        notification_state,
-                    )
-                    .await;
+                    reconcile_synced_key_state(&key_tuples, state).await;
 
-                    // Update key_names
+                    // Update &state.key_names
                     {
-                        let mut names = key_names.write().await;
+                        let mut names = state.key_names.write().await;
                         names.clear();
                         for k in &keys {
                             names.insert(k.cipher_id.clone(), k.name.clone());
@@ -943,38 +822,27 @@ pub(crate) async fn handle_control_command(
                             e
                         ));
                     }
-                    vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
+                    state
+                        .vault_locked
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
 
                     // Save device session + connect notifications
-                    save_device_session(&client, config, None).await;
+                    save_device_session(&client, &state.config, None).await;
 
                     if let Some(token) = client.access_token() {
                         connect_notification_client(
-                            config,
+                            &state.config,
                             Some(&client),
                             token,
                             notification_rx,
                             notification_client,
-                            notification_state,
+                            &state.notification_state,
                         )
                         .await;
                     }
 
-                    *api_client.write().await = Some(client);
-                    resolve_pending_sync(
-                        pending_sync,
-                        api_client,
-                        cached_key_tuples,
-                        local_key_cache_data,
-                        local_cache_key_state,
-                        authorization_memory,
-                        key_material_fingerprints,
-                        vault_locked,
-                        agent,
-                        key_names,
-                        notification_state,
-                    )
-                    .await;
+                    *state.api_client.write().await = Some(client);
+                    resolve_pending_sync(state, agent).await;
 
                     let message = if was_locked {
                         format!("Vault unlocked, {} SSH keys loaded", count)
@@ -993,8 +861,13 @@ pub(crate) async fn handle_control_command(
         ControlAction::Sync => {
             // Locked means nothing is pulled or decrypted (ADR 0009): the sync
             // waits as a Pending Sync, and the next unlock runs it.
-            if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
-                pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+            if state
+                .vault_locked
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                state
+                    .pending_sync
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 return sshwarden_agent::ControlResponse::ok(
                     "Vault is locked; sync will run on next unlock",
                 );
@@ -1008,31 +881,11 @@ pub(crate) async fn handle_control_command(
                 // Cache Key in memory, a plain sync would update the live agent but
                 // leave `sshwarden keys` showing the old cache header. Prompt for
                 // PIN first so the synced key set can be persisted atomically.
-                if let Err(e) = ensure_local_cache_key_for_manual_sync(
-                    local_key_cache_data,
-                    local_cache_key_state,
-                    ui_request_tx,
-                    pin_failures,
-                )
-                .await
-                {
+                if let Err(e) = ensure_local_cache_key_for_manual_sync(state).await {
                     return sshwarden_agent::ControlResponse::err(&e);
                 }
             }
-            match do_sync(
-                api_client,
-                cached_key_tuples,
-                local_key_cache_data,
-                local_cache_key_state,
-                authorization_memory,
-                key_material_fingerprints,
-                vault_locked,
-                agent,
-                key_names,
-                notification_state,
-            )
-            .await
-            {
+            match do_sync(state, agent).await {
                 Ok(count) => {
                     sshwarden_agent::ControlResponse::ok(&format!("Synced {count} SSH keys"))
                 }
@@ -1053,7 +906,8 @@ pub(crate) async fn handle_control_command(
                 }
             }
 
-            let native_slot = local_key_cache_data
+            let native_slot = &state
+                .local_key_cache_data
                 .read()
                 .await
                 .as_ref()
@@ -1073,24 +927,28 @@ pub(crate) async fn handle_control_command(
                 failures.push(format!("device session file ({e})"));
             }
 
-            local_cache_key_state.write().await.clear();
-            authorization_memory.write().await.clear();
-            cached_key_tuples.write().await.clear();
-            *api_client.write().await = None;
-            pending_sync.store(false, std::sync::atomic::Ordering::Relaxed);
+            state.local_cache_key_state.write().await.clear();
+            state.authorization_memory.write().await.clear();
+            state.cached_key_tuples.write().await.clear();
+            *state.api_client.write().await = None;
+            state
+                .pending_sync
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             if let Some(client) = notification_client.take() {
                 client.stop();
             }
             // Full reset rather than clearing one field: the client is gone, so
             // every field (state, url, counters, last error) would otherwise
             // describe a connection that no longer exists.
-            notification_state.write().await.reset();
+            state.notification_state.write().await.reset();
             *notification_rx = None;
-            vault_locked.store(true, std::sync::atomic::Ordering::Relaxed);
+            state
+                .vault_locked
+                .store(true, std::sync::atomic::Ordering::Relaxed);
 
             if remove_shared_cache {
-                *local_key_cache_data.write().await = None;
-                key_names.write().await.clear();
+                *state.local_key_cache_data.write().await = None;
+                state.key_names.write().await.clear();
                 let _ = agent.clear_keys();
             } else {
                 // Multi-device plain `forget` is device-only: remove this
@@ -1099,11 +957,11 @@ pub(crate) async fn handle_control_command(
                 let cache = sshwarden_config::cache::LocalKeyCacheFile::load()
                     .ok()
                     .flatten();
-                *local_key_cache_data.write().await = cache.clone();
+                *state.local_key_cache_data.write().await = cache.clone();
                 // Clear unconditionally (mirroring the shared-cache branch): if the
                 // shared cache fails to reload below, stale labels from the
                 // just-forgotten session must not linger in memory.
-                key_names.write().await.clear();
+                state.key_names.write().await.clear();
                 let _ = agent.clear_keys();
                 if let Some(cache) = cache {
                     let identities = key_tuples_from_cache_header(&cache);
@@ -1113,7 +971,7 @@ pub(crate) async fn handle_control_command(
                             e
                         );
                     }
-                    let mut names = key_names.write().await;
+                    let mut names = state.key_names.write().await;
                     for (_, name, vault_item_id) in identities {
                         names.insert(vault_item_id, name);
                     }
@@ -1140,15 +998,15 @@ pub(crate) async fn handle_control_command(
                 return sshwarden_agent::ControlResponse::err("PIN must be at least 4 characters");
             }
 
-            let keys = cached_key_tuples.read().await.clone_inner();
+            let keys = state.cached_key_tuples.read().await.clone_inner();
             if keys.is_empty() {
                 return sshwarden_agent::ControlResponse::err("No keys loaded. Login first.");
             }
 
-            let email = config.auth.email.clone();
-            let server_url = config.server.base_url.clone();
+            let email = state.config.auth.email.clone();
+            let server_url = state.config.server.base_url.clone();
 
-            let local_cache_key = local_cache_key_state.read().await.clone_key();
+            let local_cache_key = state.local_cache_key_state.read().await.clone_key();
             let cache_write_result = match local_cache_key {
                 Some(local_cache_key) => write_envelope_local_key_cache_with_key(
                     &keys,
@@ -1162,15 +1020,19 @@ pub(crate) async fn handle_control_command(
 
             match cache_write_result {
                 Ok((cache, local_cache_key)) => {
-                    *local_key_cache_data.write().await = Some(cache);
-                    local_cache_key_state.write().await.set(local_cache_key);
+                    *state.local_key_cache_data.write().await = Some(cache);
+                    state
+                        .local_cache_key_state
+                        .write()
+                        .await
+                        .set(local_cache_key);
                     info!("Envelope local key cache saved");
 
                     // Save device session with PIN-encrypted refresh token
                     {
-                        let client_guard = api_client.read().await;
+                        let client_guard = state.api_client.read().await;
                         if let Some(ref client) = *client_guard {
-                            save_device_session(client, config, Some(&pin)).await;
+                            save_device_session(client, &state.config, Some(&pin)).await;
                         }
                     }
 
@@ -1185,7 +1047,7 @@ pub(crate) async fn handle_control_command(
             }
         }
         // The daemon loop runs this one in its own task; kept for the match.
-        ControlAction::BindHostsDialog => bind_hosts_dialog_response(ui_request_tx).await,
+        ControlAction::BindHostsDialog => bind_hosts_dialog_response(&state.ui_request_tx).await,
     }
 }
 

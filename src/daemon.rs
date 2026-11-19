@@ -17,9 +17,9 @@ use crate::commands::login::prompt_email;
 use crate::control::{handle_control_command, lock_vault, PinFailureHandle, PinFailureState};
 use crate::notifications::connect_notification_client;
 use crate::runtime::{
-    AuthorizationMemorySet, CachedKeyTuples, KeyMaterialFingerprints, LocalCacheKeyHandle,
-    LocalCacheKeyState, NotificationConnectionState, NotificationRuntimeState, RuntimeEvent,
-    SecureKeyCache, UIRequestTx,
+    AuthorizationMemorySet, CachedKeyTuples, DaemonState, KeyMaterialFingerprints,
+    LocalCacheKeyHandle, LocalCacheKeyState, NotificationConnectionState, NotificationRuntimeState,
+    RuntimeEvent, SecureKeyCache, UIRequestTx,
 };
 use crate::sshconfig::{sync_managed_ssh_config_with_bindings, write_key_selector_files};
 use crate::sync::{do_sync, resolve_pending_sync};
@@ -275,7 +275,6 @@ pub(crate) async fn run_foreground(
 
     // Main loop configuration
     let prompt_behavior = config.agent.prompt_behavior;
-    let auto_unlock = config.unlock.auto_unlock_on_request;
     let lock_timeout = config.agent.lock_timeout;
     let config = Arc::new(config);
     // Wall-clock time, so the hours a machine sleeps count as idle.
@@ -314,6 +313,22 @@ pub(crate) async fn run_foreground(
         }
     }
 
+    let state = DaemonState {
+        config,
+        vault_locked,
+        pending_sync,
+        cached_key_tuples,
+        key_names,
+        key_material_fingerprints,
+        api_client,
+        local_key_cache_data,
+        local_cache_key_state,
+        authorization_memory,
+        notification_state,
+        pin_failures,
+        ui_request_tx,
+    };
+
     loop {
         tokio::select! {
             // Control commands from IPC
@@ -334,7 +349,7 @@ pub(crate) async fn run_foreground(
                     ctrl_req.action,
                     sshwarden_agent::ControlAction::BindHostsDialog
                 ) {
-                    let ui_request_tx = ui_request_tx.clone();
+                    let ui_request_tx = state.ui_request_tx.clone();
                     tokio::spawn(async move {
                         let response =
                             crate::control::bind_hosts_dialog_response(&ui_request_tx).await;
@@ -353,28 +368,8 @@ pub(crate) async fn run_foreground(
                 let response = run_control_action(
                     label,
                     budget,
-                    handle_control_command(
-                        ctrl_req.action,
-                        &mut agent,
-                        &vault_locked,
-                        &cached_key_tuples,
-                        &api_client,
-                        &local_key_cache_data,
-                        &local_cache_key_state,
-                        &key_material_fingerprints,
-                        &key_names,
-                        &config,
-                        auto_unlock,
-                        &ui_request_tx,
-                        &mut notification_rx,
-                        &mut _notification_client,
-                        &pending_sync,
-                        &notification_state,
-                        &authorization_memory,
-                        &pin_failures,
-                    ),
-                )
-                .await;
+                    handle_control_command(ctrl_req.action, &mut agent, &state, &mut notification_rx, &mut _notification_client),
+                ).await;
                 // Stamped when the action ends: an unlock can wait on a PIN
                 // window for longer than the lock timeout.
                 if is_activity {
@@ -392,37 +387,21 @@ pub(crate) async fn run_foreground(
                 let in_flight_done = in_flight_prompts.clone();
 
                 // Spawn a task to handle each request so we don't block the main loop
-                let response_tx_clone = (*response_tx).clone();
-                let vault_locked_clone = vault_locked.clone();
-                let cached_keys_clone = cached_key_tuples.clone();
-                let agent_clone = agent.clone();
-                let key_names_clone = key_names.clone();
-                let local_key_cache_clone = local_key_cache_data.clone();
-                let local_cache_key_state_clone = local_cache_key_state.clone();
-                let runtime_event_tx_clone = runtime_event_tx.clone();
-                let authorization_memory_clone = authorization_memory.clone();
-                let pin_failures_clone = pin_failures.clone();
-                let key_selector_clone = key_selector.clone();
-
-                let ui_tx_clone = ui_request_tx.clone();
+                let response_tx = (*response_tx).clone();
+                let agent = agent.clone();
+                let state = state.clone();
+                let runtime_event_tx = runtime_event_tx.clone();
+                let key_selector = key_selector.clone();
 
                 tokio::spawn(async move {
                     handle_ui_request(
                         request,
-                        response_tx_clone,
-                        vault_locked_clone,
-                        cached_keys_clone,
-                        agent_clone,
-                        key_names_clone,
-                        local_key_cache_clone,
-                        local_cache_key_state_clone,
+                        response_tx,
+                        agent,
+                        state,
                         prompt_behavior,
-                        auto_unlock,
-                        ui_tx_clone,
-                        runtime_event_tx_clone,
-                        authorization_memory_clone,
-                        pin_failures_clone,
-                        key_selector_clone,
+                        runtime_event_tx,
+                        key_selector,
                     ).await;
                     in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 });
@@ -435,73 +414,19 @@ pub(crate) async fn run_foreground(
                 match event {
                     #[cfg(windows)]
                     RuntimeEvent::AutoUnlockedWindowsHello => {
-                        try_restore_api_session_hello(
-                            &api_client,
-                            &config,
-                            &mut notification_rx,
-                            &mut _notification_client,
-                            &notification_state,
-                        )
-                        .await;
-                        resolve_pending_sync(
-                            &pending_sync,
-                            &api_client,
-                            &cached_key_tuples,
-                            &local_key_cache_data,
-                            &local_cache_key_state,
-                            &authorization_memory,
-                            &key_material_fingerprints,
-                            &vault_locked,
-                            &mut agent,
-                            &key_names,
-                            &notification_state,
-                        )
-                        .await;
+                        try_restore_api_session_hello(&state, &mut notification_rx, &mut _notification_client).await;
+                        resolve_pending_sync(&state, &mut agent).await;
                     }
                     RuntimeEvent::AutoUnlockedPin { pin } => {
-                        try_restore_api_session(
-                            &api_client,
-                            &config,
-                            &pin,
-                            &mut notification_rx,
-                            &mut _notification_client,
-                            &notification_state,
-                        )
-                        .await;
-                        resolve_pending_sync(
-                            &pending_sync,
-                            &api_client,
-                            &cached_key_tuples,
-                            &local_key_cache_data,
-                            &local_cache_key_state,
-                            &authorization_memory,
-                            &key_material_fingerprints,
-                            &vault_locked,
-                            &mut agent,
-                            &key_names,
-                            &notification_state,
-                        )
-                        .await;
+                        try_restore_api_session(&state, &pin, &mut notification_rx, &mut _notification_client).await;
+                        resolve_pending_sync(&state, &mut agent).await;
                     }
                     RuntimeEvent::AutoUnlockedNative => {
                         // Native (Keychain / Secret Service / DPAPI) unlock cannot
                         // currently restore an API session — SessionFile has no
                         // native_encrypted_token slot — so we only resolve any
                         // sync that was deferred while the vault was locked.
-                        resolve_pending_sync(
-                            &pending_sync,
-                            &api_client,
-                            &cached_key_tuples,
-                            &local_key_cache_data,
-                            &local_cache_key_state,
-                            &authorization_memory,
-                            &key_material_fingerprints,
-                            &vault_locked,
-                            &mut agent,
-                            &key_names,
-                            &notification_state,
-                        )
-                        .await;
+                        resolve_pending_sync(&state, &mut agent).await;
                     }
                 }
             }
@@ -514,47 +439,47 @@ pub(crate) async fn run_foreground(
             } => {
                 match event {
                     sshwarden_api::SyncEvent::ConnectionStatus(status) => {
-                        notification_state.write().await.apply_status(&status);
+                        state.notification_state.write().await.apply_status(&status);
                     }
                     sshwarden_api::SyncEvent::CipherChanged => {
-                        if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
-                            pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if state.vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+                            state.pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
                             // Count it as delivered: "no events for a while" must
                             // mean "no events", not "no processed events".
-                            notification_state.write().await.record_event();
+                            state.notification_state.write().await.record_event();
                             info!("Notification: cipher changed while locked; sync pending until unlock");
                         } else {
                             info!("Notification: cipher changed, syncing...");
-                            match do_sync(&api_client, &cached_key_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
+                            match do_sync(&state, &mut agent).await {
                                 Ok(count) => {
-                                    notification_state.write().await.last_event_at = Some(std::time::Instant::now());
+                                    state.notification_state.write().await.last_event_at = Some(std::time::Instant::now());
                                     info!("Auto-synced: {} SSH keys", count)
                                 },
                                 Err(e) => {
-                                    pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    state.pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!("Auto-sync failed: {}; sync remains pending", e);
                                 }
                             }
                         }
                     }
                     sshwarden_api::SyncEvent::LogOut => {
-                        notification_state.write().await.record_event();
+                        state.notification_state.write().await.record_event();
                         info!("Notification: remote logout");
-                        let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, Some(&local_cache_key_state), Some(&authorization_memory)).await;
+                        let _ = lock_vault(&mut agent, &state).await;
                     }
                     sshwarden_api::SyncEvent::FallbackSyncDue => {
-                        if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
-                            pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if state.vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+                            state.pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
                             info!("Notification degraded while locked; sync pending until unlock");
                         } else {
                             info!("Notification degraded or reconnected, running fallback sync...");
-                            match do_sync(&api_client, &cached_key_tuples, &local_key_cache_data, &local_cache_key_state, &authorization_memory, &key_material_fingerprints, &vault_locked, &mut agent, &key_names, &notification_state).await {
+                            match do_sync(&state, &mut agent).await {
                                 Ok(count) => {
-                                    notification_state.write().await.record_fallback_sync();
+                                    state.notification_state.write().await.record_fallback_sync();
                                     info!("Fallback-synced: {} SSH keys", count)
                                 },
                                 Err(e) => {
-                                    pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    state.pending_sync.store(true, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!("Fallback sync failed: {}; sync remains pending", e);
                                 }
                             }
@@ -564,22 +489,22 @@ pub(crate) async fn run_foreground(
             }
             // Token auto-refresh
             _ = token_refresh_interval.tick() => {
-                let mut client_guard = api_client.write().await;
+                let mut client_guard = state.api_client.write().await;
                 if let Some(ref mut client) = *client_guard {
                     if client.is_token_expiring_soon() {
                         match client.refresh_access_token().await {
                             Ok(()) => {
                                 info!("Access token refreshed");
                                 // Update session file with new refresh token
-                                save_device_session(client, &config, None).await;
+                                save_device_session(client, &state.config, None).await;
                                 if let Some(token) = client.access_token().map(str::to_string) {
                                     connect_notification_client(
-                                        &config,
+                                        &state.config,
                                         Some(&*client),
                                         &token,
                                         &mut notification_rx,
                                         &mut _notification_client,
-                                        &notification_state,
+                                        &state.notification_state,
                                     ).await;
                                 }
                             }
@@ -599,12 +524,12 @@ pub(crate) async fn run_foreground(
                 });
                 if should_auto_lock(
                     lock_timeout,
-                    vault_locked.load(std::sync::atomic::Ordering::Relaxed),
+                    state.vault_locked.load(std::sync::atomic::Ordering::Relaxed),
                     in_flight_prompts.load(std::sync::atomic::Ordering::Relaxed),
                     idle_secs,
                 ) {
                     info!("Auto-locking vault due to inactivity ({} seconds)", lock_timeout);
-                    let _ = lock_vault(&mut agent, &vault_locked, &cached_key_tuples, Some(&local_cache_key_state), Some(&authorization_memory)).await;
+                    let _ = lock_vault(&mut agent, &state).await;
                 }
             }
             // SSH agent transport failed (e.g. could not claim the OpenSSH pipe).
@@ -630,7 +555,7 @@ pub(crate) async fn run_foreground(
     }
 
     cancel_token.cancel();
-    notification_state.write().await.state = NotificationConnectionState::Stopped;
+    state.notification_state.write().await.state = NotificationConnectionState::Stopped;
     agent.stop();
     info!("SSHWarden stopped.");
     Ok(())

@@ -17,9 +17,8 @@ use crate::cache::{
     write_envelope_local_key_cache,
 };
 use crate::commands::login::{create_client, prompt_password};
-use crate::control::PinFailureHandle;
 use crate::runtime::{
-    AuthorizationMemorySet, CachedKeyTuples, LocalCacheKeyHandle, RuntimeEvent, UIRequestTx,
+    CachedKeyTuples, DaemonState, LocalCacheKeyHandle, RuntimeEvent, UIRequestTx,
 };
 use crate::unlock::{gate_pin_validator, save_device_session, DecryptedCache, PinValidator};
 /// Resolve the human-friendly key name for an SSH UI request, given the
@@ -94,29 +93,23 @@ pub(crate) async fn run_authorization_prompt(
 }
 
 /// Handle a single UI request from the SSH agent (runs in a spawned task).
-#[allow(clippy::too_many_arguments)]
-#[allow(unused_variables)]
 pub(crate) async fn handle_ui_request(
     request: sshwarden_agent::SshAgentUIRequest,
     response_tx: tokio::sync::broadcast::Sender<(u32, bool)>,
-    vault_locked: Arc<std::sync::atomic::AtomicBool>,
-    cached_key_tuples: CachedKeyTuples,
     agent: sshwarden_agent::SshWardenAgent,
-    key_names: Arc<RwLock<std::collections::HashMap<String, String>>>,
-    local_key_cache_data: Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
-    local_cache_key_state: LocalCacheKeyHandle,
+    state: DaemonState,
     prompt_behavior: sshwarden_config::PromptBehavior,
-    auto_unlock: bool,
-    ui_request_tx: UIRequestTx,
     runtime_event_tx: tokio::sync::mpsc::Sender<RuntimeEvent>,
-    authorization_memory: AuthorizationMemorySet,
-    pin_failures: PinFailureHandle,
     key_selector: Arc<crate::key_select::KeySelector>,
 ) {
     key_selector.record_use(&request);
 
     // Check if vault is locked; if so, try to unlock
-    if vault_locked.load(std::sync::atomic::Ordering::Relaxed) && auto_unlock {
+    if state
+        .vault_locked
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && state.config.unlock.auto_unlock_on_request
+    {
         info!(
             request_id = request.request_id,
             "Vault is locked, attempting auto-unlock"
@@ -125,7 +118,7 @@ pub(crate) async fn handle_ui_request(
         // 1. Native envelope unlock (platform Keychain / Secret Service / DPAPI).
         //    No UI prompt; if the slot is present and unlock succeeds, use it.
         {
-            let cache_opt = local_key_cache_data.read().await.clone();
+            let cache_opt = state.local_key_cache_data.read().await.clone();
             if let Some(cache) = cache_opt.filter(|c| current_native_unlock_slot(c).is_some()) {
                 let cache_for_unlock = cache.clone();
                 let native_result = tokio::task::spawn_blocking(move || {
@@ -138,11 +131,18 @@ pub(crate) async fn handle_ui_request(
                             serde_json::from_str(&keys_json).map(crate::runtime::KeyTuples::new)
                         {
                             let key_name = key_name_for_request(&request, &keys);
-                            apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
+                            apply_decrypted_keys_state(
+                                &state.key_names,
+                                &state.cached_key_tuples,
+                                &keys,
+                            )
+                            .await;
                             let mut agent_for_unlock = agent.clone();
                             if agent_for_unlock.set_keys(&keys).is_ok() {
-                                local_cache_key_state.write().await.set(lck);
-                                vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
+                                state.local_cache_key_state.write().await.set(lck);
+                                state
+                                    .vault_locked
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
                                 info!("Auto-unlocked via native local key cache");
                                 let _ = runtime_event_tx
                                     .send(RuntimeEvent::AutoUnlockedNative)
@@ -151,7 +151,7 @@ pub(crate) async fn handle_ui_request(
                                     &request,
                                     key_name,
                                     prompt_behavior,
-                                    &ui_request_tx,
+                                    &state.ui_request_tx,
                                 )
                                 .await;
                                 let _ = response_tx.send((request.request_id, approved));
@@ -176,7 +176,7 @@ pub(crate) async fn handle_ui_request(
         #[cfg(windows)]
         {
             // Envelope-based Hello unlock from local-key-cache.json.
-            let cache_opt = local_key_cache_data.read().await.clone();
+            let cache_opt = state.local_key_cache_data.read().await.clone();
             if let Some(cache) = cache_opt.filter(|c| current_hello_unlock_info(c).is_some()) {
                 let cache_for_unlock = cache.clone();
                 let hello_result = tokio::task::spawn_blocking(move || {
@@ -189,11 +189,18 @@ pub(crate) async fn handle_ui_request(
                             serde_json::from_str(&keys_json).map(crate::runtime::KeyTuples::new)
                         {
                             let key_name = key_name_for_request(&request, &keys);
-                            apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
+                            apply_decrypted_keys_state(
+                                &state.key_names,
+                                &state.cached_key_tuples,
+                                &keys,
+                            )
+                            .await;
                             let mut agent_for_unlock = agent.clone();
                             if agent_for_unlock.set_keys(&keys).is_ok() {
-                                local_cache_key_state.write().await.set(lck);
-                                vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
+                                state.local_cache_key_state.write().await.set(lck);
+                                state
+                                    .vault_locked
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
                                 info!("Auto-unlocked via Windows Hello envelope");
                                 let _ = runtime_event_tx
                                     .send(RuntimeEvent::AutoUnlockedWindowsHello)
@@ -202,7 +209,7 @@ pub(crate) async fn handle_ui_request(
                                     &request,
                                     key_name,
                                     prompt_behavior,
-                                    &ui_request_tx,
+                                    &state.ui_request_tx,
                                 )
                                 .await;
                                 let _ = response_tx.send((request.request_id, approved));
@@ -227,7 +234,7 @@ pub(crate) async fn handle_ui_request(
         //    The validator runs synchronously inside the dialog and captures the
         //    decrypted payload (and SymmetricKey, for envelope) into shared cells.
         let envelope_cache = {
-            let guard = local_key_cache_data.read().await;
+            let guard = state.local_key_cache_data.read().await;
             guard
                 .as_ref()
                 .filter(|c| c.local_cache_key.pin_encrypted.is_some())
@@ -264,10 +271,10 @@ pub(crate) async fn handle_ui_request(
 
         // SEC-03: share the daemon-wide PIN brute-force lockout with the control
         // channel so repeated wrong PINs in the SSH-request dialog also count.
-        let validator = gate_pin_validator(validator, &pin_failures);
+        let validator = gate_pin_validator(validator, &state.pin_failures);
 
         let context_key_name = {
-            let names = key_names.read().await;
+            let names = state.key_names.read().await;
             request
                 .cipher_id
                 .as_ref()
@@ -276,7 +283,7 @@ pub(crate) async fn handle_ui_request(
                 .unwrap_or_else(|| "Unknown key".to_string())
         };
         let pin_result = sshwarden_ui::unlock::request_pin_dialog_with_context(
-            &ui_request_tx,
+            &state.ui_request_tx,
             validator,
             Some(unlock_context_for_request(&request, context_key_name)),
         )
@@ -297,7 +304,7 @@ pub(crate) async fn handle_ui_request(
             };
             if let Ok(keys) = serde_json::from_str(&keys_json).map(crate::runtime::KeyTuples::new) {
                 let key_name = key_name_for_request(&request, &keys);
-                apply_decrypted_keys_state(&key_names, &cached_key_tuples, &keys).await;
+                apply_decrypted_keys_state(&state.key_names, &state.cached_key_tuples, &keys).await;
                 let mut agent_for_unlock = agent.clone();
                 if agent_for_unlock.set_keys(&keys).is_ok() {
                     if let Some(kh) = lck_holder {
@@ -308,10 +315,12 @@ pub(crate) async fn handle_ui_request(
                             // explicit unlock-pin control path (no-op in
                             // single-device mode or if a slot already exists).
                             enroll_device_platform_slots_if_missing(&lck);
-                            local_cache_key_state.write().await.set(lck);
+                            state.local_cache_key_state.write().await.set(lck);
                         }
                     }
-                    vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
+                    state
+                        .vault_locked
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     info!("Auto-unlocked via PIN dialog");
                     let _ = runtime_event_tx
                         .send(RuntimeEvent::AutoUnlockedPin { pin })
@@ -320,7 +329,7 @@ pub(crate) async fn handle_ui_request(
                         &request,
                         key_name,
                         prompt_behavior,
-                        &ui_request_tx,
+                        &state.ui_request_tx,
                     )
                     .await;
                     let _ = response_tx.send((request.request_id, approved));
@@ -339,7 +348,10 @@ pub(crate) async fn handle_ui_request(
     // private material, so deny cleanly rather than auto-approving under
     // prompt_behavior=Never — otherwise ssh sees an "approval" followed by a
     // broken signature with no way to recover.
-    if vault_locked.load(std::sync::atomic::Ordering::Relaxed) {
+    if state
+        .vault_locked
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         info!(
             request_id = request.request_id,
             process = %request.process_name,
@@ -362,7 +374,8 @@ pub(crate) async fn handle_ui_request(
             sshwarden_config::PromptBehavior::RememberUntilLock
         )
         && memory_key.as_ref().is_some_and(|key| {
-            authorization_memory
+            state
+                .authorization_memory
                 .try_read()
                 .is_ok_and(|memory| memory.contains(key))
         })
@@ -397,7 +410,7 @@ pub(crate) async fn handle_ui_request(
     }
 
     // Build request info for UI — use try_read to avoid blocking on write lock
-    let key_name = match key_names.try_read() {
+    let key_name = match state.key_names.try_read() {
         Ok(names) => request
             .cipher_id
             .as_ref()
@@ -427,7 +440,7 @@ pub(crate) async fn handle_ui_request(
             "Sign request - prompting user"
         );
         prompt_authorization_with_bind_flow(
-            &ui_request_tx,
+            &state.ui_request_tx,
             sign_info,
             request.pid,
             request.cipher_id.as_deref(),
@@ -442,7 +455,7 @@ pub(crate) async fn handle_ui_request(
         )
     {
         if let Some(key) = memory_key {
-            authorization_memory.write().await.insert(key);
+            state.authorization_memory.write().await.insert(key);
         }
     }
     let _ = response_tx.send((request.request_id, approved));

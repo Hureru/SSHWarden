@@ -324,6 +324,47 @@ pub(crate) type CachedKeyTuples = Arc<RwLock<SecureKeyCache>>;
 /// Type alias for the UI request sender passed through the system.
 pub(crate) type UIRequestTx = Arc<tokio::sync::mpsc::Sender<sshwarden_ui::UIRequest>>;
 
+/// The daemon's shared handles. Cloning it clones the `Arc`s, not the data.
+#[derive(Clone)]
+pub(crate) struct DaemonState {
+    pub(crate) config: Arc<sshwarden_config::Config>,
+    pub(crate) vault_locked: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) pending_sync: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) cached_key_tuples: CachedKeyTuples,
+    pub(crate) key_names: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    pub(crate) key_material_fingerprints: KeyMaterialFingerprints,
+    pub(crate) api_client: Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
+    pub(crate) local_key_cache_data:
+        Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
+    pub(crate) local_cache_key_state: LocalCacheKeyHandle,
+    pub(crate) authorization_memory: AuthorizationMemorySet,
+    pub(crate) notification_state: Arc<RwLock<NotificationRuntimeState>>,
+    pub(crate) pin_failures: crate::control::PinFailureHandle,
+    pub(crate) ui_request_tx: UIRequestTx,
+}
+
+#[cfg(test)]
+impl DaemonState {
+    /// An unlocked daemon with no keys, no cache and no session.
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            config: Arc::default(),
+            vault_locked: Arc::default(),
+            pending_sync: Arc::default(),
+            cached_key_tuples: Arc::new(RwLock::new(SecureKeyCache::new())),
+            key_names: Arc::default(),
+            key_material_fingerprints: Arc::default(),
+            api_client: Arc::default(),
+            local_key_cache_data: Arc::default(),
+            local_cache_key_state: Arc::default(),
+            authorization_memory: Arc::default(),
+            notification_state: Arc::default(),
+            pin_failures: Arc::default(),
+            ui_request_tx: Arc::new(tokio::sync::mpsc::channel(1).0),
+        }
+    }
+}
+
 /// Internal events emitted by spawned SSH request handlers back to the main loop.
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum RuntimeEvent {

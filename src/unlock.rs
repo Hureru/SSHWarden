@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
 use tracing::info;
 
 #[cfg(windows)]
@@ -20,7 +19,7 @@ use crate::cache::{
 };
 use crate::control::{pin_lockout_remaining, record_pin_attempt, PinFailureHandle};
 use crate::notifications::connect_notification_client;
-use crate::runtime::{CachedKeyTuples, LocalCacheKeyHandle, NotificationRuntimeState, UIRequestTx};
+use crate::runtime::DaemonState;
 /// Try to unlock using Windows Hello sign-path.
 /// Must be called from spawn_blocking.
 #[cfg(windows)]
@@ -67,23 +66,20 @@ pub(crate) fn gate_pin_validator(
 /// key via the user's PIN before syncing so `do_sync()` can refresh
 /// `local-key-cache.json` with the newly pulled key set.
 pub(crate) async fn ensure_local_cache_key_for_manual_sync(
-    local_key_cache_data: &Arc<RwLock<Option<sshwarden_config::cache::LocalKeyCacheFile>>>,
-    local_cache_key_state: &LocalCacheKeyHandle,
-    ui_request_tx: &UIRequestTx,
-    pin_failures: &PinFailureHandle,
+    state: &DaemonState,
 ) -> Result<(), String> {
     if multi_device_mode() {
-        reload_shared_local_cache_from_disk_if_multi_device(local_key_cache_data).await;
+        reload_shared_local_cache_from_disk_if_multi_device(&state.local_key_cache_data).await;
     }
 
-    let cache = match local_key_cache_data.read().await.as_ref().cloned() {
+    let cache = match state.local_key_cache_data.read().await.as_ref().cloned() {
         Some(cache) => cache,
         None => return Ok(()),
     };
 
     // Bind to a local so the read guard is dropped before the `clear()` write on
     // the same lock below.
-    let in_memory_key = local_cache_key_state.read().await.clone_key();
+    let in_memory_key = state.local_cache_key_state.read().await.clone_key();
     if let Some(local_cache_key) = in_memory_key {
         if decrypt_envelope_payload(&cache, local_cache_key.clone()).is_ok() {
             return Ok(());
@@ -91,7 +87,7 @@ pub(crate) async fn ensure_local_cache_key_for_manual_sync(
         tracing::warn!(
             "In-memory Local Cache Key no longer decrypts the shared cache; PIN is required"
         );
-        local_cache_key_state.write().await.clear();
+        state.local_cache_key_state.write().await.clear();
     }
 
     if cache.local_cache_key.pin_encrypted.is_none() {
@@ -111,16 +107,16 @@ pub(crate) async fn ensure_local_cache_key_for_manual_sync(
             Err(_) => false,
         }
     });
-    let validator = gate_pin_validator(validator, pin_failures);
+    let validator = gate_pin_validator(validator, &state.pin_failures);
 
-    match sshwarden_ui::unlock::request_pin_dialog(ui_request_tx, validator).await {
+    match sshwarden_ui::unlock::request_pin_dialog(&state.ui_request_tx, validator).await {
         Some(_) => {
             // Take the recovered key OUT of the guard before awaiting, so no
             // std::sync::MutexGuard is held across the .await (clippy::await_holding_lock).
             let recovered = key_holder.lock().unwrap_or_else(|e| e.into_inner()).take();
             match recovered {
                 Some(local_cache_key) => {
-                    local_cache_key_state.write().await.set(local_cache_key);
+                    state.local_cache_key_state.write().await.set(local_cache_key);
                     Ok(())
                 }
                 None => Err("PIN accepted but the Local Cache Key was not recovered".to_string()),
@@ -138,13 +134,11 @@ pub(crate) async fn ensure_local_cache_key_for_manual_sync(
 /// Uses the Hello-encrypted refresh token stored in the session file.
 #[cfg(windows)]
 pub(crate) async fn try_restore_api_session_hello(
-    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
-    config: &Arc<sshwarden_config::Config>,
+    state: &DaemonState,
     notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
     notification_client: &mut Option<sshwarden_api::NotificationClient>,
-    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
 ) {
-    if api_client.read().await.is_some() {
+    if state.api_client.read().await.is_some() {
         return;
     }
 
@@ -190,8 +184,8 @@ pub(crate) async fn try_restore_api_session_hello(
         }
     };
 
-    let base = &config.server.base_url;
-    let api_url = config.server.api_url();
+    let base = &state.config.server.base_url;
+    let api_url = state.config.server.api_url();
     let mut client = sshwarden_api::BitwardenClient::new_with_device_id(
         base,
         &api_url,
@@ -206,17 +200,17 @@ pub(crate) async fn try_restore_api_session_hello(
 
             if let Some(token) = client.access_token() {
                 connect_notification_client(
-                    config,
+                    &state.config,
                     Some(&client),
                     token,
                     notification_rx,
                     notification_client,
-                    notification_state,
+                    &state.notification_state,
                 )
                 .await;
             }
 
-            *api_client.write().await = Some(client);
+            *state.api_client.write().await = Some(client);
         }
         Err(e) => {
             tracing::warn!("Hello session restore failed: {}", e);
@@ -229,15 +223,13 @@ pub(crate) async fn try_restore_api_session_hello(
 /// Decrypts the stored refresh_token using the PIN, refreshes the access token,
 /// and connects to the notification hub.
 pub(crate) async fn try_restore_api_session(
-    api_client: &Arc<RwLock<Option<sshwarden_api::BitwardenClient>>>,
-    config: &Arc<sshwarden_config::Config>,
+    state: &DaemonState,
     pin: &str,
     notification_rx: &mut Option<tokio::sync::mpsc::Receiver<sshwarden_api::SyncEvent>>,
     notification_client: &mut Option<sshwarden_api::NotificationClient>,
-    notification_state: &Arc<RwLock<NotificationRuntimeState>>,
 ) {
     // Only restore if we don't already have an API client
-    if api_client.read().await.is_some() {
+    if state.api_client.read().await.is_some() {
         return;
     }
 
@@ -269,8 +261,8 @@ pub(crate) async fn try_restore_api_session(
     };
 
     // Create client with stored device_id and try to refresh
-    let base = &config.server.base_url;
-    let api_url = config.server.api_url();
+    let base = &state.config.server.base_url;
+    let api_url = state.config.server.api_url();
     let mut client = sshwarden_api::BitwardenClient::new_with_device_id(
         base,
         &api_url,
@@ -286,20 +278,20 @@ pub(crate) async fn try_restore_api_session(
             // Connect to notification hub
             if let Some(token) = client.access_token() {
                 connect_notification_client(
-                    config,
+                    &state.config,
                     Some(&client),
                     token,
                     notification_rx,
                     notification_client,
-                    notification_state,
+                    &state.notification_state,
                 )
                 .await;
             }
 
             // Update session file with new refresh token
-            save_device_session(&client, config, Some(pin)).await;
+            save_device_session(&client, &state.config, Some(pin)).await;
 
-            *api_client.write().await = Some(client);
+            *state.api_client.write().await = Some(client);
         }
         Err(e) => {
             tracing::warn!("API session restore failed (token refresh): {}", e);
@@ -416,9 +408,7 @@ pub(crate) fn create_or_preserve_hello_encrypted_token(
 pub(crate) async fn finish_unlock_with_json(
     keys_json: &str,
     agent: &mut sshwarden_agent::SshWardenAgent,
-    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    cached_key_tuples: &CachedKeyTuples,
-    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
+    state: &DaemonState,
     success_msg: &str,
 ) -> sshwarden_agent::ControlResponse {
     let keys: crate::runtime::KeyTuples = match serde_json::from_str(keys_json) {
@@ -431,20 +421,22 @@ pub(crate) async fn finish_unlock_with_json(
         }
     };
 
-    // Update key_names map
+    // Update &state.key_names map
     {
-        let mut names = key_names.write().await;
+        let mut names = state.key_names.write().await;
         names.clear();
         for (_, name, cipher_id) in keys.iter() {
             names.insert(cipher_id.clone(), name.clone());
         }
     }
 
-    cached_key_tuples.write().await.set(keys.to_vec());
+    state.cached_key_tuples.write().await.set(keys.to_vec());
     if let Err(e) = agent.set_keys(&keys) {
         return sshwarden_agent::ControlResponse::err(&format!("Failed to reload keys: {}", e));
     }
-    vault_locked.store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .vault_locked
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     info!("{}", success_msg);
     sshwarden_agent::ControlResponse::ok(success_msg)
 }

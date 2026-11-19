@@ -9,7 +9,7 @@ use base64::Engine;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::runtime::{AuthorizationMemorySet, CachedKeyTuples, LocalCacheKeyHandle};
+use crate::runtime::AuthorizationMemorySet;
 use crate::sshconfig::ManagedKey;
 use crate::unlock::finish_unlock_with_json;
 #[cfg(windows)]
@@ -433,24 +433,17 @@ pub(crate) fn decrypt_envelope_local_key_cache_with_native(
 pub(crate) async fn finish_native_unlock_response(
     cache: sshwarden_config::cache::LocalKeyCacheFile,
     agent: &mut sshwarden_agent::SshWardenAgent,
-    vault_locked: &Arc<std::sync::atomic::AtomicBool>,
-    cached_key_tuples: &CachedKeyTuples,
-    key_names: &Arc<RwLock<std::collections::HashMap<String, String>>>,
-    local_cache_key_state: &LocalCacheKeyHandle,
+    state: &crate::runtime::DaemonState,
     success_msg: &str,
 ) -> sshwarden_agent::ControlResponse {
     match decrypt_envelope_local_key_cache_with_native(&cache) {
         Ok((keys_json, local_cache_key)) => {
-            local_cache_key_state.write().await.set(local_cache_key);
-            finish_unlock_with_json(
-                &keys_json,
-                agent,
-                vault_locked,
-                cached_key_tuples,
-                key_names,
-                success_msg,
-            )
-            .await
+            state
+                .local_cache_key_state
+                .write()
+                .await
+                .set(local_cache_key);
+            finish_unlock_with_json(&keys_json, agent, state, success_msg).await
         }
         Err(e) => sshwarden_agent::ControlResponse::err(&format!("Native unlock failed: {}", e)),
     }
