@@ -218,43 +218,8 @@ impl Default for AgentConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnlockMethod {
-    WindowsHello,
-    Pin,
-    Password,
-}
-
-// Cannot use #[derive(Default)] due to conditional compilation
-#[allow(clippy::derivable_impls)]
-impl Default for UnlockMethod {
-    fn default() -> Self {
-        #[cfg(windows)]
-        {
-            Self::WindowsHello
-        }
-        #[cfg(not(windows))]
-        {
-            Self::Password
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum FallbackMethod {
-    #[default]
-    Pin,
-    Password,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnlockConfig {
-    #[serde(default)]
-    pub method: UnlockMethod,
-    #[serde(default)]
-    pub fallback: FallbackMethod,
     #[serde(default = "default_true")]
     pub auto_unlock_on_request: bool,
 }
@@ -266,8 +231,6 @@ fn default_true() -> bool {
 impl Default for UnlockConfig {
     fn default() -> Self {
         Self {
-            method: UnlockMethod::default(),
-            fallback: FallbackMethod::default(),
             auto_unlock_on_request: true,
         }
     }
@@ -391,6 +354,35 @@ impl Config {
             .with_context(|| format!("Failed to write config file: {}", path.display()))?;
         Ok(())
     }
+
+    /// Store `[auth] email` in `config.toml`. Only that key changes: the
+    /// user's comments and layout stay (`save` would rewrite the whole file).
+    pub fn save_email(email: &str) -> anyhow::Result<()> {
+        let path = config_path()?;
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("Failed to read config file: {}", path.display())))
+            }
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
+        }
+        std::fs::write(&path, with_email(&existing, email)?)
+            .with_context(|| format!("Failed to write config file: {}", path.display()))
+    }
+}
+
+fn with_email(config_toml: &str, email: &str) -> anyhow::Result<String> {
+    let mut doc: toml_edit::DocumentMut =
+        config_toml.parse().context("Failed to parse config file")?;
+    let auth = doc.entry("auth").or_insert(toml_edit::table());
+    auth["email"] = toml_edit::value(email);
+    Ok(doc.to_string())
 }
 
 /// Get the shared base directory for persistent SSHWarden configuration/data.
@@ -800,18 +792,22 @@ fn auto_device_id() -> String {
 }
 
 fn hostname_for_device_id() -> String {
+    raw_hostname().unwrap_or_else(|| "device".to_string())
+}
+
+/// The machine's host name: from the environment, else the `hostname` command.
+pub(crate) fn raw_hostname() -> Option<String> {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
+        .or_else(|| {
             std::process::Command::new("hostname")
                 .output()
                 .ok()
                 .and_then(|output| String::from_utf8(output.stdout).ok())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "device".to_string())
         })
 }
 
@@ -1216,5 +1212,23 @@ mod tests {
         let config: Config =
             toml::from_str("[auth]\nmethod = \"api_key\"\nemail = \"a@b.c\"\n").unwrap();
         assert_eq!(config.auth.email, "a@b.c");
+    }
+
+    #[test]
+    fn saving_the_email_keeps_comments_and_other_keys() {
+        let before = "# my server\n[server]\nbase_url = \"https://x\" # home\n\n[auth]\n# who\nemail = \"\"\n";
+        let after = with_email(before, "a@b.c").unwrap();
+        assert_eq!(after, before.replace("email = \"\"", "email = \"a@b.c\""));
+        let fresh: Config = toml::from_str(&with_email("", "a@b.c").unwrap()).unwrap();
+        assert_eq!(fresh.auth.email, "a@b.c");
+    }
+
+    /// `[unlock] method = "native"` used to stop every command with a TOML
+    /// parse error, although nothing read the option.
+    #[test]
+    fn a_config_with_the_removed_unlock_options_still_loads() {
+        let config: Config =
+            toml::from_str("[unlock]\nmethod = \"native\"\nfallback = \"pin\"\n").unwrap();
+        assert!(config.unlock.auto_unlock_on_request);
     }
 }

@@ -37,8 +37,6 @@ SSHWarden 的目标不是复刻完整 Bitwarden Desktop，而是提供一个专�
 - [`CONTEXT.md`](CONTEXT.md) — 项目领域语言
 - [`docs/adr/`](docs/adr/) — 架构决策记录
 
-`llmdoc/` 中包含历史分析和 Bitwarden Desktop 参考资料，不代表 SSHWarden 当前支持状态。
-
 ## 核心概念
 
 ### Bitwarden Vault

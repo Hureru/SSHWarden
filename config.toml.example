@@ -105,22 +105,6 @@ key_picker = false
 # 解锁配置
 # ============================================
 [unlock]
-# 默认解锁方法
-# 可选值:
-#   - "windows_hello": Windows Hello 生物识别（仅 Windows）
-#   - "pin": PIN 码快速解锁
-#   - "password": Bitwarden 主密码
-# 默认: Windows 上为 "windows_hello"，其他平台为 "password"
-method = "windows_hello"
-
-# 备用解锁方法
-# 当主解锁方法失败时使用
-# 可选值:
-#   - "pin": PIN 码
-#   - "password": 主密码
-# 默认: "pin"
-fallback = "pin"
-
 # SSH 请求时自动尝试解锁
 # true: 收到 SSH 请求时自动尝试 Windows Hello 解锁
 # false: 需要手动解锁

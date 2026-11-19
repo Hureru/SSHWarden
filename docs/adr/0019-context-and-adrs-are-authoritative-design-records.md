@@ -1,3 +1,3 @@
 # Context and ADRs are authoritative design records
 
-SSHWarden may keep `llmdoc/` legacy and upstream-reference notes while the design is still being compared against Bitwarden Desktop, but current product language and architectural decisions are recorded in `CONTEXT.md` and `docs/adr/`. Legacy notes are reference material only and must not be treated as evidence that SSHWarden supports a feature.
+Current product language and architectural decisions are recorded in `CONTEXT.md` and `docs/adr/`. The older `llmdoc/` notes (legacy analysis and Bitwarden Desktop reference material) were deleted in 2026-11 because they described features that no longer exist; git history keeps them.

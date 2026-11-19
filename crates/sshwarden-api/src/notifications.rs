@@ -173,21 +173,6 @@ pub struct NotificationClient {
 const RECORD_SEP: u8 = 0x1E;
 
 impl NotificationClient {
-    /// Connect to the notification hub and start the background listener.
-    ///
-    /// Returns the client handle and a receiver for sync events.
-    pub async fn connect(
-        notifications_url: &str,
-        access_token: &str,
-    ) -> anyhow::Result<(Self, mpsc::Receiver<SyncEvent>)> {
-        Self::connect_with_options(
-            notifications_url,
-            access_token,
-            NotificationOptions::default(),
-        )
-        .await
-    }
-
     /// Connect to the notification hub using explicit runtime options.
     pub async fn connect_with_options(
         notifications_url: &str,

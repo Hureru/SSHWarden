@@ -75,8 +75,14 @@ pub(crate) fn local_state_dir() -> anyhow::Result<std::path::PathBuf> {
 /// Create the machine-local state directory if it does not exist yet.
 pub(crate) fn ensure_local_state_dir() -> anyhow::Result<std::path::PathBuf> {
     let dir = local_state_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create local state directory: {}", dir.display()))?;
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).with_context(|| {
+            format!("Failed to create local state directory: {}", dir.display())
+        })?;
+        // shortcut: only a folder we create gets 700 (an existing one may be a
+        // configured `local_dir` with other content); the files in it are 600.
+        let _ = sshwarden_config::ssh_config::ensure_ssh_dir_permissions(&dir);
+    }
     Ok(dir)
 }
 
@@ -225,8 +231,9 @@ pub(crate) fn pid_file_owner_alive(path: &std::path::Path) -> bool {
     // and would otherwise falsely block a healthy restart.
     use sysinfo::System;
     let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    match sys.process(sysinfo::Pid::from_u32(pid)) {
+    let pid = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    match sys.process(pid) {
         Some(proc) => process_is_sshwarden(proc),
         None => false,
     }
@@ -270,12 +277,8 @@ pub(crate) fn is_daemon_running() -> bool {
 /// stale and reclaimed.
 pub(crate) fn claim_pid_file() -> anyhow::Result<bool> {
     use std::io::Write;
+    ensure_local_state_dir()?;
     let path = pid_file_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create PID file directory: {}", parent.display())
-        })?;
-    }
     loop {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -301,6 +304,7 @@ pub(crate) fn claim_pid_file() -> anyhow::Result<bool> {
                 }
                 f.write_all(std::process::id().to_string().as_bytes())
                     .with_context(|| format!("Failed to write PID file: {}", path.display()))?;
+                let _ = sshwarden_config::ssh_config::ensure_private_file_permissions(&path);
                 // We are the sole owner: it is now safe to drop stale legacy state
                 // so cloud sync stops mirroring it.
                 cleanup_legacy_runtime_files();
@@ -452,7 +456,7 @@ pub(crate) async fn cmd_daemon_install() -> anyhow::Result<()> {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>works.earendil.sshwarden</string>
+    <string>io.github.hureru.sshwarden</string>
     <key>ProgramArguments</key>
     <array>
         <string>{}</string>
@@ -546,7 +550,7 @@ pub(crate) fn macos_launch_agent_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home
         .join("Library")
         .join("LaunchAgents")
-        .join("works.earendil.sshwarden.plist"))
+        .join("io.github.hureru.sshwarden.plist"))
 }
 
 #[cfg(target_os = "linux")]

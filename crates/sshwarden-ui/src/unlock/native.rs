@@ -6,7 +6,7 @@ use anyhow::Result;
 mod platform {
     use super::*;
 
-    const SERVICE: &str = "works.earendil.sshwarden.local-cache-key";
+    const SERVICE: &str = "io.github.hureru.sshwarden.local-cache-key";
     const ACCOUNT: &str = "SSHWarden";
 
     pub fn native_available() -> bool {

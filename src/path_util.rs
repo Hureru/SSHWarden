@@ -90,7 +90,5 @@ pub(crate) fn write_private_file(path: &Path, content: impl AsRef<[u8]>) -> anyh
     if let Some(parent) = path.parent() {
         create_parent_dir(parent)?;
     }
-    std::fs::write(path, content)?;
-    sshwarden_config::ssh_config::ensure_private_file_permissions(path)?;
-    Ok(())
+    sshwarden_config::write_owner_only_file(path, content)
 }
