@@ -332,6 +332,10 @@ pub(crate) async fn run_foreground(
         keyring_auto_unlock: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("Failed to listen for SIGTERM")?;
+
     loop {
         tokio::select! {
             // Control commands from IPC
@@ -541,6 +545,17 @@ pub(crate) async fn run_foreground(
             // Shutdown signal
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C, shutting down...");
+                break;
+            }
+            // `kill`, systemd stop and logout send SIGTERM: leave the same way,
+            // so the pid file and sockets are removed.
+            _ = async {
+                #[cfg(unix)]
+                sigterm.recv().await;
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            } => {
+                info!("Received SIGTERM, shutting down...");
                 break;
             }
         }

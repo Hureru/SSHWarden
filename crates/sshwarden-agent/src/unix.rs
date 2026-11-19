@@ -41,7 +41,10 @@ impl SshWardenAgent {
                 let cloned_keystore = cloned_agent_state.keystore_clone();
                 let cloned_cancellation_token = cloned_agent_state.cancellation_token();
 
+                let socket_file = RemoveOnDrop(socket_path.clone());
                 tokio::spawn(async move {
+                    // Dropped when the server ends or the runtime shuts down.
+                    let _socket_file = socket_file;
                     let _ = ssh_agent::serve(
                         stream,
                         cloned_agent_state.clone(),
@@ -66,6 +69,16 @@ impl SshWardenAgent {
         }
 
         Ok(agent_state)
+    }
+}
+
+/// Removes the agent socket when the server is gone, so clients get "no such
+/// file" instead of a dead socket.
+pub(crate) struct RemoveOnDrop(pub(crate) PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
