@@ -60,9 +60,6 @@ This roadmap tracks implementation work needed to align the codebase with the cu
 
 ## Known issues
 
-- **Audit backlog (2026-11):** 28 numbered findings with evidence, file
-  references, fix sketches and a fix order are in `docs/audit-2026-11.md`.
-
 - **Some ECDSA keys do not load.** OpenSSH stores the private number of an
   ECDSA key without its leading zero bytes, and `ssh-key` 0.6.7 refuses the
   shorter form ("Failed to parse key: length invalid"). About half of all
