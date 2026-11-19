@@ -88,6 +88,20 @@ fn main() -> anyhow::Result<()> {
     // invocation log to stderr.
     let is_daemon = matches!(cli.command, Some(Commands::Run { background: true }));
 
+    // Typed in a terminal, `run --background` used to stay in the foreground
+    // and die with the terminal. Start the detached copy and return; its stdin
+    // is not a terminal, so it runs the agent itself.
+    #[cfg(not(windows))]
+    if is_daemon && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        if process::is_daemon_running() {
+            out_line("SSHWarden is already running.");
+            return Ok(());
+        }
+        process::spawn_background_agent(&std::env::current_exe()?)?;
+        out_line("Started agent in the background.");
+        return Ok(());
+    }
+
     if is_daemon {
         // PID/log/sockets live in the machine-local state directory, never in the
         // (possibly cloud-synced) shared data root.

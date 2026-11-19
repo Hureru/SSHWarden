@@ -142,25 +142,10 @@ fn default_notifications_url(base_url: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthConfig {
-    #[serde(default = "default_auth_method")]
-    pub method: String,
     #[serde(default)]
     pub email: String,
-}
-
-fn default_auth_method() -> String {
-    "password".to_string()
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            method: default_auth_method(),
-            email: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -312,8 +297,7 @@ pub struct SshConfigConfig {
     ///
     /// Supports `~`, `~/...`, and `~\\...`. Relative paths are resolved under
     /// SSHWarden's shared data directory. The default is `sshwarden_config`
-    /// in the shared data directory when multi-device mode is enabled, otherwise
-    /// beside the running executable for backwards compatibility.
+    /// in the shared data directory.
     pub managed_path: Option<String>,
     /// Formatting style for paths written into `~/.ssh/config` and the managed
     /// snippet. `home_relative` is recommended for OneDrive multi-device use.
@@ -729,17 +713,19 @@ pub fn managed_ssh_config_path(config: &Config) -> anyhow::Result<PathBuf> {
     match config.ssh_config.managed_path.as_deref().map(str::trim) {
         Some("") => anyhow::bail!("ssh_config.managed_path is present but empty"),
         Some(path) => expand_config_path(path),
-        None if config.storage.multi_device => Ok(shared_data_dir()?.join("sshwarden_config")),
-        None => default_managed_ssh_config_path(),
+        None => Ok(shared_data_dir()?.join("sshwarden_config")),
     }
 }
 
-pub fn default_managed_ssh_config_path() -> anyhow::Result<PathBuf> {
+/// The default before the snippet moved to the data directory: beside the
+/// executable, which a system-wide install cannot write. Only used to
+/// recognise an old Include line.
+pub fn legacy_exe_managed_ssh_config_path() -> anyhow::Result<PathBuf> {
     Ok(executable_dir()?.join("sshwarden_config"))
 }
 
-/// The historical managed snippet path used before SSHWarden kept the generated
-/// file beside the executable by default. Used only for migration/cleanup.
+/// The first default, `~/.ssh/sshwarden_config`. Only used to recognise an old
+/// Include line.
 pub fn legacy_home_managed_ssh_config_path() -> anyhow::Result<PathBuf> {
     Ok(home_dir_any()?.join(".ssh").join("sshwarden_config"))
 }
@@ -1223,5 +1209,12 @@ mod tests {
 
         let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
         assert_eq!(reparsed.rules[1].user.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn a_config_with_the_removed_auth_method_still_loads() {
+        let config: Config =
+            toml::from_str("[auth]\nmethod = \"api_key\"\nemail = \"a@b.c\"\n").unwrap();
+        assert_eq!(config.auth.email, "a@b.c");
     }
 }

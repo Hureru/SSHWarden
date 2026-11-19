@@ -3,7 +3,7 @@
 //! Moved out of `main.rs` as part of the incremental module split (M1 step 3b).
 
 use anyhow::Context;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::naming::{selector_file_name, vault_item_id_prefix};
 use crate::path_util::{
@@ -424,7 +424,31 @@ fn write_managed_ssh_config(
             include_path.display()
         )
     })?;
+    match user_ssh_config_path().and_then(|config| follow_moved_include(&config, &include_path)) {
+        Ok(true) => info!("Updated the SSHWarden Include line in the SSH config"),
+        Ok(false) => {}
+        Err(e) => warn!("Could not update the SSHWarden Include line: {e:#}"),
+    }
     Ok(())
+}
+
+/// The snippet's path can change under an installed Include line (a new
+/// default, or an edited `managed_path`). The daemon's sync only writes the
+/// snippet, so point a marked Include at it here, or ssh would keep reading
+/// the old file. A config without our marker is left alone.
+fn follow_moved_include(
+    config_path: &std::path::Path,
+    include_path: &std::path::Path,
+) -> anyhow::Result<bool> {
+    let before = read_user_ssh_config(config_path)?;
+    if !before
+        .lines()
+        .any(|line| line.trim() == sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER)
+    {
+        return Ok(false);
+    }
+    write_sshwarden_include_line(config_path, include_path)?;
+    Ok(read_user_ssh_config(config_path)? != before)
 }
 
 pub(crate) fn managed_sshwarden_include_path() -> anyhow::Result<std::path::PathBuf> {
@@ -554,9 +578,13 @@ pub(crate) fn line_matches_current_or_legacy_sshwarden_include(
     if sshwarden_config::ssh_config::line_matches_sshwarden_include(line, include_path) {
         return true;
     }
-    sshwarden_config::legacy_home_managed_ssh_config_path()
-        .map(|legacy| sshwarden_config::ssh_config::line_matches_sshwarden_include(line, &legacy))
-        .unwrap_or(false)
+    [
+        sshwarden_config::legacy_home_managed_ssh_config_path(),
+        sshwarden_config::legacy_exe_managed_ssh_config_path(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|legacy| sshwarden_config::ssh_config::line_matches_sshwarden_include(line, &legacy))
 }
 
 /// `existing` without SSHWarden's Include lines: the marker comment with the
@@ -761,6 +789,37 @@ mod tests {
 
         assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
         assert!(std::fs::read_to_string(&real).unwrap().contains("Include "));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit #16: when the snippet moves, an installed Include follows it;
+    /// a config that never had our Include is not touched.
+    #[test]
+    fn a_marked_include_follows_the_snippet_to_its_new_path() {
+        let dir = temp_dir("include-follow");
+        let config_path = dir.join("config");
+        let new_path = dir.join("after-move").join("sshwarden_config");
+        write_sshwarden_include_line(
+            &config_path,
+            &dir.join("before-move").join("sshwarden_config"),
+        )
+        .unwrap();
+
+        assert!(follow_moved_include(&config_path, &new_path).unwrap());
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config.contains("after-move") && !config.contains("before-move"),
+            "{config}"
+        );
+        assert!(!follow_moved_include(&config_path, &new_path).unwrap());
+
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "Host work\n    User me\n").unwrap();
+        assert!(!follow_moved_include(&plain, &new_path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&plain).unwrap(),
+            "Host work\n    User me\n"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

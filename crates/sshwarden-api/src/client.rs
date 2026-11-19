@@ -174,6 +174,9 @@ impl BitwardenClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if let Some(reason) = login_refusal_reason(&body) {
+                return Err(anyhow!(reason));
+            }
             return Err(anyhow!("Login failed ({}): {}", status, body));
         }
 
@@ -514,10 +517,35 @@ impl BitwardenClient {
     }
 }
 
+/// A plain sentence for the two login answers sshwarden cannot act on.
+/// shortcut: matched on text seen in Bitwarden/Vaultwarden answers, not tried
+/// against a real server; when one of them is built, send the code instead.
+fn login_refusal_reason(body: &str) -> Option<&'static str> {
+    let body = body.to_ascii_lowercase();
+    if body.contains("twofactorproviders") || body.contains("two factor required") {
+        Some("This account uses two-step login, which sshwarden cannot do yet. Nothing was saved.")
+    } else if body.contains("device verification") {
+        Some("The server wants to verify this new device with a code sent by e-mail, which sshwarden cannot enter yet. Nothing was saved.")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_step_and_new_device_answers_get_a_plain_reason() {
+        let two_step = r#"{"error":"invalid_grant","error_description":"Two factor required.","TwoFactorProviders":["0"]}"#;
+        assert!(login_refusal_reason(two_step).unwrap().contains("two-step"));
+        let device = r#"{"error":"invalid_grant","ErrorModel":{"Message":"New device verification required"}}"#;
+        assert!(login_refusal_reason(device).unwrap().contains("e-mail"));
+        let wrong =
+            r#"{"error":"invalid_grant","error_description":"invalid_username_or_password"}"#;
+        assert!(login_refusal_reason(wrong).is_none());
+    }
 
     #[test]
     fn only_a_refused_token_counts_as_rejected() {

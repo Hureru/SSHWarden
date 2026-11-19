@@ -513,6 +513,9 @@ pub async fn start_control_server(
         error!(error = %e, ?path, "Failed to set control socket permissions");
     }
 
+    // Also runs when the runtime shuts down before this task sees the cancel.
+    let _socket_file = crate::platform_ssh_agent::RemoveOnDrop(path.clone());
+
     info!(?path, "Control server starting on Unix socket");
 
     loop {
@@ -528,7 +531,6 @@ pub async fn start_control_server(
             }
             _ = cancel.cancelled() => {
                 info!(?path, "Control server shutting down");
-                let _ = std::fs::remove_file(&path);
                 return;
             }
         };

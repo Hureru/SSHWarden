@@ -39,7 +39,7 @@ rand = "0.8"
 # pulls in the Qt backend and the software renderer (png 0.17/0.18), which
 # nothing here needs. Keep the feature list in sync with sshwarden-ui.
 slint = { version = "1.15", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
