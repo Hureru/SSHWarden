@@ -400,10 +400,28 @@ pub(crate) async fn finish_unlock_with_json(
     sshwarden_agent::ControlResponse::ok(success_msg)
 }
 
+/// Shortest PIN that can be set. The PIN opens the Local Cache Key, and that
+/// opens the saved session with the vault's user key (ADR 0028).
+pub(crate) const MIN_PIN_LEN: usize = 6;
+
+/// For a new PIN only: a shorter PIN set before this rule still unlocks.
+pub(crate) fn check_new_pin(pin: &str) -> Result<(), String> {
+    if pin.chars().count() < MIN_PIN_LEN {
+        return Err(format!("PIN must be at least {MIN_PIN_LEN} characters"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_pin_needs_six_characters() {
+        assert!(check_new_pin("12345").is_err());
+        assert!(check_new_pin("123456").is_ok());
+    }
 
     #[test]
     fn session_secrets_open_only_with_the_key_that_closed_them() {

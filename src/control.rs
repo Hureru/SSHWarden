@@ -924,8 +924,8 @@ pub(crate) async fn handle_control_command(
             }
         }
         ControlAction::SetPin { pin } => {
-            if pin.len() < 4 {
-                return sshwarden_agent::ControlResponse::err("PIN must be at least 4 characters");
+            if let Err(e) = crate::unlock::check_new_pin(&pin) {
+                return sshwarden_agent::ControlResponse::err(&e);
             }
 
             let keys = state.cached_key_tuples.read().await.clone_inner();

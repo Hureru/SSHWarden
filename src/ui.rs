@@ -515,12 +515,15 @@ pub(crate) async fn prompt_setup_pin(
         return;
     }
 
-    let pin = match prompt_password("Enter new PIN (>= 4 chars): ") {
+    let pin = match prompt_password(&format!(
+        "Enter new PIN (>= {} chars): ",
+        crate::unlock::MIN_PIN_LEN
+    )) {
         Ok(p) => p,
         Err(_) => return,
     };
-    if pin.len() < 4 {
-        info!("PIN must be at least 4 characters. Skipped.");
+    if let Err(e) = crate::unlock::check_new_pin(&pin) {
+        info!("{e}. Skipped.");
         return;
     }
     let pin_confirm = match prompt_password("Confirm PIN: ") {
