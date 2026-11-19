@@ -8,11 +8,13 @@ OpenSSH asks the configured SSH agent for identities and may try several keys be
 
 ## How SSHWarden solves it
 
-SSHWarden writes public **Key Selector Files** for vault keys and can generate a managed SSH config file. By default this file is kept beside the running executable:
+SSHWarden writes public **Key Selector Files** for vault keys and can generate a managed SSH config file. By default this file is kept in SSHWarden's data directory (the folder that holds `config.toml`):
 
 ```text
-<exe-dir>/sshwarden_config
+<data-dir>/sshwarden_config
 ```
+
+Older versions kept it beside the executable. An `Include` line that SSHWarden wrote is moved to the new path at the next sync; the old file is left where it is and can be deleted.
 
 You can override it in `config.toml`; `~`, `~/...`, and `~\\...` are expanded:
 
@@ -77,7 +79,7 @@ Saving from this flow also approves the original signing request.
 
 - `bindings.json` — local mapping from vault item id to host patterns, stored under SSHWarden's configuration directory.
 - `keys/*.pub` — public Key Selector Files, stored under SSHWarden's configuration directory.
-- `<exe-dir>/sshwarden_config` by default, or `[ssh_config].managed_path` when configured — OpenSSH-readable managed config generated from bindings.
+- `<data-dir>/sshwarden_config` by default, or `[ssh_config].managed_path` when configured — OpenSSH-readable managed config generated from bindings.
 - `~/.ssh/config` — contains one SSHWarden Include line.
 
 OpenSSH still reads the user's main config from fixed SSH paths, so `~/.ssh/config` remains the unavoidable OpenSSH footprint. The generated SSHWarden snippet no longer defaults to the device-wide `.ssh` directory.

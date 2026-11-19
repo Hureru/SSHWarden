@@ -133,7 +133,7 @@ Implemented in `docs/adr/0023-host-bindings-and-managed-ssh-config.md`.
   filtering at `REQUEST_IDENTITIES` time (protocol-level limitation: agent
   doesn't know target host until sign request).
 - Why `~/.ssh/config` still needs the Include line even though the generated
-  snippet defaults beside the executable and can be configured.
+  snippet defaults to the data directory (beside the executable before 2026-11) and can be configured.
 - Why "Bind & Approve" is one click (UX: avoid double-prompting the user).
 - Why process-peek inference is best-effort (silently falls back).
 

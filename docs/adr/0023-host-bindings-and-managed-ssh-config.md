@@ -41,5 +41,6 @@ SSHWarden best-effort infers the target host by reading the SSH client process c
 
 - SSHWarden's unavoidable OpenSSH footprint is the single Include line in `~/.ssh/config`; the generated managed snippet defaults to the executable directory and can be configured.
 - Bindings are per-device local preferences, not Bitwarden-synced state.
+- Update (2026-11): the default moved to `sshwarden_config` in the data directory, because a system-wide install cannot write beside its executable. An Include line that SSHWarden wrote follows the snippet at the next sync.
 - SSHWarden must preserve compatibility with older unquoted Include lines and the previous `~/.ssh/sshwarden_config` default while quoting generated paths so spaces in platform-standard directories work.
 - Users can create broad patterns such as `*`; SSHWarden warns because such patterns can reintroduce `MaxAuthTries` failures.

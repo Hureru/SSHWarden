@@ -189,7 +189,7 @@ max_file_bytes = 5242880
 # SSH config / Host binding 生成配置
 # ============================================
 [ssh_config]
-# 托管 snippet 路径。留空时：普通模式默认 exe 同目录；multi_device=true 时默认共享目录下的 sshwarden_config。
+# 托管 snippet 路径。留空时默认数据目录（共享目录）下的 sshwarden_config。
 # managed_path = "sshwarden_config"
 
 # 写入 ~/.ssh/config Include 和托管 snippet 中 IdentityFile 的路径风格：
