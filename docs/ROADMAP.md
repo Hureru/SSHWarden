@@ -6,7 +6,6 @@ This roadmap tracks implementation work needed to align the codebase with the cu
 
 - Fix `cargo test --workspace` by updating or removing stale UI examples.
 - Update `config.toml.example` so it does not imply completed cross-platform parity or portable-by-default storage.
-- Mark `llmdoc/` legacy notes as reference material where needed; `CONTEXT.md` and ADRs are authoritative.
 - Improve sync freshness:
   - fix SignalR notification URL construction for Bitwarden cloud vs self-hosted/Vaultwarden,
   - resolve service URLs using explicit config, then `/api/config` discovery, then built-in defaults,
