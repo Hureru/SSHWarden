@@ -218,43 +218,8 @@ impl Default for AgentConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnlockMethod {
-    WindowsHello,
-    Pin,
-    Password,
-}
-
-// Cannot use #[derive(Default)] due to conditional compilation
-#[allow(clippy::derivable_impls)]
-impl Default for UnlockMethod {
-    fn default() -> Self {
-        #[cfg(windows)]
-        {
-            Self::WindowsHello
-        }
-        #[cfg(not(windows))]
-        {
-            Self::Password
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum FallbackMethod {
-    #[default]
-    Pin,
-    Password,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnlockConfig {
-    #[serde(default)]
-    pub method: UnlockMethod,
-    #[serde(default)]
-    pub fallback: FallbackMethod,
     #[serde(default = "default_true")]
     pub auto_unlock_on_request: bool,
 }
@@ -266,8 +231,6 @@ fn default_true() -> bool {
 impl Default for UnlockConfig {
     fn default() -> Self {
         Self {
-            method: UnlockMethod::default(),
-            fallback: FallbackMethod::default(),
             auto_unlock_on_request: true,
         }
     }
@@ -1216,5 +1179,14 @@ mod tests {
         let config: Config =
             toml::from_str("[auth]\nmethod = \"api_key\"\nemail = \"a@b.c\"\n").unwrap();
         assert_eq!(config.auth.email, "a@b.c");
+    }
+
+    /// `[unlock] method = "native"` used to stop every command with a TOML
+    /// parse error, although nothing read the option.
+    #[test]
+    fn a_config_with_the_removed_unlock_options_still_loads() {
+        let config: Config =
+            toml::from_str("[unlock]\nmethod = \"native\"\nfallback = \"pin\"\n").unwrap();
+        assert!(config.unlock.auto_unlock_on_request);
     }
 }
