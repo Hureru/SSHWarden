@@ -194,9 +194,8 @@ pub(crate) async fn dispatch_standalone_bind_hosts_dialog(
         .await
         .map_err(|_| anyhow::anyhow!("UI request channel closed"))?;
 
-    // CONC-1: this dialog response is awaited inline in the main select! loop
-    // (via the BindHostsDialog control command), so an unbounded wait would
-    // freeze auto-lock, token refresh and notification handling. Bound it.
+    // CONC-1: bounded, so a dialog nobody answers does not keep its task and
+    // the waiting `keys ui` client around forever.
     match tokio::time::timeout(std::time::Duration::from_secs(600), response_rx).await {
         Ok(Ok(sshwarden_ui::BindHostsResult::Saved { bindings: payload })) => {
             persist_bind_payload(&payload).await?;

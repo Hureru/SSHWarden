@@ -64,6 +64,15 @@ This roadmap tracks implementation work needed to align the codebase with the cu
 - **Audit backlog (2026-11):** 28 numbered findings with evidence, file
   references, fix sketches and a fix order are in `docs/audit-2026-11.md`.
 
+- **Some ECDSA keys do not load.** OpenSSH stores the private number of an
+  ECDSA key without its leading zero bytes, and `ssh-key` 0.6.7 refuses the
+  shorter form ("Failed to parse key: length invalid"). About half of all
+  P-521 keys and one in 256 P-256 or P-384 keys are affected. The agent then
+  does not offer the key; the log has an ERROR line, but `login` and `sync`
+  still count the key as loaded. Ed25519 and RSA keys are not affected. Seen
+  2026-11 with a generated P-521 key; not fixed, since the fix is to re-pad
+  the number before parsing or to wait for a newer `ssh-key`.
+
 - **Linux dialog is rendered at 800×600 with content in the top-left 380×230
   area** on Wayland (observed on niri) when Slint uses the femtovg renderer.
   Root cause is a window min/max-size constraint being overwritten inside the

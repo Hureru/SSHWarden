@@ -11,9 +11,10 @@ base64 = { workspace = true }
 bitwarden-russh = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+rsa = { version = "0.9", features = ["sha2"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-ssh-key = { workspace = true, features = ["encryption", "ed25519", "rsa", "getrandom"] }
+ssh-key = { workspace = true, features = ["std", "encryption", "ed25519", "rsa", "p256", "p384", "p521", "getrandom"] }
 sysinfo = { workspace = true, features = ["windows"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "sync", "macros", "net", "time"] }

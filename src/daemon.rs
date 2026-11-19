@@ -335,6 +335,21 @@ pub(crate) async fn run_foreground(
                     info!("Received stop command, shutting down...");
                     break;
                 }
+                // `keys ui` waits on the user for up to ten minutes and needs
+                // only the UI channel, so it runs beside the loop: signing and
+                // the other commands are served meanwhile.
+                if matches!(
+                    ctrl_req.action,
+                    sshwarden_agent::ControlAction::BindHostsDialog
+                ) {
+                    let ui_request_tx = ui_request_tx.clone();
+                    tokio::spawn(async move {
+                        let response =
+                            crate::control::bind_hosts_dialog_response(&ui_request_tx).await;
+                        let _ = ctrl_req.reply.send(response);
+                    });
+                    continue;
+                }
                 // Watchdog: control actions run serially here, so an action that
                 // never returns (a lock wait, a network call without a timeout)
                 // would otherwise wedge every later command — including `stop` —

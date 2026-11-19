@@ -73,13 +73,58 @@ impl SshKey for SshWardenKey {
         self.public_key_bytes.clone()
     }
 
-    fn private_key(&self) -> Option<Box<dyn ssh_key::SigningKey>> {
-        if let Some(ref private_key) = self.private_key {
-            Some(Box::new(private_key.clone()))
-        } else {
-            None
+    fn sign(&self, data: &[u8], flags: u32) -> anyhow::Result<ssh_key::Signature> {
+        let result = match &self.private_key {
+            Some(private_key) => sign_with(private_key, data, flags),
+            None => Err(anyhow::anyhow!("the key is locked")),
+        };
+        // The client only ever sees "agent refused operation"; the reason goes here.
+        if let Err(e) = &result {
+            error!(key = %self.name, error = %e, "Signing failed");
         }
+        result
     }
+}
+
+// SIGN_REQUEST flags (draft-miller-ssh-agent): which hash an RSA key signs with.
+const SSH_AGENT_RSA_SHA2_256: u32 = 2;
+const SSH_AGENT_RSA_SHA2_512: u32 = 4;
+
+fn sign_with(
+    private_key: &ssh_key::private::PrivateKey,
+    data: &[u8],
+    flags: u32,
+) -> anyhow::Result<ssh_key::Signature> {
+    use rsa::signature::{SignatureEncoding, Signer};
+
+    let ssh_key::private::KeypairData::Rsa(keypair) = private_key.key_data() else {
+        return Ok(private_key.try_sign(data)?);
+    };
+    // Not `private_key.try_sign`: ssh-key 0.6.7 builds the RSA key from the
+    // prime p twice instead of p and q, and the `rsa` crate rejects that.
+    let key = rsa::RsaPrivateKey::from_components(
+        rsa::BigUint::try_from(&keypair.public.n)?,
+        rsa::BigUint::try_from(&keypair.public.e)?,
+        rsa::BigUint::try_from(&keypair.private.d)?,
+        vec![
+            rsa::BigUint::try_from(&keypair.private.p)?,
+            rsa::BigUint::try_from(&keypair.private.q)?,
+        ],
+    )?;
+    let (hash, signature) = if flags & SSH_AGENT_RSA_SHA2_512 != 0 {
+        let key = rsa::pkcs1v15::SigningKey::<rsa::sha2::Sha512>::new(key);
+        (ssh_key::HashAlg::Sha512, key.try_sign(data)?.to_vec())
+    } else if flags & SSH_AGENT_RSA_SHA2_256 != 0 {
+        let key = rsa::pkcs1v15::SigningKey::<rsa::sha2::Sha256>::new(key);
+        (ssh_key::HashAlg::Sha256, key.try_sign(data)?.to_vec())
+    } else {
+        // OpenSSH has refused these signatures since 8.8.
+        anyhow::bail!("the client asked for an ssh-rsa (SHA-1) signature, which is not supported");
+    };
+    Ok(ssh_key::Signature::new(
+        ssh_key::Algorithm::Rsa { hash: Some(hash) },
+        signature,
+    )?)
 }
 
 /// The SSHWarden SSH Agent implementation.
@@ -467,6 +512,34 @@ AAAEAgAQkLDKjON00XO+Y09BoIBuQsAXAx6HUhQoTEodVzig5iivf6TICxdizawaKSZS6G
 nGZV/aEAZ3ZMrsrA3g32AAAAEHRlc3RAZXhhbXBsZS5jb20BAgMEBQ==
 -----END OPENSSH PRIVATE KEY-----";
 
+    const TEST_RSA_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
+NhAAAAAwEAAQAAAQEArygx7enKdJxedA34y7LoOwLu/bbXECX1TRV3CY66VSPsptyal5vs
+Me+3/QLXvkOBKpA/Gn8+ygUWEe4gA4a9Jey8ljo8nzO/NQarUWdr7u3qX6/MtFD9oO0nQ/
+LukiHgbYUzkR/UzhusK5Z7Go8xMWsOZaENnpbElb3AWzCn/1094pAVtnGDKhE0RNuBKNMY
+l0P2GeS0LekW0qdLyZxp1VY+GEGGP39Ewh3Eq70sF5etkPIHbOrEf5mZXqONSSd1sgBmI1
+T4YEgZQedFT98uofFMjsTDfztAGJpgGBL5bhwVhLD8cKg9/JPfmAps1lpnJU0XIRkYRw3Z
+Ic/cUYQtjQAAA8jMw6IEzMOiBAAAAAdzc2gtcnNhAAABAQCvKDHt6cp0nF50DfjLsug7Au
+79ttcQJfVNFXcJjrpVI+ym3JqXm+wx77f9Ate+Q4EqkD8afz7KBRYR7iADhr0l7LyWOjyf
+M781BqtRZ2vu7epfr8y0UP2g7SdD8u6SIeBthTORH9TOG6wrlnsajzExaw5loQ2elsSVvc
+BbMKf/XT3ikBW2cYMqETRE24Eo0xiXQ/YZ5LQt6RbSp0vJnGnVVj4YQYY/f0TCHcSrvSwX
+l62Q8gds6sR/mZleo41JJ3WyAGYjVPhgSBlB50VP3y6h8UyOxMN/O0AYmmAYEvluHBWEsP
+xwqD38k9+YCmzWWmclTRchGRhHDdkhz9xRhC2NAAAAAwEAAQAAAP8WaE364a3EvTxYHHF3
+nauX4Qgx7PIWXsTC17wivN+ZhL8BmbctLgVJXiFrfLGc5YXgrBNmkGC3926bXJs72EDaWS
+7HCSw4MaaEYhYIk/J63nTdSOAnMTVBIRWk268pgqvzVtcB+dB/jYq5CMc23pqsd8WfurrD
+TwZXIa85+z+Cq3SCdhbalFl6UEgLLe4CwGWzMxiohHaARvOIGJBGqCnplHjLvw4M+lctFm
+k3NKGAcYBkFB3pDJYJrMwDaglKK6wxIi2PUMOv1KvMOQqxdAa5P2vcXazF9BFc5p3srRdV
+cG4RuanGvTvEDBe3zAUX62HBkJF1NHOiaRUwjmND3XkAAACBAIZYHZANpvfgVa+okm8mav
+vdNy4fAna+lHCRwA9Q++JxAyL9dAecAoQAHv6ZXCEdzFEKDmYwxObrpp86qw/NE2w5rpaO
+S86lIEBTndxYJ1W//a/kVKzE5OBVpj1jM/yYixlZorMvz6KFKnPSJ/sDGyX8xAlC4y2frr
+RVrt0U95gJAAAAgQDrkoW60sX7m+o4axz0lYEsk9D4Yk2QZ/GGdMf00ysZaSIu0H66G4oH
+m3xSz21Xqh8cIufcj2OY/VNnyvlDDGYikfYiO+kVirVRf11zU/WM3j78A04LxyylCh8kVV
+cRaCU5UDXOYygiwvxwiWXcBaFP0vrSBrnfgQKwDQvyltRYRQAAAIEAvliCvgtjlr27bk9N
+ad4d4KrAzATef3nUwrdlb2n4oADFky6a7P6SbM1Mu7RRB5IFPrHPexLyrcKtGpvJK1SK5s
+PBBdAFsAHGszaqV4azJzjCxPK+vnKoRoIGI7igbNTfTXuSxIOD8DGI6BlG2+6CkRBL05VO
+V1e7S3lMGgbgyKkAAAAQdGVzdEBleGFtcGxlLmNvbQECAw==
+-----END OPENSSH PRIVATE KEY-----";
+
     fn create_test_agent() -> (
         SshWardenAgent,
         tokio::sync::mpsc::Receiver<SshAgentUIRequest>,
@@ -585,6 +658,59 @@ nGZV/aEAZ3ZMrsrA3g32AAAAEHRlc3RAZXhhbXBsZS5jb20BAgMEBQ==
         assert_eq!(body, [5], "expected SSH_AGENT_FAILURE");
     }
 
+    /// Audit #9: a message length over the limit closes the connection.
+    #[tokio::test]
+    async fn oversized_message_length_closes_the_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (agent, _request_rx, _response_tx) = create_test_agent();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let listener = futures::stream::iter(vec![Ok((server, PeerInfo::unknown()))]);
+        tokio::spawn(ssh_agent::serve(
+            listener,
+            agent.clone(),
+            agent.keystore_clone(),
+            agent.cancellation_token(),
+        ));
+
+        client.write_all(&[0xff; 4]).await.expect("write");
+        let mut reply = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut reply))
+            .await
+            .expect("the agent should hang up at once");
+        assert_eq!(read.expect("read"), 0, "expected end of stream");
+        agent.cancellation_token().cancel();
+    }
+
+    /// Audit #21: every ECDSA curve signs.
+    #[test]
+    fn ecdsa_keys_sign_on_every_curve() {
+        use rsa::signature::Verifier;
+        use ssh_key::{Algorithm, EcdsaCurve};
+
+        let message = b"test message for ecdsa";
+        for curve in [
+            EcdsaCurve::NistP256,
+            EcdsaCurve::NistP384,
+            EcdsaCurve::NistP521,
+        ] {
+            let key = ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::OsRng,
+                Algorithm::Ecdsa { curve },
+            )
+            .expect("key generation should work");
+            let signature = sign_with(&key, message, 0).expect("signing should work");
+            assert_eq!(
+                signature.algorithm().as_str(),
+                format!("ecdsa-sha2-{}", curve.as_str())
+            );
+            key.public_key()
+                .key_data()
+                .verify(message, &signature)
+                .expect("signature should verify");
+        }
+    }
+
     #[tokio::test]
     async fn test_agent_sign_with_ed25519_key() {
         let (mut agent, _request_rx, _response_tx) = create_test_agent();
@@ -605,12 +731,53 @@ nGZV/aEAZ3ZMrsrA3g32AAAAEHRlc3RAZXhhbXBsZS5jb20BAgMEBQ==
         assert_eq!(ssh_key.cipher_uuid, "ed25519-uuid");
         assert!(!ssh_key.public_key_bytes().is_empty());
 
-        let signing_key = ssh_key.private_key().expect("should have signing key");
         let message = b"test message for ed25519";
-        let signature: Signature = signing_key.try_sign(message).expect("signing should work");
+        let signature: Signature = ssh_key.sign(message, 0).expect("signing should work");
 
         assert!(!signature.as_bytes().is_empty());
         assert_eq!(signature.algorithm(), ssh_key::Algorithm::Ed25519);
+    }
+
+    /// Audit #1: RSA keys sign, with the hash the client asked for.
+    #[test]
+    fn rsa_key_signs_with_the_requested_hash() {
+        use rsa::signature::Verifier;
+        use ssh_key::{Algorithm, HashAlg};
+
+        let (mut agent, _request_rx, _response_tx) = create_test_agent();
+        agent.is_running.store(true, Ordering::Relaxed);
+        agent
+            .set_keys(vec![(
+                TEST_RSA_KEY.to_string(),
+                "rsa-key".to_string(),
+                "rsa-uuid".to_string(),
+            )])
+            .expect("set_keys should succeed");
+        let keystore = agent.keystore.0.read().expect("RwLock is not poisoned");
+        let ssh_key = keystore.values().next().expect("should have one key");
+        let public_key = ssh_key
+            .private_key
+            .as_ref()
+            .expect("unlocked")
+            .public_key()
+            .clone();
+
+        let message = b"test message for rsa";
+        for (flags, hash) in [
+            (SSH_AGENT_RSA_SHA2_256, HashAlg::Sha256),
+            (SSH_AGENT_RSA_SHA2_512, HashAlg::Sha512),
+        ] {
+            let signature = ssh_key.sign(message, flags).expect("signing should work");
+            assert_eq!(signature.algorithm(), Algorithm::Rsa { hash: Some(hash) });
+            public_key
+                .key_data()
+                .verify(message, &signature)
+                .expect("signature should verify");
+        }
+        assert!(
+            ssh_key.sign(message, 0).is_err(),
+            "SHA-1 ssh-rsa is refused"
+        );
     }
 
     #[tokio::test]
