@@ -10,13 +10,14 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 sshwarden-api = { path = "../sshwarden-api" }
-# Only winit + femtovg are used; the default set also adds the Qt backend and
+# Only winit + Skia are used (Skia for hinted text: femtovg draws
+# unhinted grayscale glyphs); the default set also adds the Qt backend and
 # the software renderer (and their png 0.17/0.18 deps), which we don't need.
 slint = { version = "1.15", default-features = false, features = [
     "std",
     "compat-1-2",
     "backend-winit",
-    "renderer-femtovg",
+    "renderer-skia",
     "unstable-winit-030",
     "accessibility",
 ] }

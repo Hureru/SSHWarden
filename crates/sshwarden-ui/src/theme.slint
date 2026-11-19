@@ -1,6 +1,6 @@
 // Shared look and behaviour constants for every SSHWarden dialog.
 
-import { Palette } from "std-widgets.slint";
+import { Button, Palette } from "std-widgets.slint";
 
 export global Theme {
     // Windows' UI font. Slint's generic sans-serif there is Arial; systems
@@ -9,8 +9,9 @@ export global Theme {
     out property <length> pad: 16px;
     out property <length> gap: 10px;
     out property <length> title-size: 16px;
-    out property <length> body-size: 13px;
-    out property <length> small-size: 12px;
+    out property <length> body-size: 14px;
+    out property <length> small-size: 13px;
+    out property <length> hint-size: 12px;
     // Lists are sized in whole rows: after a long jump (End, or opening on a
     // key far down) Slint puts a row boundary at the top edge, and a list of
     // any other height then shows the selected row cut off at the bottom.
@@ -66,5 +67,61 @@ export component DetailRow inherits HorizontalLayout {
         font-size: Theme.body-size;
         wrap: word-wrap;
         horizontal-stretch: 1;
+    }
+}
+
+// A button whose keyboard shortcut shows as a tooltip on hover, not in its label.
+export component TipButton {
+    in property <string> text;
+    in property <string> shortcut;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+
+    callback clicked();
+
+    min-width: button.min-width;
+    min-height: button.min-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    forward-focus: button;
+
+    states [
+        tip-shown when hover.has-hover && root.shortcut != "": {
+            tip.opacity: 1;
+            in {
+                animate tip.opacity { delay: 500ms; duration: 100ms; }
+            }
+        }
+    ]
+
+    // Only watches the pointer: the click goes to the button inside.
+    hover := TouchArea {
+        button := Button {
+            text: root.text;
+            primary: root.primary;
+            enabled: root.enabled;
+            accessible-description: root.shortcut;
+            clicked => { root.clicked(); }
+        }
+    }
+
+    // Above the button: anything below it is drawn later and would cover the tip.
+    tip := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: -self.height - 4px;
+        width: tip-text.preferred-width + 14px;
+        height: tip-text.preferred-height + 8px;
+        opacity: 0;
+        background: Palette.alternate-background;
+        border-width: 1px;
+        border-color: Palette.border;
+        border-radius: 4px;
+
+        tip-text := Text {
+            text: root.shortcut;
+            color: Palette.foreground;
+            font-size: Theme.small-size;
+            accessible-role: none;
+        }
     }
 }

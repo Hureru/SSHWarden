@@ -7,7 +7,7 @@ use crate::PickKeyRequest;
 
 slint::slint! {
     import { Button, StandardListView, Palette } from "std-widgets.slint";
-    import { Theme, WarningBanner } from "../theme.slint";
+    import { Theme, TipButton, WarningBanner } from "../theme.slint";
 
     export component PickKeyDialog inherits Window {
         title: "SSHWarden - Choose Key";
@@ -128,13 +128,15 @@ slint::slint! {
                         horizontal-stretch: 1;
                     }
 
-                    Button {
-                        text: "Cancel (Esc)";
+                    TipButton {
+                        text: "Cancel";
+                        shortcut: "Esc";
                         clicked => { root.cancel(); }
                     }
 
-                    Button {
-                        text: "Use Key (Enter)";
+                    TipButton {
+                        text: "Use Key";
+                        shortcut: "Enter";
                         primary: true;
                         enabled: root.armed && list.current-item >= 0;
                         clicked => { root.use-current(); }
