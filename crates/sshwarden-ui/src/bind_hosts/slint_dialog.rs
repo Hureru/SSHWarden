@@ -32,6 +32,9 @@ slint::slint! {
         in property <bool> approve-on-save: false;
         out property <length> content-height: content.preferred-height;
 
+        // Two lines of text: taller than the one-line rows of Theme.list-row.
+        property <length> key-row: 48px;
+
         callback key-selected(int);
         callback add-host();
         callback remove-host(int);
@@ -47,8 +50,8 @@ slint::slint! {
         // Keeps the selected key in view.
         function reveal-key() {
             key-list.viewport-y = clamp(key-list.viewport-y,
-                -root.selected-index * Theme.list-row,
-                key-list.visible-height - (root.selected-index + 1) * Theme.list-row);
+                -root.selected-index * root.key-row,
+                key-list.visible-height - (root.selected-index + 1) * root.key-row);
         }
         changed selected-index => { root.reveal-key(); }
 
@@ -94,7 +97,7 @@ slint::slint! {
                     // Rows of our own: StandardListView rows hold one line of text.
                     key-scope := FocusScope {
                         width: 250px;
-                        height: 8 * Theme.list-row;
+                        height: 7 * root.key-row;
                         accessible-role: list;
                         accessible-label: "SSH keys";
                         key-pressed(event) => {
@@ -122,7 +125,7 @@ slint::slint! {
                             changed visible-height => { root.reveal-key(); }
                             changed viewport-height => { root.reveal-key(); }
                             for key[i] in root.keys: Rectangle {
-                                height: Theme.list-row;
+                                height: root.key-row;
                                 accessible-role: list-item;
                                 accessible-label: key.name + ", " + key.hosts;
                                 accessible-item-selectable: true;
