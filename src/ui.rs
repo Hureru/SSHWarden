@@ -133,7 +133,14 @@ pub(crate) async fn handle_ui_request(
         //    No UI prompt; if the slot is present and unlock succeeds, use it.
         {
             let cache_opt = state.local_key_cache_data.read().await.clone();
-            if let Some(cache) = cache_opt.filter(|c| current_native_unlock_slot(c).is_some()) {
+            // Not after a lock: a lock that the next request undoes without a
+            // prompt is no lock (ADR 0014).
+            let allowed = state
+                .keyring_auto_unlock
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(cache) =
+                cache_opt.filter(|c| allowed && current_native_unlock_slot(c).is_some())
+            {
                 let cache_for_unlock = cache.clone();
                 let native_result = tokio::task::spawn_blocking(move || {
                     decrypt_envelope_local_key_cache_with_native(&cache_for_unlock)
@@ -548,6 +555,22 @@ pub(crate) async fn prompt_setup_pin(
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn a_lock_turns_the_silent_keyring_unlock_off() {
+        let state = DaemonState::for_tests();
+        let mut agent = sshwarden_agent::SshWardenAgent::new(
+            tokio::sync::mpsc::channel(1).0,
+            tokio::sync::mpsc::channel(1).0,
+            Arc::new(tokio::sync::broadcast::channel(1).0),
+        );
+        assert!(state.keyring_auto_unlock.load(Ordering::Relaxed));
+
+        // This agent is not running, so the lock itself fails; the flag must
+        // be off all the same.
+        let _ = crate::control::lock_vault(&mut agent, &state).await;
+        assert!(!state.keyring_auto_unlock.load(Ordering::Relaxed));
+    }
 
     #[tokio::test]
     async fn a_request_that_waited_for_an_unlock_does_not_start_its_own() {

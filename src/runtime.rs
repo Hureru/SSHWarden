@@ -350,6 +350,10 @@ pub(crate) struct DaemonState {
     /// Held while a sign request unlocks the vault, so the requests that
     /// arrive meanwhile wait instead of opening a PIN dialog each.
     pub(crate) unlock_lock: Arc<tokio::sync::Mutex<()>>,
+    /// True from the start of the daemon until the first lock. After a lock
+    /// (by hand or by timeout) the keyring must not unlock the vault without
+    /// the user asking for it, or the lock would undo itself (ADR 0014).
+    pub(crate) keyring_auto_unlock: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(test)]
@@ -373,6 +377,7 @@ impl DaemonState {
             sync_lock: Arc::default(),
             change_lock: Arc::default(),
             unlock_lock: Arc::default(),
+            keyring_auto_unlock: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 }

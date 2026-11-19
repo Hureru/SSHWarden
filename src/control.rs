@@ -194,6 +194,10 @@ pub(crate) async fn lock_vault(
     agent: &mut sshwarden_agent::SshWardenAgent,
     state: &DaemonState,
 ) -> Result<(), anyhow::Error> {
+    // First, so that it holds even when the lock itself fails.
+    state
+        .keyring_auto_unlock
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     agent.lock()?;
     state
         .vault_locked
@@ -506,8 +510,20 @@ pub(crate) async fn handle_control_command(
             }
 
             // Try platform-native Local Key Cache first, then Windows Hello.
+            // Not after a lock: then only `unlock --method native` uses the keyring.
             #[cfg(not(windows))]
-            if let Some(cache) = state.local_key_cache_data.read().await.as_ref().cloned() {
+            if let Some(cache) = state
+                .local_key_cache_data
+                .read()
+                .await
+                .as_ref()
+                .filter(|_| {
+                    state
+                        .keyring_auto_unlock
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .cloned()
+            {
                 let resp = finish_native_unlock_response(
                     cache,
                     agent,

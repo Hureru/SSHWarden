@@ -329,6 +329,7 @@ pub(crate) async fn run_foreground(
         sync_lock: Arc::default(),
         change_lock: Arc::default(),
         unlock_lock: Arc::default(),
+        keyring_auto_unlock: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
 
     loop {
