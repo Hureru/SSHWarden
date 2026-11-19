@@ -93,14 +93,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Reads the cache main's build saved; one saved from a tag is read by nothing.
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: build
+          save-if: false
 
       - name: Install system dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
