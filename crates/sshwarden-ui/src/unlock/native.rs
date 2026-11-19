@@ -20,7 +20,14 @@ mod platform {
         false
     }
 
-    pub fn native_encrypt_local_cache_key(encoded_local_cache_key: &str) -> Result<String> {
+    pub fn native_slot_is_legacy(_slot: &str) -> bool {
+        false
+    }
+
+    pub fn native_encrypt_local_cache_key(
+        encoded_local_cache_key: &str,
+        _previous_slot: Option<&str>,
+    ) -> Result<String> {
         security_framework::passwords::set_generic_password(
             SERVICE,
             ACCOUNT,
@@ -51,17 +58,59 @@ mod platform {
         which_secret_tool().is_some()
     }
 
-    pub fn native_encrypt_local_cache_key(encoded_local_cache_key: &str) -> Result<String> {
-        let secret_tool = which_secret_tool().ok_or_else(|| anyhow!("secret-tool not found"))?;
-        let mut child = std::process::Command::new(&secret_tool)
-            .args([
-                "store",
-                "--label=SSHWarden Local Cache Key",
+    /// The entry every copy of SSHWarden shared before each got its own.
+    const LEGACY_ATTRS: [&str; 4] = ["application", "sshwarden", "kind", "local-cache-key"];
+
+    /// The id of the keyring entry a slot text points to; `None` for a slot
+    /// written before entries had one.
+    fn slot_instance(slot: &str) -> Option<&str> {
+        slot.split(';')
+            .find_map(|part| part.strip_prefix("instance="))
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
+    /// The keyring attributes of a slot's entry. `secret-tool` matches every
+    /// entry that has the given attributes, so the per-instance entries use
+    /// another `kind`: a lookup or clear of the shared entry must not hit them.
+    fn slot_attrs(slot: &str) -> Vec<&str> {
+        match slot_instance(slot) {
+            Some(id) => vec![
                 "application",
                 "sshwarden",
                 "kind",
-                "local-cache-key",
-            ])
+                "instance-local-cache-key",
+                "instance",
+                id,
+            ],
+            None => LEGACY_ATTRS.to_vec(),
+        }
+    }
+
+    pub fn native_slot_is_legacy(slot: &str) -> bool {
+        slot_instance(slot).is_none()
+    }
+
+    /// Stores the key in this instance's own keyring entry: the one
+    /// `previous_slot` names, or a new one with a random id. One shared entry
+    /// let a second copy (a dev build, another `SSHWARDEN_HOME`) overwrite or
+    /// delete the key of the first.
+    pub fn native_encrypt_local_cache_key(
+        encoded_local_cache_key: &str,
+        previous_slot: Option<&str>,
+    ) -> Result<String> {
+        let secret_tool = which_secret_tool().ok_or_else(|| anyhow!("secret-tool not found"))?;
+        let slot = match previous_slot.and_then(slot_instance) {
+            Some(id) => slot_text(id),
+            None => {
+                use std::io::Read;
+                let mut id = [0u8; 8];
+                std::fs::File::open("/dev/urandom")?.read_exact(&mut id)?;
+                slot_text(&id.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            }
+        };
+        let mut child = std::process::Command::new(&secret_tool)
+            .args(["store", "--label=SSHWarden Local Cache Key"])
+            .args(slot_attrs(&slot))
             .stdin(std::process::Stdio::piped())
             .spawn()?;
         {
@@ -76,19 +125,18 @@ mod platform {
         if !status.success() {
             return Err(anyhow!("secret-tool store failed"));
         }
-        Ok("secret-service:application=sshwarden;kind=local-cache-key".to_string())
+        Ok(slot)
     }
 
-    pub fn native_decrypt_local_cache_key(_slot: &str) -> Result<String> {
+    fn slot_text(id: &str) -> String {
+        format!("secret-service:application=sshwarden;kind=instance-local-cache-key;instance={id}")
+    }
+
+    pub fn native_decrypt_local_cache_key(slot: &str) -> Result<String> {
         let secret_tool = which_secret_tool().ok_or_else(|| anyhow!("secret-tool not found"))?;
         let output = std::process::Command::new(&secret_tool)
-            .args([
-                "lookup",
-                "application",
-                "sshwarden",
-                "kind",
-                "local-cache-key",
-            ])
+            .arg("lookup")
+            .args(slot_attrs(slot))
             .output()?;
         if !output.status.success() {
             return Err(anyhow!("secret-tool lookup failed"));
@@ -96,7 +144,12 @@ mod platform {
         Ok(String::from_utf8(output.stdout)?.trim_end().to_string())
     }
 
-    pub fn native_delete_local_cache_key(_slot: Option<&str>) -> Result<()> {
+    pub fn native_delete_local_cache_key(slot: Option<&str>) -> Result<()> {
+        // No slot: this instance stored nothing. The shared entry of older
+        // versions may belong to another copy, so it is left alone.
+        let Some(slot) = slot else {
+            return Ok(());
+        };
         let Some(secret_tool) = which_secret_tool() else {
             // No keyring tool present — nothing was stored, nothing to delete.
             return Ok(());
@@ -104,13 +157,8 @@ mod platform {
         // XP-5: check the exit status so a failed revocation is reported (and
         // surfaced by `forget`) instead of silently claiming success.
         let status = std::process::Command::new(&secret_tool)
-            .args([
-                "clear",
-                "application",
-                "sshwarden",
-                "kind",
-                "local-cache-key",
-            ])
+            .arg("clear")
+            .args(slot_attrs(slot))
             .status()
             .map_err(|e| anyhow!("secret-tool clear failed to run: {e}"))?;
         if !status.success() {
@@ -132,6 +180,28 @@ mod platform {
             })
             .map(ToOwned::to_owned)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_slot_with_an_id_gets_its_own_entry_and_an_old_slot_the_shared_one() {
+            let old = "secret-service:application=sshwarden;kind=local-cache-key";
+            assert!(native_slot_is_legacy(old));
+            assert_eq!(slot_attrs(old), LEGACY_ATTRS);
+
+            let own = slot_text("0a1b2c3d4e5f6071");
+            assert!(!native_slot_is_legacy(&own));
+            let attrs = slot_attrs(&own);
+            assert_eq!(attrs[4..], ["instance", "0a1b2c3d4e5f6071"]);
+            // Disjoint from the shared entry, or a clear of one would take both.
+            assert_ne!(attrs[3], LEGACY_ATTRS[3]);
+
+            // An id from a file is passed to a command: letters and digits only.
+            assert!(native_slot_is_legacy("secret-service:kind=x;instance=a b"));
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -142,7 +212,14 @@ mod platform {
         false
     }
 
-    pub fn native_encrypt_local_cache_key(_encoded_local_cache_key: &str) -> Result<String> {
+    pub fn native_slot_is_legacy(_slot: &str) -> bool {
+        false
+    }
+
+    pub fn native_encrypt_local_cache_key(
+        _encoded_local_cache_key: &str,
+        _previous_slot: Option<&str>,
+    ) -> Result<String> {
         Err(anyhow!("native unlock is not available on this platform"))
     }
 
@@ -157,5 +234,5 @@ mod platform {
 
 pub use platform::{
     native_available, native_decrypt_local_cache_key, native_delete_local_cache_key,
-    native_encrypt_local_cache_key,
+    native_encrypt_local_cache_key, native_slot_is_legacy,
 };

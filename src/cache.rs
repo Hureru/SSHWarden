@@ -276,8 +276,19 @@ pub(crate) fn enroll_native_for_local_key_cache(
         cache.local_cache_key.native_encrypted = None;
     } else {
         let encoded_local_cache_key = sshwarden_api::crypto::encode_symmetric_key(local_cache_key);
-        let native_slot =
-            sshwarden_ui::unlock::native::native_encrypt_local_cache_key(&encoded_local_cache_key)?;
+        // A cache that is being rebuilt (`set-pin`, `login`) has no slot yet:
+        // take the keyring entry of the file it replaces, or every rebuild
+        // would leave one more entry behind.
+        let previous = current_native_unlock_slot(cache).or_else(|| {
+            sshwarden_config::cache::LocalKeyCacheFile::load()
+                .ok()
+                .flatten()
+                .and_then(|old| old.local_cache_key.native_encrypted)
+        });
+        let native_slot = sshwarden_ui::unlock::native::native_encrypt_local_cache_key(
+            &encoded_local_cache_key,
+            previous.as_deref(),
+        )?;
         cache.local_cache_key.native_encrypted = Some(native_slot);
     }
     Ok(())
@@ -308,9 +319,11 @@ pub(crate) fn native_encrypt_device_slot(
     local_cache_key: &sshwarden_api::crypto::SymmetricKey,
 ) -> anyhow::Result<()> {
     let encoded_local_cache_key = sshwarden_api::crypto::encode_symmetric_key(local_cache_key);
-    let native_slot =
-        sshwarden_ui::unlock::native::native_encrypt_local_cache_key(&encoded_local_cache_key)?;
     let mut slots = load_device_unlock_slots().unwrap_or_default();
+    let native_slot = sshwarden_ui::unlock::native::native_encrypt_local_cache_key(
+        &encoded_local_cache_key,
+        slots.native_encrypted.as_deref(),
+    )?;
     slots.native_encrypted = Some(native_slot);
     slots.save()
 }
@@ -410,7 +423,22 @@ pub(crate) fn decrypt_envelope_local_key_cache_with_native(
         .context("Failed to unlock Local Cache Key with native unlock")?;
     let local_cache_key = sshwarden_api::crypto::decode_symmetric_key(&encoded_lck)
         .context("Failed to decode Local Cache Key")?;
-    decrypt_envelope_payload(cache, local_cache_key)
+    let (payload, local_cache_key) = decrypt_envelope_payload(cache, local_cache_key)?;
+
+    // The key opened this cache, so the shared keyring entry of older versions
+    // is ours: move it to an entry of our own. The device slot file is read
+    // before the cache's slot, so that is where the new slot text goes.
+    if sshwarden_ui::unlock::native::native_slot_is_legacy(&native_slot) {
+        match native_encrypt_device_slot(&local_cache_key) {
+            Ok(()) => {
+                let _ =
+                    sshwarden_ui::unlock::native::native_delete_local_cache_key(Some(&native_slot));
+                info!("Moved the native unlock key to this instance's own keyring entry");
+            }
+            Err(e) => tracing::warn!("Could not move the native unlock key: {}", e),
+        }
+    }
+    Ok((payload, local_cache_key))
 }
 
 pub(crate) async fn finish_native_unlock_response(
