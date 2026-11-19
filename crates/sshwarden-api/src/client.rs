@@ -6,6 +6,26 @@ use zeroize::Zeroizing;
 use crate::crypto::{self, SymmetricKey};
 use crate::models::{Cipher, CipherType, PreloginResponse, SyncResponse, TokenResponse};
 
+/// The server refused the refresh token itself, so the saved session is dead.
+/// Any other refresh error (network, 5xx) may pass, and the session is kept.
+#[derive(Debug)]
+pub struct RefreshRejected {
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Display for RefreshRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Refresh token rejected ({}): {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for RefreshRejected {}
+
+fn refresh_is_rejected(status: u16, body: &str) -> bool {
+    status == 401 || (status == 400 && body.contains("invalid_grant"))
+}
+
 /// Bitwarden API client
 #[derive(Clone)]
 pub struct BitwardenClient {
@@ -464,8 +484,11 @@ impl BitwardenClient {
             .context("Token refresh request failed")?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
+            let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
+            if refresh_is_rejected(status, &body) {
+                return Err(RefreshRejected { status, body }.into());
+            }
             return Err(anyhow!("Token refresh failed ({}): {}", status, body));
         }
 
@@ -493,6 +516,15 @@ impl BitwardenClient {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refused_token_counts_as_rejected() {
+        assert!(refresh_is_rejected(401, ""));
+        assert!(refresh_is_rejected(400, r#"{"error":"invalid_grant"}"#));
+        assert!(!refresh_is_rejected(400, r#"{"error":"invalid_request"}"#));
+        assert!(!refresh_is_rejected(500, "invalid_grant"));
+        assert!(!refresh_is_rejected(503, ""));
+    }
 
     /// Audit #7: a server that accepts and never answers ends in a timeout.
     /// The clock is paused, so the 30 s pass at once.

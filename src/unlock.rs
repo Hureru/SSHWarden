@@ -369,11 +369,22 @@ pub(crate) async fn try_restore_api_session(
         }
         Err(e) => {
             tracing::warn!("API session restore failed (token refresh): {}", e);
-            // Session file may have an expired refresh token — clean it up
-            if let Err(e) = sshwarden_config::session::SessionFile::delete() {
-                tracing::warn!("Failed to delete stale session file: {}", e);
-            }
+            delete_session_if_rejected(&e);
         }
+    }
+}
+
+/// Delete the session file only when the server refused its token. A network
+/// error or a 5xx passes; deleting then would force a new `sshwarden login`.
+fn delete_session_if_rejected(error: &anyhow::Error) {
+    if error
+        .downcast_ref::<sshwarden_api::RefreshRejected>()
+        .is_none()
+    {
+        return;
+    }
+    if let Err(e) = sshwarden_config::session::SessionFile::delete() {
+        tracing::warn!("Failed to delete stale session file: {}", e);
     }
 }
 
