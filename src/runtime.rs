@@ -347,6 +347,9 @@ pub(crate) struct DaemonState {
     /// changes the state. A sync runs beside the main loop, so without this
     /// its load could land in the middle of a `lock` or a `set-pin`.
     pub(crate) change_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a sign request unlocks the vault, so the requests that
+    /// arrive meanwhile wait instead of opening a PIN dialog each.
+    pub(crate) unlock_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[cfg(test)]
@@ -369,6 +372,7 @@ impl DaemonState {
             ui_request_tx: Arc::new(tokio::sync::mpsc::channel(1).0),
             sync_lock: Arc::default(),
             change_lock: Arc::default(),
+            unlock_lock: Arc::default(),
         }
     }
 }

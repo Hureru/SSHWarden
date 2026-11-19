@@ -328,6 +328,7 @@ pub(crate) async fn run_foreground(
         ui_request_tx,
         sync_lock: Arc::default(),
         change_lock: Arc::default(),
+        unlock_lock: Arc::default(),
     };
 
     loop {
