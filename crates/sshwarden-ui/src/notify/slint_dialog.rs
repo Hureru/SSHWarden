@@ -2,7 +2,7 @@ use crate::{AuthorizationResult, SignRequestInfo};
 
 slint::slint! {
     import { Button, Palette } from "std-widgets.slint";
-    import { Theme, WarningBanner, DetailRow } from "../theme.slint";
+    import { Theme, TipButton, WarningBanner, DetailRow } from "../theme.slint";
 
     export component AuthDialog inherits Window {
         title: "SSHWarden - Authorization";
@@ -89,20 +89,23 @@ slint::slint! {
                     padding-top: 4px;
                     spacing: 8px;
 
-                    Button {
-                        text: "Bind\u{2026} (B)";
+                    TipButton {
+                        text: "Bind\u{2026}";
+                        shortcut: "B";
                         clicked => { root.bind(); }
                     }
 
                     Rectangle { horizontal-stretch: 1; }
 
-                    Button {
-                        text: "Deny (Esc)";
+                    TipButton {
+                        text: "Deny";
+                        shortcut: "Esc";
                         clicked => { root.deny(); }
                     }
 
-                    Button {
-                        text: "Approve (Enter)";
+                    TipButton {
+                        text: "Approve";
+                        shortcut: "Enter";
                         primary: true;
                         enabled: root.armed;
                         clicked => { root.approve(); }

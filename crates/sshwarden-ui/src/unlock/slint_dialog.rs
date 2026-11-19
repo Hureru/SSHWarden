@@ -2,7 +2,7 @@ use tracing::info;
 
 slint::slint! {
     import { Button, LineEdit, Palette } from "std-widgets.slint";
-    import { Theme } from "../theme.slint";
+    import { Theme, TipButton } from "../theme.slint";
 
     export component PinDialog inherits Window {
         title: "SSHWarden - Unlock Vault";
@@ -110,13 +110,15 @@ slint::slint! {
                     alignment: end;
                     spacing: 8px;
 
-                    Button {
-                        text: "Cancel (Esc)";
+                    TipButton {
+                        text: "Cancel";
+                        shortcut: "Esc";
                         clicked => { root.cancel(); }
                     }
 
-                    Button {
-                        text: root.verifying ? "Verifying\u{2026}" : "Unlock (Enter)";
+                    TipButton {
+                        text: root.verifying ? "Verifying\u{2026}" : "Unlock";
+                        shortcut: "Enter";
                         primary: true;
                         enabled: !root.verifying;
                         clicked => { root.try-submit(); }

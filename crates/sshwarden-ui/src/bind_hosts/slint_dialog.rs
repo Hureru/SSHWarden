@@ -2,13 +2,15 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
-use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::{BindHostsRequest, BindHostsResult};
 
 slint::slint! {
-    import { Button, LineEdit, ListView, StandardListView, Palette } from "std-widgets.slint";
-    import { Theme } from "../theme.slint";
+    import { Button, LineEdit, ListView, Palette } from "std-widgets.slint";
+    import { Theme, TipButton } from "../theme.slint";
+
+    export struct KeyRow { name: string, hosts: string }
 
     export component BindHostsDialog inherits Window {
         title: "SSHWarden - Bind Hosts";
@@ -20,7 +22,7 @@ slint::slint! {
         background: Palette.background;
         always-on-top: true;
 
-        in property <[StandardListViewItem]> keys;
+        in property <[KeyRow]> keys;
         // The key whose hosts are shown.
         in-out property <int> selected-index: 0;
         in property <[string]> current-hosts;
@@ -35,6 +37,20 @@ slint::slint! {
         callback remove-host(int);
         callback save();
         callback cancel();
+
+        function select-key(index: int) {
+            if index >= 0 && index < root.keys.length && index != root.selected-index {
+                root.selected-index = index;
+                root.key-selected(index);
+            }
+        }
+        // Keeps the selected key in view.
+        function reveal-key() {
+            key-list.viewport-y = clamp(key-list.viewport-y,
+                -root.selected-index * Theme.list-row,
+                key-list.visible-height - (root.selected-index + 1) * Theme.list-row);
+        }
+        changed selected-index => { root.reveal-key(); }
 
         // Parent of the content, and capturing: these work while typing a host.
         // It never takes the focus itself: a click beside a field leaves it there.
@@ -75,24 +91,97 @@ slint::slint! {
                 HorizontalLayout {
                     spacing: 12px;
 
-                    StandardListView {
+                    // Rows of our own: StandardListView rows hold one line of text.
+                    key-scope := FocusScope {
                         width: 250px;
                         height: 8 * Theme.list-row;
-                        model: root.keys;
-                        current-item: root.selected-index;
+                        accessible-role: list;
                         accessible-label: "SSH keys";
-                        // Selecting again once the rows have a height: only `set-current-item`
-                        // also scrolls to the row and starts the arrow keys from it.
-                        changed viewport-height => {
-                            self.current-item = -1;
-                            self.set-current-item(root.selected-index);
-                        }
-                        current-item-changed(index) => {
-                            // Not for the call above, nor for reselecting the same key.
-                            if index != root.selected-index {
-                                root.selected-index = index;
-                                root.key-selected(index);
+                        key-pressed(event) => {
+                            if event.text == Key.UpArrow {
+                                root.select-key(root.selected-index - 1);
+                                return accept;
                             }
+                            if event.text == Key.DownArrow {
+                                root.select-key(root.selected-index + 1);
+                                return accept;
+                            }
+                            if event.text == Key.Home {
+                                root.select-key(0);
+                                return accept;
+                            }
+                            if event.text == Key.End {
+                                root.select-key(root.keys.length - 1);
+                                return accept;
+                            }
+                            return reject;
+                        }
+
+                        key-list := ListView {
+                            // Again once the list is laid out: that is when the key preselected on opening can be scrolled to.
+                            changed visible-height => { root.reveal-key(); }
+                            changed viewport-height => { root.reveal-key(); }
+                            for key[i] in root.keys: Rectangle {
+                                height: Theme.list-row;
+                                accessible-role: list-item;
+                                accessible-label: key.name + ", " + key.hosts;
+                                accessible-item-selectable: true;
+                                accessible-item-selected: i == root.selected-index;
+                                accessible-item-index: i;
+                                accessible-action-default => { root.select-key(i); }
+
+                                Rectangle {
+                                    x: 3px;
+                                    y: 2px;
+                                    width: parent.width - 6px;
+                                    height: parent.height - 4px;
+                                    border-radius: 4px;
+                                    background: Palette.foreground.with-alpha(
+                                        i == root.selected-index ? 0.1 : row-touch.has-hover ? 0.05 : 0);
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        padding-left: 13px;
+                                        padding-right: 10px;
+
+                                        Text {
+                                            text: key.name;
+                                            color: Palette.foreground;
+                                            font-size: Theme.body-size;
+                                            overflow: elide;
+                                            accessible-role: none;
+                                        }
+
+                                        Text {
+                                            text: key.hosts;
+                                            color: Theme.muted;
+                                            font-size: Theme.hint-size;
+                                            accessible-role: none;
+                                        }
+                                    }
+
+                                    if i == root.selected-index: Rectangle {
+                                        x: 0;
+                                        width: 3px;
+                                        height: 16px;
+                                        border-radius: 2px;
+                                        background: Palette.accent-background;
+                                    }
+                                }
+
+                                row-touch := TouchArea {
+                                    clicked => {
+                                        key-scope.focus();
+                                        root.select-key(i);
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            border-radius: 4px;
+                            border-width: key-scope.has-focus ? 2px : 1px;
+                            border-color: key-scope.has-focus ? Palette.accent-background : Palette.border;
                         }
                     }
 
@@ -118,8 +207,9 @@ slint::slint! {
                                 accepted => { root.add-host(); }
                             }
 
-                            Button {
-                                text: "Add (Enter)";
+                            TipButton {
+                                text: "Add";
+                                shortcut: "Enter";
                                 clicked => { root.add-host(); }
                             }
                         }
@@ -180,15 +270,16 @@ slint::slint! {
                     alignment: end;
                     spacing: 8px;
 
-                    Button {
-                        text: "Cancel (Esc)";
+                    TipButton {
+                        text: "Cancel";
+                        shortcut: "Esc";
                         clicked => { root.cancel(); }
                     }
 
-                    Button {
+                    TipButton {
+                        text: root.approve-on-save ? "Save & Approve" : "Save";
                         // Slint's `control` modifier is the Command key on macOS.
-                        text: (root.approve-on-save ? "Save & Approve" : "Save")
-                            + (Platform.os == OperatingSystemType.macos ? " (\u{2318}Enter)" : " (Ctrl+Enter)");
+                        shortcut: Platform.os == OperatingSystemType.macos ? "\u{2318}Enter" : "Ctrl+Enter";
                         primary: true;
                         clicked => { root.save(); }
                     }
@@ -250,13 +341,16 @@ fn pending_host(hosts: &[String], input: &str) -> Result<Option<String>, &'stati
     Ok(Some(pattern.to_string()))
 }
 
-fn key_row(name: &str, host_count: usize) -> StandardListViewItem {
+fn key_row(name: &str, host_count: usize) -> KeyRow {
     let hosts = match host_count {
         0 => "no hosts".to_string(),
         1 => "1 host".to_string(),
         n => format!("{n} hosts"),
     };
-    format!("{name} \u{2014} {hosts}").as_str().into()
+    KeyRow {
+        name: name.into(),
+        hosts: hosts.into(),
+    }
 }
 
 pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
@@ -307,7 +401,7 @@ pub(crate) fn build_bind_hosts_dialog(request: BindHostsDialogRequest) -> Option
         None => 0,
     } as i32;
 
-    let key_rows: Rc<VecModel<StandardListViewItem>> = Rc::new(VecModel::from(
+    let key_rows: Rc<VecModel<KeyRow>> = Rc::new(VecModel::from(
         keys.iter()
             .map(|k| key_row(&k.name, k.hosts.len()))
             .collect::<Vec<_>>(),
