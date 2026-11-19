@@ -61,6 +61,9 @@ This roadmap tracks implementation work needed to align the codebase with the cu
 
 ## Known issues
 
+- **Audit backlog (2026-11):** 28 numbered findings with evidence, file
+  references, fix sketches and a fix order are in `docs/audit-2026-11.md`.
+
 - **Linux dialog is rendered at 800×600 with content in the top-left 380×230
   area** on Wayland (observed on niri) when Slint uses the femtovg renderer.
   Root cause is a window min/max-size constraint being overwritten inside the

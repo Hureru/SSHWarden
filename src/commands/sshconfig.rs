@@ -65,13 +65,8 @@ pub(crate) async fn cmd_sshcfg_status() -> anyhow::Result<()> {
         .transpose()?
         .unwrap_or_default();
 
-    let user_config_has_include = std::fs::read_to_string(&config_path)
-        .map(|s| {
-            s.lines().any(|l| {
-                sshwarden_config::ssh_config::line_matches_sshwarden_include(l, &include_path)
-            })
-        })
-        .unwrap_or(false);
+    let user_config_has_include =
+        crate::sshconfig::sshwarden_include_is_active(&config_path, &include_path);
 
     let snippet_size = std::fs::metadata(&include_path).map(|m| m.len()).ok();
 
@@ -93,7 +88,7 @@ pub(crate) async fn cmd_sshcfg_status() -> anyhow::Result<()> {
             if user_config_has_include {
                 "present"
             } else {
-                "missing"
+                "missing or placed after a Host/Match block"
             }
         );
         println!(

@@ -253,6 +253,21 @@ pub(crate) fn ssh_config_snippet_with_bindings(
 /// Pure snippet builder behind [`ssh_config_snippet_with_bindings`]: the
 /// selector directory and path style are injected so the generated content can
 /// be asserted in tests without touching the real config directory.
+/// A vault item id that is one plain token (Bitwarden ids are UUIDs).
+fn is_safe_cipher_id(cipher_id: &str) -> bool {
+    !cipher_id.is_empty()
+        && cipher_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// `text` with control characters (newlines above all) turned into spaces.
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 fn ssh_config_snippet_with_bindings_in(
     keys: &[ManagedKey],
     bindings: &sshwarden_config::bindings::HostBindingsFile,
@@ -268,24 +283,46 @@ fn ssh_config_snippet_with_bindings_in(
         String::new(),
     ];
 
-    let mut bound_keys: Vec<&ManagedKey> = Vec::new();
+    // Names and ids come from the vault server and hosts from a hand-editable
+    // file; ssh runs whatever lands here (`ProxyCommand`), so nothing unchecked
+    // may reach a line of its own.
+    let mut bound_keys: Vec<(&ManagedKey, Vec<&str>)> = Vec::new();
     let mut unbound_keys: Vec<&ManagedKey> = Vec::new();
     for key in keys {
-        match bindings.bindings.get(&key.cipher_id) {
-            Some(b) if !b.hosts.is_empty() => bound_keys.push(key),
-            _ => unbound_keys.push(key),
+        if !is_safe_cipher_id(&key.cipher_id) {
+            tracing::warn!(
+                "Key {:?} left out of the managed SSH config: its vault item id is not a plain id",
+                key.name
+            );
+            continue;
+        }
+        let hosts: Vec<&str> = bindings
+            .bindings
+            .get(&key.cipher_id)
+            .map(|b| b.hosts.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let (hosts, rejected): (Vec<&str>, Vec<&str>) = hosts
+            .into_iter()
+            .partition(|host| sshwarden_config::bindings::validate_host_pattern(host).is_ok());
+        if !rejected.is_empty() {
+            tracing::warn!(
+                "Host patterns of key {:?} left out of the managed SSH config: {:?}",
+                key.name,
+                rejected
+            );
+        }
+        if hosts.is_empty() {
+            unbound_keys.push(key);
+        } else {
+            bound_keys.push((key, hosts));
         }
     }
 
-    for key in &bound_keys {
+    for (key, hosts) in &bound_keys {
         let path = selector_dir.join(selector_file_name(&key.name, &key.cipher_id));
-        let binding = bindings
-            .bindings
-            .get(&key.cipher_id)
-            .expect("bound_keys filtered for presence");
         lines.push(format!("{}{}", SSHWARDEN_KEY_MARKER_PREFIX, key.cipher_id));
-        lines.push(format!("# {} ({})", key.name, key.cipher_id));
-        lines.push(format!("Host {}", binding.hosts.join(" ")));
+        lines.push(format!("# {} ({})", single_line(&key.name), key.cipher_id));
+        lines.push(format!("Host {}", hosts.join(" ")));
         lines.push(format!(
             "    IdentityFile {}",
             sshwarden_config::ssh_config::path_arg_with_style(&path, path_style)
@@ -300,7 +337,7 @@ fn ssh_config_snippet_with_bindings_in(
         for key in &unbound_keys {
             let path = selector_dir.join(selector_file_name(&key.name, &key.cipher_id));
             lines.push(format!("{}{}", SSHWARDEN_KEY_MARKER_PREFIX, key.cipher_id));
-            lines.push(format!("# {} ({})", key.name, key.cipher_id));
+            lines.push(format!("# {} ({})", single_line(&key.name), key.cipher_id));
             lines.push("# Host <host>".to_string());
             lines.push(format!(
                 "#     IdentityFile {}",
@@ -330,13 +367,34 @@ pub(crate) fn sync_managed_ssh_config_with_bindings(
 }
 
 /// Inner sync: optionally force write even when no bindings + no existing file
-/// (used by `ssh-config write`).
+/// (used by `ssh-config write`). Hand edits to `Host` lines in the old snippet
+/// are imported first.
 pub(crate) fn sync_managed_ssh_config_inner(
     keys: &[ManagedKey],
     force_write: bool,
 ) -> anyhow::Result<()> {
-    let mut bindings =
+    let bindings =
         load_host_bindings_importing_managed(keys).context("Failed to load host bindings")?;
+    write_managed_ssh_config(keys, bindings, force_write)
+}
+
+/// Rebuild the managed snippet right after a change made through
+/// [`with_host_bindings_locked`]. `bindings.json` is the truth here: the old
+/// snippet still shows the hosts from before the change, so importing it again
+/// would undo the change (hand edits were already imported before it).
+pub(crate) fn regenerate_managed_ssh_config_after_change(
+    keys: &[ManagedKey],
+) -> anyhow::Result<()> {
+    let bindings = sshwarden_config::bindings::HostBindingsFile::load()
+        .context("Failed to load host bindings")?;
+    write_managed_ssh_config(keys, bindings, true)
+}
+
+fn write_managed_ssh_config(
+    keys: &[ManagedKey],
+    mut bindings: sshwarden_config::bindings::HostBindingsFile,
+    force_write: bool,
+) -> anyhow::Result<()> {
     // UX-7/data-safety: an empty key set means we have no cache metadata to
     // classify orphans against — e.g. binding ahead of first sync (see
     // resolve_cipher_id), or the local key cache isn't loaded. Pruning against an
@@ -381,6 +439,66 @@ pub(crate) fn user_ssh_config_path() -> anyhow::Result<std::path::PathBuf> {
     sshwarden_config::user_ssh_config_path()
 }
 
+/// Read the user's SSH config for a rewrite. Only a missing file counts as
+/// empty: any other error (bad encoding, permissions) must stop the caller,
+/// or the rewrite would replace the whole file with just our lines.
+fn read_user_ssh_config(config_path: &std::path::Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => Ok(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!(
+            "Failed to read SSH config: {} (left unchanged)",
+            config_path.display()
+        ))),
+    }
+}
+
+/// Replace the user's SSH config through a temp file and a rename, so a crash
+/// cannot leave it half written. A symlinked config (dotfiles) is resolved
+/// first, so the rename replaces the target and keeps the link.
+fn write_user_ssh_config(config_path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    let target = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    sshwarden_config::write_owner_only_file(&target, content)
+}
+
+/// True for a line that opens a `Host` or `Match` block.
+fn opens_host_or_match_block(trimmed: &str) -> bool {
+    let keyword = trimmed
+        .split(|c: char| c.is_whitespace() || c == '=')
+        .next()
+        .unwrap_or_default();
+    keyword.eq_ignore_ascii_case("Host") || keyword.eq_ignore_ascii_case("Match")
+}
+
+/// True when a line accepted by `is_include` comes before the first `Host` /
+/// `Match` line. OpenSSH reads an `Include` placed after such a line only when
+/// that block matches, so only an Include above all of them works for every host.
+fn include_precedes_first_block(content: &str, is_include: impl Fn(&str) -> bool) -> bool {
+    content
+        .lines()
+        .map(str::trim)
+        .take_while(|line| !opens_host_or_match_block(line))
+        .any(is_include)
+}
+
+/// Whether `ssh` reads the managed snippet for every host: the user's SSH
+/// config has SSHWarden's Include line before the first `Host` / `Match` block.
+pub(crate) fn sshwarden_include_is_active(
+    config_path: &std::path::Path,
+    include_path: &std::path::Path,
+) -> bool {
+    std::fs::read_to_string(config_path)
+        .map(|content| {
+            include_precedes_first_block(&content, |line| {
+                sshwarden_config::ssh_config::line_matches_sshwarden_include(line, include_path)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Put the marker and SSHWarden's `Include` line at the top of the user's SSH
+/// config, moving an older one (marked, or unmarked with our path) from
+/// wherever it was. No write when the wanted line is already above every block.
 pub(crate) fn write_sshwarden_include_line(
     config_path: &std::path::Path,
     include_path: &std::path::Path,
@@ -398,78 +516,28 @@ pub(crate) fn write_sshwarden_include_line(
         include_path,
         sshwarden_config::Config::load()?.ssh_config.path_style,
     );
-    let existing = std::fs::read_to_string(config_path).unwrap_or_default();
-    // Return only when the desired line is already present. A legacy absolute
-    // line may still "match" SSHWarden's include semantically, but in
-    // home-relative multi-device mode we want the marked block below to rewrite
-    // it so a synced ~/.ssh/config works across different Windows usernames.
-    if existing.lines().any(|line| line.trim() == include_line) {
+    let existing = read_user_ssh_config(config_path)?;
+    // Only the exact wanted line counts: a legacy absolute line still "matches"
+    // semantically, but in home-relative multi-device mode it must be rewritten
+    // so a synced ~/.ssh/config works across different Windows usernames.
+    if include_precedes_first_block(&existing, |line| line == include_line) {
         return Ok(());
     }
 
+    // Lines we did not write stay byte for byte when there is nothing to move.
+    let rest = strip_sshwarden_include(&existing, include_path).unwrap_or(existing);
+    let rest = rest.trim_start_matches(['\r', '\n']);
     const MARKER: &str = sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER;
-    let mut rewritten: Vec<String> = Vec::with_capacity(existing.lines().count() + 2);
-    let mut marker_waiting_for_include = false;
-    let mut replaced_marked_include = false;
-    let mut dropped_unmarked_include = false;
-
-    for line in existing.lines() {
-        let trimmed = line.trim();
-        if trimmed == MARKER {
-            marker_waiting_for_include = true;
-            rewritten.push(line.to_string());
-            continue;
-        }
-        if marker_waiting_for_include {
-            if trimmed.is_empty() {
-                rewritten.push(line.to_string());
-                continue;
-            }
-            if is_ssh_include_directive(trimmed)
-                || line_matches_current_or_legacy_sshwarden_include(trimmed, include_path)
-            {
-                rewritten.push(include_line.clone());
-                marker_waiting_for_include = false;
-                replaced_marked_include = true;
-                continue;
-            }
-            marker_waiting_for_include = false;
-        }
-        if line_matches_current_or_legacy_sshwarden_include(trimmed, include_path) {
-            // Drop unmarked older SSHWarden Include lines. A fresh marked line
-            // with the desired path style is appended below if no marked block
-            // was rewritten.
-            dropped_unmarked_include = true;
-            continue;
-        }
-        rewritten.push(line.to_string());
-    }
-
-    if replaced_marked_include {
-        let mut new_config = rewritten.join("\n");
-        if !new_config.is_empty() && !new_config.ends_with('\n') {
+    let mut new_config = format!("{MARKER}\n{include_line}\n");
+    if !rest.is_empty() {
+        new_config.push('\n');
+        new_config.push_str(rest);
+        if !new_config.ends_with('\n') {
             new_config.push('\n');
         }
-        write_private_file(config_path, &new_config)
-            .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
-        return Ok(());
     }
-
-    let mut new_config = if dropped_unmarked_include {
-        rewritten.join("\n")
-    } else {
-        existing
-    };
-    if !new_config.is_empty() && !new_config.ends_with('\n') {
-        new_config.push('\n');
-    }
-    new_config.push_str("\n# SSHWarden managed key selector snippets\n");
-    new_config.push_str(&include_line);
-    new_config.push('\n');
-    write_private_file(config_path, &new_config)
-        .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
-
-    Ok(())
+    write_user_ssh_config(config_path, &new_config)
+        .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))
 }
 
 pub(crate) fn is_ssh_include_directive(line: &str) -> bool {
@@ -491,17 +559,10 @@ pub(crate) fn line_matches_current_or_legacy_sshwarden_include(
         .unwrap_or(false)
 }
 
-/// Remove the sshwarden `Include` line and its preceding marker comment from
-/// `~/.ssh/config`. Returns `true` if anything was changed.
-pub(crate) fn remove_sshwarden_include_line(
-    config_path: &std::path::Path,
-    include_path: &std::path::Path,
-) -> anyhow::Result<bool> {
-    if !config_path.exists() {
-        return Ok(false);
-    }
-    let existing = std::fs::read_to_string(config_path)
-        .with_context(|| format!("Failed to read SSH config: {}", config_path.display()))?;
+/// `existing` without SSHWarden's Include lines: the marker comment with the
+/// Include that follows it, and unmarked Includes of the managed snippet.
+/// `None` when there is none.
+fn strip_sshwarden_include(existing: &str, include_path: &std::path::Path) -> Option<String> {
     const MARKER: &str = sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER;
 
     let mut kept: Vec<&str> = Vec::with_capacity(existing.lines().count());
@@ -542,22 +603,29 @@ pub(crate) fn remove_sshwarden_include_line(
     }
 
     if !removed_any {
-        return Ok(false);
+        return None;
     }
-
     let mut new_config = kept.join("\n");
     if !new_config.is_empty() && !new_config.ends_with('\n') {
         new_config.push('\n');
     }
-    if let Some(parent) = config_path.parent() {
-        create_private_dir(parent).with_context(|| {
-            format!(
-                "Failed to prepare SSH config directory: {}",
-                parent.display()
-            )
-        })?;
+    Some(new_config)
+}
+
+/// Remove the sshwarden `Include` line and its preceding marker comment from
+/// `~/.ssh/config`. Returns `true` if anything was changed.
+pub(crate) fn remove_sshwarden_include_line(
+    config_path: &std::path::Path,
+    include_path: &std::path::Path,
+) -> anyhow::Result<bool> {
+    if !config_path.exists() {
+        return Ok(false);
     }
-    write_private_file(config_path, &new_config)
+    let existing = read_user_ssh_config(config_path)?;
+    let Some(new_config) = strip_sshwarden_include(&existing, include_path) else {
+        return Ok(false);
+    };
+    write_user_ssh_config(config_path, &new_config)
         .with_context(|| format!("Failed to update SSH config: {}", config_path.display()))?;
     Ok(true)
 }
@@ -662,5 +730,139 @@ mod tests {
         assert!(snippet.contains("# Host <host>"));
         assert!(!snippet.lines().any(|line| line.starts_with("Host ")));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit #4: an unreadable config (here: not UTF-8) must fail the command
+    /// and stay byte-for-byte as it was, not be replaced by the Include line.
+    #[test]
+    fn include_write_leaves_unreadable_config_untouched() {
+        let dir = temp_dir("include-non-utf8");
+        let config_path = dir.join("config");
+        let original = b"# caf\xff comment\nHost work\n    User me\n".to_vec();
+        std::fs::write(&config_path, &original).unwrap();
+
+        let result = write_sshwarden_include_line(&config_path, &dir.join("sshwarden_config"));
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&config_path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_write_keeps_symlinked_config_a_symlink() {
+        let dir = temp_dir("include-symlink");
+        let real = dir.join("dotfiles-config");
+        let link = dir.join("config");
+        std::fs::write(&real, "Host work\n    User me\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_sshwarden_include_line(&link, &dir.join("sshwarden_config")).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert!(std::fs::read_to_string(&real).unwrap().contains("Include "));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit #6: an Include after a `Host` block is read only for that host,
+    /// so it must be written above every block, and moved there when older
+    /// versions appended it at the end.
+    #[test]
+    fn include_is_written_above_the_first_host_block() {
+        let dir = temp_dir("include-top");
+        let config_path = dir.join("config");
+        let include_path = dir.join("sshwarden_config");
+        let include_line = sshwarden_config::ssh_config::include_line(&include_path);
+        const MARKER: &str = sshwarden_config::ssh_config::SSHWARDEN_INCLUDE_MARKER;
+        let user_part = "Host work\n    User me\n\nMatch host *.corp\n    Port 2222\n";
+
+        // Fresh config that starts with a Host block.
+        std::fs::write(&config_path, user_part).unwrap();
+        assert!(!sshwarden_include_is_active(&config_path, &include_path));
+        write_sshwarden_include_line(&config_path, &include_path).unwrap();
+        let expected = format!("{MARKER}\n{include_line}\n\n{user_part}");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), expected);
+        assert!(sshwarden_include_is_active(&config_path, &include_path));
+
+        // Second run changes nothing.
+        write_sshwarden_include_line(&config_path, &include_path).unwrap();
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), expected);
+
+        // An Include appended at the end by an older version is moved up.
+        std::fs::write(
+            &config_path,
+            format!("{user_part}\n{MARKER}\n{include_line}\n"),
+        )
+        .unwrap();
+        assert!(!sshwarden_include_is_active(&config_path, &include_path));
+        write_sshwarden_include_line(&config_path, &include_path).unwrap();
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), expected);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Audit #22: a key name, a vault item id or a host pattern must never
+    /// become a config line of its own in the file ssh reads.
+    #[test]
+    fn snippet_cannot_be_injected_through_name_id_or_host() {
+        const PAYLOAD: &str = "x\nHost *\n  ProxyCommand evil";
+        let keys = [
+            ManagedKey {
+                name: PAYLOAD.to_string(),
+                cipher_id: "id-1".to_string(),
+            },
+            ManagedKey {
+                name: "Bad id".to_string(),
+                cipher_id: PAYLOAD.to_string(),
+            },
+            ManagedKey {
+                name: "Bad host".to_string(),
+                cipher_id: "id-3".to_string(),
+            },
+        ];
+        // Built by hand, as a hand-edited or synced bindings.json would be:
+        // set_hosts() would refuse these.
+        let mut bindings = sshwarden_config::bindings::HostBindingsFile::default();
+        for (id, hosts) in [
+            ("id-1", vec!["a.example"]),
+            (PAYLOAD, vec!["b.example"]),
+            ("id-3", vec!["c.example", PAYLOAD]),
+        ] {
+            bindings.bindings.insert(
+                id.to_string(),
+                sshwarden_config::bindings::KeyBinding {
+                    hosts: hosts.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let snippet = ssh_config_snippet_with_bindings_in(
+            &keys,
+            &bindings,
+            std::path::Path::new("/selectors"),
+            sshwarden_config::SshConfigPathStyle::Absolute,
+        );
+
+        let live: Vec<&str> = snippet
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert!(!snippet.contains("ProxyCommand evil\n"), "{snippet}");
+        assert!(
+            live.iter().all(|line| !line.contains("ProxyCommand")),
+            "{snippet}"
+        );
+        let host_lines: Vec<&str> = live
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("Host"))
+            .collect();
+        assert_eq!(
+            host_lines,
+            ["Host a.example", "Host c.example"],
+            "{snippet}"
+        );
     }
 }

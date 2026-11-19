@@ -31,7 +31,7 @@ Host github.com
 
 `IdentityFile` points to a public selector file, not private key material. `IdentitiesOnly yes` tells OpenSSH to offer only the selected identity for that host.
 
-SSHWarden also adds one Include line to the user's SSH config:
+SSHWarden also puts one Include line at the top of the user's SSH config. It has to come before the first `Host` / `Match` block: OpenSSH reads an `Include` placed after such a block only when that block matches. An Include that an older version appended at the end is moved up by the next `keys bind`, `ssh-config write` or `doctor --fix`.
 
 ```sshconfig
 # SSHWarden managed key selector snippets
@@ -94,7 +94,7 @@ This preserves the managed snippet and `bindings.json`. Delete them manually if 
 
 ## Troubleshooting
 
-### Include line missing
+### Include line missing or below a Host block
 
 Run:
 

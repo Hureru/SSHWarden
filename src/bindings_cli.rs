@@ -6,7 +6,7 @@ use crate::cache::load_managed_keys_from_cache;
 use crate::runtime::UIRequestTx;
 use crate::sshconfig::{
     load_host_bindings_importing_managed, managed_sshwarden_include_path,
-    sync_managed_ssh_config_inner, user_ssh_config_path, with_host_bindings_locked,
+    regenerate_managed_ssh_config_after_change, user_ssh_config_path, with_host_bindings_locked,
     write_sshwarden_include_line,
 };
 /// Prompt the user to authorize a sign request, supporting the
@@ -133,7 +133,7 @@ pub(crate) async fn persist_bind_payload(
             Ok(())
         })?;
 
-        sync_managed_ssh_config_inner(&keys, true)?;
+        regenerate_managed_ssh_config_after_change(&keys)?;
 
         // CFG-2: a binding is inert unless ~/.ssh/config Includes the managed
         // snippet. Mirror cmd_bindings_add so UI/sign-flow bindings install the
