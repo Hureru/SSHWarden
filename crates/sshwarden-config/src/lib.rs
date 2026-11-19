@@ -763,18 +763,22 @@ fn auto_device_id() -> String {
 }
 
 fn hostname_for_device_id() -> String {
+    raw_hostname().unwrap_or_else(|| "device".to_string())
+}
+
+/// The machine's host name: from the environment, else the `hostname` command.
+pub(crate) fn raw_hostname() -> Option<String> {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
+        .or_else(|| {
             std::process::Command::new("hostname")
                 .output()
                 .ok()
                 .and_then(|output| String::from_utf8(output.stdout).ok())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "device".to_string())
         })
 }
 

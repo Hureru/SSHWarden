@@ -110,24 +110,11 @@ impl SessionFile {
 
 /// Get the machine hostname, sanitised for use in file names.
 fn hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .or_else(|_| gethostname())
-        .unwrap_or_else(|_| "unknown".to_string())
+    crate::raw_hostname()
+        .unwrap_or_else(|| "unknown".to_string())
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .collect()
-}
-
-/// Fallback hostname retrieval via `hostname` command.
-fn gethostname() -> Result<String, std::env::VarError> {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or(std::env::VarError::NotPresent)
 }
 
 #[cfg(test)]

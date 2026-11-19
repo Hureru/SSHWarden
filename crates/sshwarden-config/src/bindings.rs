@@ -79,36 +79,8 @@ impl HostBindingsFile {
         }
         let content =
             serde_json::to_string_pretty(self).context("Failed to serialize bindings file")?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, content)
-            .with_context(|| format!("Failed to write bindings tmp file: {}", tmp.display()))?;
-        // Best-effort atomic replace: on Windows `rename` over an existing file
-        // can fail, so fall back to a rollback-safe backup+promote flow.
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            if path.exists() {
-                let backup = path.with_extension("json.bak");
-                let _ = std::fs::remove_file(&backup);
-                std::fs::rename(path, &backup).with_context(|| {
-                    format!(
-                        "Failed to move existing bindings file to backup after rename error: {e}"
-                    )
-                })?;
-                if let Err(promote_err) = std::fs::rename(&tmp, path) {
-                    let _ = std::fs::rename(&backup, path);
-                    return Err(anyhow::Error::from(promote_err).context(format!(
-                        "Failed to replace bindings file: {}",
-                        path.display()
-                    )));
-                }
-                let _ = std::fs::remove_file(&backup);
-            } else {
-                return Err(anyhow::Error::from(e).context(format!(
-                    "Failed to rename bindings tmp file: {}",
-                    path.display()
-                )));
-            }
-        }
-        Ok(())
+        crate::write_owner_only_file(path, content)
+            .with_context(|| format!("Failed to write bindings file: {}", path.display()))
     }
 
     /// Run `mutate` on the bindings file at `path` under an exclusive advisory
