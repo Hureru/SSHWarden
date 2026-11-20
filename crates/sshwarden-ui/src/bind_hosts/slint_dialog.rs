@@ -2,15 +2,13 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
-use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, VecModel};
 
 use crate::{BindHostsRequest, BindHostsResult};
 
 slint::slint! {
-    import { Button, LineEdit, ListView, Palette } from "std-widgets.slint";
+    import { Button, LineEdit, ListView, StandardListView, Palette } from "std-widgets.slint";
     import { Theme, TipButton } from "../theme.slint";
-
-    export struct KeyRow { name: string, hosts: string }
 
     export component BindHostsDialog inherits Window {
         title: "SSHWarden - Bind Hosts";
@@ -22,7 +20,7 @@ slint::slint! {
         background: Palette.background;
         always-on-top: true;
 
-        in property <[KeyRow]> keys;
+        in property <[StandardListViewItem]> keys;
         // The key whose hosts are shown.
         in-out property <int> selected-index: 0;
         in property <[string]> current-hosts;
@@ -32,28 +30,11 @@ slint::slint! {
         in property <bool> approve-on-save: false;
         out property <length> content-height: content.preferred-height;
 
-        // Two lines of text: taller than the one-line rows of Theme.list-row.
-        property <length> key-row: 48px;
-
         callback key-selected(int);
         callback add-host();
         callback remove-host(int);
         callback save();
         callback cancel();
-
-        function select-key(index: int) {
-            if index >= 0 && index < root.keys.length && index != root.selected-index {
-                root.selected-index = index;
-                root.key-selected(index);
-            }
-        }
-        // Keeps the selected key in view.
-        function reveal-key() {
-            key-list.viewport-y = clamp(key-list.viewport-y,
-                -root.selected-index * root.key-row,
-                key-list.visible-height - (root.selected-index + 1) * root.key-row);
-        }
-        changed selected-index => { root.reveal-key(); }
 
         // Parent of the content, and capturing: these work while typing a host.
         // It never takes the focus itself: a click beside a field leaves it there.
@@ -94,97 +75,32 @@ slint::slint! {
                 HorizontalLayout {
                     spacing: 12px;
 
-                    // Rows of our own: StandardListView rows hold one line of text.
-                    key-scope := FocusScope {
+                    StandardListView {
                         width: 250px;
-                        height: 7 * root.key-row;
-                        accessible-role: list;
+                        height: 8 * Theme.list-row;
+                        model: root.keys;
+                        current-item: root.selected-index;
                         accessible-label: "SSH keys";
-                        key-pressed(event) => {
-                            if event.text == Key.UpArrow {
-                                root.select-key(root.selected-index - 1);
-                                return accept;
-                            }
-                            if event.text == Key.DownArrow {
-                                root.select-key(root.selected-index + 1);
-                                return accept;
-                            }
-                            if event.text == Key.Home {
-                                root.select-key(0);
-                                return accept;
-                            }
-                            if event.text == Key.End {
-                                root.select-key(root.keys.length - 1);
-                                return accept;
-                            }
-                            return reject;
-                        }
-
-                        key-list := ListView {
-                            // Again once the list is laid out: that is when the key preselected on opening can be scrolled to.
-                            changed visible-height => { root.reveal-key(); }
-                            changed viewport-height => { root.reveal-key(); }
-                            for key[i] in root.keys: Rectangle {
-                                height: root.key-row;
-                                accessible-role: list-item;
-                                accessible-label: key.name + ", " + key.hosts;
-                                accessible-item-selectable: true;
-                                accessible-item-selected: i == root.selected-index;
-                                accessible-item-index: i;
-                                accessible-action-default => { root.select-key(i); }
-
-                                Rectangle {
-                                    x: 3px;
-                                    y: 2px;
-                                    width: parent.width - 6px;
-                                    height: parent.height - 4px;
-                                    border-radius: 4px;
-                                    background: Palette.foreground.with-alpha(
-                                        i == root.selected-index ? 0.1 : row-touch.has-hover ? 0.05 : 0);
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        padding-left: 13px;
-                                        padding-right: 10px;
-
-                                        Text {
-                                            text: key.name;
-                                            color: Palette.foreground;
-                                            font-size: Theme.body-size;
-                                            overflow: elide;
-                                            accessible-role: none;
-                                        }
-
-                                        Text {
-                                            text: key.hosts;
-                                            color: Theme.muted;
-                                            font-size: Theme.hint-size;
-                                            accessible-role: none;
-                                        }
-                                    }
-
-                                    if i == root.selected-index: Rectangle {
-                                        x: 0;
-                                        width: 3px;
-                                        height: 16px;
-                                        border-radius: 2px;
-                                        background: Palette.accent-background;
-                                    }
-                                }
-
-                                row-touch := TouchArea {
-                                    clicked => {
-                                        key-scope.focus();
-                                        root.select-key(i);
-                                    }
-                                }
+                        // The widget's focus scope is zero-width and ignores clicks:
+                        // without this a click selects a row but leaves arrow keys dead.
+                        item-pointer-event(item, event, position) => {
+                            if event.kind == PointerEventKind.down
+                                    && event.button == PointerEventButton.left {
+                                self.focus();
                             }
                         }
-
-                        Rectangle {
-                            border-radius: 4px;
-                            border-width: key-scope.has-focus ? 2px : 1px;
-                            border-color: key-scope.has-focus ? Palette.accent-background : Palette.border;
+                        // Selecting again once the rows have a height: only `set-current-item`
+                        // also scrolls to the row and starts the arrow keys from it.
+                        changed viewport-height => {
+                            self.current-item = -1;
+                            self.set-current-item(root.selected-index);
+                        }
+                        current-item-changed(index) => {
+                            // Not for the call above, nor for reselecting the same key.
+                            if index != root.selected-index {
+                                root.selected-index = index;
+                                root.key-selected(index);
+                            }
                         }
                     }
 
@@ -344,18 +260,6 @@ fn pending_host(hosts: &[String], input: &str) -> Result<Option<String>, &'stati
     Ok(Some(pattern.to_string()))
 }
 
-fn key_row(name: &str, host_count: usize) -> KeyRow {
-    let hosts = match host_count {
-        0 => "no hosts".to_string(),
-        1 => "1 host".to_string(),
-        n => format!("{n} hosts"),
-    };
-    KeyRow {
-        name: name.into(),
-        hosts: hosts.into(),
-    }
-}
-
 pub fn show_bind_hosts_dialog(request: BindHostsDialogRequest) {
     let Some(dialog) = build_bind_hosts_dialog(request) else {
         return;
@@ -404,12 +308,12 @@ pub(crate) fn build_bind_hosts_dialog(request: BindHostsDialogRequest) -> Option
         None => 0,
     } as i32;
 
-    let key_rows: Rc<VecModel<KeyRow>> = Rc::new(VecModel::from(
+    let key_rows: Rc<VecModel<StandardListViewItem>> = Rc::new(VecModel::from(
         keys.iter()
-            .map(|k| key_row(&k.name, k.hosts.len()))
+            .map(|k| StandardListViewItem::from(k.name.as_str()))
             .collect::<Vec<_>>(),
     ));
-    dialog.set_keys(ModelRc::from(key_rows.clone()));
+    dialog.set_keys(ModelRc::from(key_rows));
 
     // Current-hosts model (shown for selected key).
     let hosts_model: Rc<VecModel<SharedString>> = Rc::new(VecModel::default());
@@ -445,22 +349,11 @@ pub(crate) fn build_bind_hosts_dialog(request: BindHostsDialogRequest) -> Option
         }
     };
 
-    let update_key_count = {
-        let key_rows = key_rows.clone();
-        let key_names = key_names.clone();
-        move |idx: i32, count: usize| {
-            if let Some(name) = key_names.get(idx as usize) {
-                key_rows.set_row_data(idx as usize, key_row(name, count));
-            }
-        }
-    };
-
     // Binds `host` to the selected key in the working state.
     let commit_host = {
         let working = working.clone();
         let key_ids = key_ids.clone();
         let hosts_model = hosts_model.clone();
-        let update_count = update_key_count.clone();
         let touched = touched.clone();
         move |d: &BindHostsDialog, host: String| {
             let idx = d.get_selected_index();
@@ -470,7 +363,6 @@ pub(crate) fn build_bind_hosts_dialog(request: BindHostsDialogRequest) -> Option
             d.set_error_message(host_pattern_warning(&host).unwrap_or("").into());
             d.set_new_host_text("".into());
             hosts_model.push(SharedString::from(host.as_str()));
-            update_count(idx, hosts_model.row_count());
             touched.borrow_mut().insert(cipher_id.clone());
             working
                 .borrow_mut()
@@ -541,7 +433,6 @@ pub(crate) fn build_bind_hosts_dialog(request: BindHostsDialogRequest) -> Option
         let working = working.clone();
         let key_ids = key_ids.clone();
         let hosts_model = hosts_model.clone();
-        let update_count = update_key_count.clone();
         let touched = touched.clone();
         dialog.on_remove_host(move |host_idx| {
             let Some(d) = weak.upgrade() else { return };
@@ -569,7 +460,6 @@ pub(crate) fn build_bind_hosts_dialog(request: BindHostsDialogRequest) -> Option
             if host_idx < hosts_model.row_count() {
                 hosts_model.remove(host_idx);
             }
-            update_count(idx, hosts_model.row_count());
             d.set_error_message("".into());
         });
     }
