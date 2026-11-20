@@ -89,9 +89,9 @@ fn main() -> anyhow::Result<()> {
     let is_daemon = matches!(cli.command, Some(Commands::Run { background: true }));
 
     // Typed in a terminal, `run --background` used to stay in the foreground
-    // and die with the terminal. Start the detached copy and return; its stdin
-    // is not a terminal, so it runs the agent itself.
-    #[cfg(not(windows))]
+    // (on Windows the shell waits for this process even after FreeConsole).
+    // Start the detached copy and return; its stdin is null, so it runs the
+    // agent itself.
     if is_daemon && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         if process::is_daemon_running() {
             out_line("SSHWarden is already running.");
