@@ -39,11 +39,16 @@ pub(crate) fn spawn_background_agent(exe: &std::path::Path) -> anyhow::Result<()
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
         // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so the child outlives this
-        // CLI invocation and does not share its console.
+        // CLI invocation and does not share its console. Null stdin keeps the
+        // child from seeing a terminal and spawning another copy of itself.
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
     }
     #[cfg(unix)]
     {
@@ -342,9 +347,9 @@ pub(crate) fn remove_pid_file() {
     }
 }
 
-/// Detach from the parent console (for daemon mode).
-/// This frees the console so the parent terminal regains control,
-/// while the process remains in the user's interactive desktop session.
+/// Detach from the parent console (for daemon mode) so the process survives
+/// the console going away. This does not make a shell that is waiting on this
+/// process return — only exiting does.
 /// UI dialogs (TaskDialog, Windows Hello, MessageBox) are unaffected
 /// because they use the GUI subsystem, not the console.
 #[cfg(windows)]
