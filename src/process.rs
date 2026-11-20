@@ -32,7 +32,16 @@ pub(crate) fn running_agent_pid() -> Option<u32> {
     None
 }
 
-/// Spawn a detached background agent process (`<exe> run --background`).
+/// Spawn a detached background agent process (`<exe> run --background`) and
+/// wait for it to claim the PID file.
+///
+/// The child opens its log file and loads config before claiming the PID, so
+/// the wait turns those early failures into an error here instead of letting
+/// the caller report success for a process that already died.
+///
+/// shortcut: readiness means "PID file claimed", which happens just before the
+/// SSH endpoint starts; upgrade to a control-channel ping if endpoint failures
+/// must reach the caller too.
 pub(crate) fn spawn_background_agent(exe: &std::path::Path) -> anyhow::Result<()> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["run", "--background"]);
@@ -63,9 +72,25 @@ pub(crate) fn spawn_background_agent(exe: &std::path::Path) -> anyhow::Result<()
             .stdout(Stdio::null())
             .stderr(Stdio::null());
     }
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("Failed to start background agent: {}", exe.display()))?;
-    Ok(())
+    let log = log_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "the agent log".into());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if is_daemon_running() {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("The agent exited during startup ({status}). See {log}");
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("The agent did not start within 10s. See {log}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Get the machine-local runtime state directory (PID file, log file, sockets).
