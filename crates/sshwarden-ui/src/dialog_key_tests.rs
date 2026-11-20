@@ -285,6 +285,26 @@ fn dialogs_answer_to_keyboard_and_mouse() {
         )]
     );
 
+    // A click on a row also gives the key list the keyboard, so End moves it.
+    let (dialog, mut rx) = bind_dialog(5, None);
+    let window = dialog.window();
+    lay_out_list_at(window, 100.0, 200.0);
+    click(window, 100.0, 200.0);
+    press(window, Key::End);
+    press(window, Key::Tab);
+    for c in ["x", ".", "i", "o"] {
+        press(window, c);
+    }
+    press(window, Key::Return);
+    press_with_ctrl(window, Key::Return);
+    assert_eq!(
+        saved(&mut rx),
+        [(
+            "id-5".to_string(),
+            vec!["old5.example.com".to_string(), "x.io".to_string()]
+        )]
+    );
+
     // Deselecting a row (Ctrl+Space) leaves the key being edited in place: the typed host is kept.
     let (dialog, mut rx) = bind_dialog(5, Some("id-4"));
     let window = dialog.window();

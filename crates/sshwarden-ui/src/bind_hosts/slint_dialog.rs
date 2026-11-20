@@ -81,6 +81,14 @@ slint::slint! {
                         model: root.keys;
                         current-item: root.selected-index;
                         accessible-label: "SSH keys";
+                        // The widget's focus scope is zero-width and ignores clicks:
+                        // without this a click selects a row but leaves arrow keys dead.
+                        item-pointer-event(item, event, position) => {
+                            if event.kind == PointerEventKind.down
+                                    && event.button == PointerEventButton.left {
+                                self.focus();
+                            }
+                        }
                         // Selecting again once the rows have a height: only `set-current-item`
                         // also scrolls to the row and starts the arrow keys from it.
                         changed viewport-height => {
